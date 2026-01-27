@@ -1,0 +1,14 @@
+export const VIEW_TYPE_RSLATTE = "rslatte-sidepanel";
+export const VIEW_TYPE_TASKS  = "rslatte-taskpanel";
+export const VIEW_TYPE_PROJECTS = "rslatte-projectpanel";
+export const VIEW_TYPE_OUTPUTS = "rslatte-outputpanel";
+export const VIEW_TYPE_PUBLISH = "rslatte-publishpanel";
+export const VIEW_TYPE_CONTACTS = "rslatte-contactspanel";
+export const VIEW_TYPE_FINANCE = "rslatte-financepanel";
+export const VIEW_TYPE_CHECKIN = "rslatte-checkinpanel";
+export const VIEW_TYPE_HUB = "rslatte-hub";
+export const VIEW_TYPE_DASHBOARD = "rslatte-dashboard";
+export const VIEW_TYPE_TIMELINE = "rslatte-stats-timeline";
+export const VIEW_TYPE_MONTHLY_STATS = "rslatte-stats-monthly";
+export const VIEW_TYPE_CALENDAR = "rslatte-calendar";
+export const VIEW_TYPE_MOBILE_OPS = "rslatte-mobile-ops-panel";
