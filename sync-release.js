@@ -123,6 +123,20 @@ function syncBuildFiles() {
 }
 
 /**
+ * 清空 code-release 目录内容，但保留 .git（避免覆盖 Git 提交记录）
+ */
+function clearCodeReleaseDirExceptGit(dir) {
+  if (!fs.existsSync(dir)) return;
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const e of entries) {
+    if (e.name === '.git') continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
+    else fs.unlinkSync(p);
+  }
+}
+
+/**
  * 同步源码到 plugin-release/code-plugin（排除过程类文档）
  */
 function syncSourceCode() {
@@ -131,10 +145,8 @@ function syncSourceCode() {
       fs.mkdirSync(CODE_RELEASE_DIR, { recursive: true });
       console.log(`📁 Created: ${CODE_RELEASE_DIR}`);
     } else {
-      // 清空目标目录
-      fs.rmSync(CODE_RELEASE_DIR, { recursive: true, force: true });
-      fs.mkdirSync(CODE_RELEASE_DIR, { recursive: true });
-      console.log(`📁 Cleared and recreated: ${CODE_RELEASE_DIR}`);
+      clearCodeReleaseDirExceptGit(CODE_RELEASE_DIR);
+      console.log(`📁 Cleared: ${CODE_RELEASE_DIR} (kept .git)`);
     }
     
     // 复制源码目录
