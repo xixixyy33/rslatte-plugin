@@ -1,0 +1,27 @@
+{
+  "name": "rslatte-plugin",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "build": "node build.js",
+    "sync": "node sync-release.js",
+    "build:release": "npm run build && npm run sync",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "obsidian": "^1.11.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "dependency-cruiser": "^17.3.5",
+    "esbuild": "^0.27.2",
+    "madge": "^8.0.0",
+    "tsuml2": "^0.17.1",
+    "typescript": "^5.9.3"
+  }
+}
