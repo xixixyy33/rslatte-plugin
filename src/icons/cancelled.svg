@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+  <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="8"/>
+    <path d="M8.5 15.5l7-7"/>
+  </g>
+
+  <defs>
+    <mask id="rslatte-beanCut-cancel-__UID__" maskUnits="userSpaceOnUse">
+      <rect width="24" height="24" fill="white"/>
+      <path d="M-1.50 0 C -0.55 -0.35 0.55 -0.35 1.50 0"
+            stroke="black" stroke-width="0.85" stroke-linecap="round"
+            transform="translate(20 20) rotate(-25)"/>
+    </mask>
+  </defs>
+
+  <ellipse cx="20" cy="20" rx="1.5" ry="1.1"
+           transform="rotate(-25 20 20)"
+           fill="currentColor"
+           mask="url(#rslatte-beanCut-cancel-__UID__)"/>
+</svg>

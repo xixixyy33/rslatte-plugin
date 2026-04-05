@@ -1,6 +1,7 @@
 import type { ProjectArchiveResult, ProjectRSLatteIndexItem } from "./types";
 import { isYmd, monthKeyFromYmd, todayYmd } from "../taskRSLatte/utils";
 import { ProjectIndexStore } from "./indexStore";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
 
 function ymdMinusDays(ymd: string, days: number): string {
   const [y, m, d] = ymd.split("-").map((x) => parseInt(x, 10));
@@ -14,17 +15,20 @@ function ymdMinusDays(ymd: string, days: number): string {
 
 function closedDate(it: ProjectRSLatteIndexItem): string | null {
   const st = String(it.status ?? "").trim().toLowerCase();
-  if (st === "done") return isYmd(it.done_date ?? "") ? String(it.done_date) : null;
+  if (st === "pending_archive") {
+    return isYmd((it as any).pending_archive_date ?? "") ? String((it as any).pending_archive_date) : null;
+  }
   if (st === "cancelled") return isYmd(it.cancelled_date ?? "") ? String(it.cancelled_date) : null;
   return null;
 }
 
 /**
- * 归档项目中央索引：把“早于今天-阈值”的 DONE/CANCELLED 项目从主索引搬迁到 archive/project-archive-YYYY-MM.json
- * - 仅影响索引，不修改项目文件夹内容
+ * 归档项目中央索引：把“早于今天-阈值”的待归档 / 已取消项目从主索引搬迁到 archive/project-archive-YYYY-MM.json
+ * - 已完成但未标记待归档的不在此按时间迁出（保留在主索引便于随时查看）
+ * - 仅影响索引 JSON，不移动笔记文件夹
  */
 export async function archiveProjectIndexByMonths(store: ProjectIndexStore, thresholdDays: number): Promise<ProjectArchiveResult> {
-  const th = Math.max(1, Math.floor(Number(thresholdDays ?? 90)));
+  const th = normalizeArchiveThresholdDays(thresholdDays);
   const cutoff = ymdMinusDays(todayYmd(), th);
 
   await store.ensureLayout();

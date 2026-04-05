@@ -7,6 +7,12 @@ import type {
   RSLatteReconcileGate,
 } from "../moduleSpec";
 import type { RSLatteResult, RSLatteError } from "../types";
+import { writeFinanceAnalysisAlertIndex } from "../../finance/financeAnalysisAlertIndex";
+import {
+  ensurePrevMonthFinanceSnapshotsIfMissing,
+  writeFinanceAnalysisSnapshotsAndIndex,
+} from "../../finance/financeAnalysisIndex";
+import { writeFinanceRulesAlertSnapshot } from "../../finance/financeRulesAnalysis";
 
 function ok<T>(data: T, warnings?: string[]): RSLatteResult<T> {
   return warnings?.length ? { ok: true, data, warnings } : { ok: true, data };
@@ -17,7 +23,7 @@ function fail(code: string, message: string, detail?: unknown): RSLatteResult<ne
   return { ok: false, error };
 }
 
-const FINANCE_MODULES = { checkin: false, finance: true } as const;
+const FINANCE_MODULES = { checkin: false, finance: true, health: false } as const;
 
 function legacyCtxFromAtomic(ctx: RSLatteAtomicOpContext, op: any) {
   return {
@@ -112,9 +118,12 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
       }
     },
 
-    async applyDelta(_ctx, scan: any) {
+    async applyDelta(ctx, scan: any) {
       if (scan?.empty) {
         lastDeltaSize = 0;
+        await writeFinanceAnalysisAlertIndex(plugin, String(ctx?.mode ?? "manual_refresh"));
+        await writeFinanceRulesAlertSnapshot(plugin, String(ctx?.mode ?? "manual_refresh"));
+        await writeFinanceAnalysisSnapshotsAndIndex(plugin, String(ctx?.mode ?? "manual_refresh"));
         // ✅ forceFull 由 buildOps/flushQueue 消费（这里不改索引语义）
         return ok({ changedDays: 0, forceFullSync: getForceFullFlag() } as any);
       }
@@ -122,6 +131,16 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
         await plugin?.recordRSLatte?.ensureReady?.();
         const applied: any = await plugin?.recordRSLatte?.applyIncrementalScan?.(scan, { updateLists: true });
         lastDeltaSize = Number(applied?.changedDays ?? applied?.scannedDays ?? 0);
+        await writeFinanceAnalysisAlertIndex(plugin, String(ctx?.mode ?? "manual_refresh"));
+        await writeFinanceRulesAlertSnapshot(plugin, String(ctx?.mode ?? "manual_refresh"));
+        await writeFinanceAnalysisSnapshotsAndIndex(plugin, String(ctx?.mode ?? "manual_refresh"));
+        if (String(ctx?.mode ?? "") === "auto_refresh") {
+          try {
+            await ensurePrevMonthFinanceSnapshotsIfMissing(plugin, "auto_refresh");
+          } catch (e) {
+            console.warn("[RSLatte][finance] ensure prev-month snapshots failed", e);
+          }
+        }
         return ok({ ...(applied ?? { changedDays: 0 }), forceFullSync: getForceFullFlag() } as any);
       } catch (e: any) {
         return fail("FIN_APPLY_DELTA_FAILED", "Finance applyDelta failed", { message: e?.message ?? String(e) });
@@ -131,22 +150,32 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
     async scanFull(_ctx) {
       try {
         await plugin?.recordRSLatte?.ensureReady?.();
-        const scan: any = await plugin?.recordRSLatte?.scanFullFromDiaryRange?.({ reconcileMissingDays: false, modules: FINANCE_MODULES });
+        const scan: any = await plugin?.recordRSLatte?.scanFullFromDiaryRange?.({
+          reconcileMissingDays: true,
+          modules: FINANCE_MODULES,
+          scanAllDiaryDates: _ctx?.mode === "rebuild",
+        });
         return ok(scan ?? { empty: true, modules: FINANCE_MODULES, kind: "full" });
       } catch (e: any) {
         return fail("FIN_SCAN_FULL_FAILED", "Finance scanFull failed", { message: e?.message ?? String(e) });
       }
     },
 
-    async replaceAll(_ctx, scan: any) {
+    async replaceAll(ctx, scan: any) {
       try {
         await plugin?.recordRSLatte?.ensureReady?.();
         if (scan?.empty) {
           lastDeltaSize = 0;
+          await writeFinanceAnalysisAlertIndex(plugin, String(ctx?.mode ?? "rebuild"));
+          await writeFinanceRulesAlertSnapshot(plugin, String(ctx?.mode ?? "rebuild"));
+          await writeFinanceAnalysisSnapshotsAndIndex(plugin, String(ctx?.mode ?? "rebuild"));
           return ok({ changedDays: 0, forceFullSync: true } as any);
         }
         const applied: any = await plugin?.recordRSLatte?.applyFullReplace?.(scan, { updateLists: true });
         lastDeltaSize = Number(applied?.changedDays ?? applied?.scannedDays ?? 0);
+        await writeFinanceAnalysisAlertIndex(plugin, String(ctx?.mode ?? "rebuild"));
+        await writeFinanceRulesAlertSnapshot(plugin, String(ctx?.mode ?? "rebuild"));
+        await writeFinanceAnalysisSnapshotsAndIndex(plugin, String(ctx?.mode ?? "rebuild"));
         return ok({ ...(applied ?? { changedDays: 0 }), forceFullSync: true } as any);
       } catch (e: any) {
         return fail("FIN_REPLACE_ALL_FAILED", "Finance replaceAll failed", { message: e?.message ?? String(e) });
@@ -343,8 +372,6 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
                     // ✅ 只重建增量扫描检测到的日期，而不是全量重建
                     // ✅ 这样可以避免扫描所有文件
                     await plugin?.recordRSLatte?.ensureReady?.();
-                    // ✅ 获取当前索引，确保状态正确
-                    const fsnap = await plugin?.recordRSLatte?.getFinanceSnapshot?.(false);
                     
                     // ✅ 使用增量扫描的结果
                     r = {
@@ -363,12 +390,12 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
           } catch (e: any) {
             // ✅ 如果增量扫描失败，仍然进行全量重建（保守策略）
             console.warn(`[RSLatte][finance][reconcile] Incremental scan failed, falling back to full rebuild:`, e);
-            r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, FINANCE_MODULES);
+            r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, FINANCE_MODULES, true);
           }
         } else {
           // ✅ rebuild 模式：直接进行全量重建
           await plugin?.recordRSLatte?.ensureReady?.();
-          r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, FINANCE_MODULES);
+          r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, FINANCE_MODULES, true);
         }
         
         // ✅ 调用后端 reconcile API 校准数据库中的记录（只有在需要时才调用）
@@ -394,7 +421,7 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
             const fsnap = await plugin?.recordRSLatte?.getFinanceSnapshot?.(false);
             const items = (fsnap?.items ?? []) as any[];
             
-            // 构建 present_comp_keys: 格式为 "YYYY-MM-DD|category_id"
+            // present_comp_keys：无 entryId → `YYYY-MM-DD|category_id`；有 entryId → `YYYY-MM-DD|category_id|entryId`（与后端 reconcile 一致）
             const presentCompKeys = new Set<string>();
             const scopeDates = new Set<string>();
             
@@ -402,8 +429,11 @@ export function createFinanceSpecAtomic(plugin: any): ModuleSpecAtomic {
               if (item.isDelete) continue; // 跳过已删除的记录
               const recordDate = String(item.recordDate ?? "");
               const categoryId = String(item.categoryId ?? "");
+              const entryId = String((item as any).entryId ?? "").trim();
               if (recordDate && categoryId && /^\d{4}-\d{2}-\d{2}$/.test(recordDate)) {
-                presentCompKeys.add(`${recordDate}|${categoryId}`);
+                presentCompKeys.add(
+                  entryId ? `${recordDate}|${categoryId}|${entryId}` : `${recordDate}|${categoryId}`
+                );
                 scopeDates.add(recordDate);
               }
             }

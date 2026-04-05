@@ -59,7 +59,12 @@ function getAllModulesFromRegistry(workEventSvc?: WorkEventService): Array<{ id:
   }
 }
 
-export type CollapsibleSectionFactory = (title: string, open: boolean, extraCls: string) => HTMLElement;
+export type CollapsibleSectionFactory = (
+  title: string,
+  open: boolean,
+  extraCls: string,
+  scopeTag?: "global" | "space",
+) => HTMLElement;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function renderStatsSettings(opts: {
@@ -99,7 +104,7 @@ export function renderStatsSettings(opts: {
   // =========================
   // 统计管理（可折叠，顶层，与其他管理标题同级）
   // =========================
-  const statsMgmtWrap = makeCollapsibleSection("统计管理", false, "rslatte-stats-mgmt-wrap");
+  const statsMgmtWrap = makeCollapsibleSection("统计管理", false, "rslatte-stats-mgmt-wrap", "global");
 
   // 获取主插件的空间列表
   const listSpaces = (): RSLatteSpaceConfig[] => {
@@ -140,17 +145,17 @@ export function renderStatsSettings(opts: {
         existing.name = mainSpace.name || existing.name || mainSpace.id;
         // 如果用户没有设置背景色，则使用随机颜色（但不自动保存，只在用户修改时保存）
         // existing.backgroundColor 保持原值或使用随机颜色（仅在渲染时使用）
-        // 保留现有的 enabled 状态，如果未设置则默认为 false
+        // 保留现有的 enabled 状态；未设置则默认参与统计（勾选）
         if (existing.enabled === undefined) {
-          existing.enabled = false;
+          existing.enabled = true;
         }
       } else {
-        // 添加新空间
+        // 添加新空间：默认勾选「是否统计」
         existingStatsSpaces.push({
           id: mainSpace.id,
           name: mainSpace.name || mainSpace.id,
           backgroundColor: generateRandomHexColor(), // 初始时设置随机颜色
-          enabled: false, // 默认关闭
+          enabled: true,
         });
       }
     }
@@ -247,7 +252,7 @@ export function renderStatsSettings(opts: {
         type: "checkbox",
         cls: "col-enabled-toggle",
       });
-      enabledToggle.checked = space.enabled === true; // 默认为 false
+      enabledToggle.checked = space.enabled !== false; // 未设置视为开启统计
       enabledToggle.onchange = async (e) => {
         const target = e.target as HTMLInputElement;
         space.enabled = target.checked;
@@ -261,12 +266,6 @@ export function renderStatsSettings(opts: {
           // 如果没有 refreshAllViews 方法，手动刷新打开的视图
           const workspace = plugin.app.workspace;
           workspace.getLeavesOfType("rslatte-stats-timeline").forEach((leaf: WorkspaceLeaf) => {
-            const view = leaf.view as any;
-            if (view && typeof view.refresh === "function") {
-              view.refresh();
-            }
-          });
-          workspace.getLeavesOfType("rslatte-stats-monthly").forEach((leaf: WorkspaceLeaf) => {
             const view = leaf.view as any;
             if (view && typeof view.refresh === "function") {
               view.refresh();
@@ -382,12 +381,6 @@ export function renderStatsSettings(opts: {
             view.refresh();
           }
         });
-        workspace.getLeavesOfType("rslatte-stats-monthly").forEach((leaf: WorkspaceLeaf) => {
-          const view = leaf.view as any;
-          if (view && typeof view.refresh === "function") {
-            view.refresh();
-          }
-        });
       };
 
       // 是否开启开关列
@@ -406,12 +399,6 @@ export function renderStatsSettings(opts: {
         // 刷新统计视图
         const workspace = plugin.app.workspace;
         workspace.getLeavesOfType("rslatte-stats-timeline").forEach((leaf: WorkspaceLeaf) => {
-          const view = leaf.view as any;
-          if (view && typeof view.refresh === "function") {
-            view.refresh();
-          }
-        });
-        workspace.getLeavesOfType("rslatte-stats-monthly").forEach((leaf: WorkspaceLeaf) => {
           const view = leaf.view as any;
           if (view && typeof view.refresh === "function") {
             view.refresh();

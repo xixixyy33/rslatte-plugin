@@ -1,18 +1,40 @@
 import { App, ButtonComponent, Modal, Notice, Setting, TextAreaComponent } from "obsidian";
 
 import type RSLattePlugin from "../../main";
+import { getDefaultTaskBusinessCategoryName } from "../../taskRSLatte/task/taskBusinessCategory";
+import { buildCaptureWorkEventUi, buildWorkEventTaskCreateUi } from "../../services/execution/buildExecutionWorkEvents";
+import { EXECUTION_RECIPE } from "../../services/execution/executionOrchestrator";
+import { writeTaskTodayCreate } from "../../services/execution/taskWriteFacade";
+import { runExecutionFlowUi } from "../helpers/runExecutionFlowUi";
+
+export type AddTaskModalFlowOpts = {
+  initialText?: string;
+  initialDue?: string;
+  initialScheduled?: string;
+  modalTitle?: string;
+  onBackToTypeSelect?: () => void;
+  /** 若提供：保存成功后调用，再关闭弹窗（用于日程结束并建任务等串联流程） */
+  onCreated?: (res: { uid: string; diaryPath?: string }) => void | Promise<void>;
+  skipDefaultNotice?: boolean;
+  /** 来自 Capture 三合一：WorkEvent 记为 kind capture（含 ref.capture_op） */
+  captureQuickRecordWorkEvent?: boolean;
+};
 
 export class AddTaskModal extends Modal {
-  constructor(app: App, private plugin: RSLattePlugin) {
+  constructor(
+    app: App,
+    private plugin: RSLattePlugin,
+    private flow?: AddTaskModalFlowOpts
+  ) {
     super(app);
   }
 
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    this.titleEl.setText("新增任务");
+    this.titleEl.setText(this.flow?.modalTitle ?? "新增任务");
 
-    let text = "";
+    let text = this.flow?.initialText ?? "";
     // 默认填入今天（用户可清空以表示不写入 📅）
     const today = (() => {
       try {
@@ -30,27 +52,47 @@ export class AddTaskModal extends Modal {
       return `${yyyy}-${mm}-${dd}`;
     })();
 
-    // due 必填：默认今天
-    let due = today;
+    // due 必填：默认今天（flow.initialDue 优先）
+    let due = /^\d{4}-\d{2}-\d{2}$/.test(String(this.flow?.initialDue ?? "").trim())
+      ? String(this.flow?.initialDue ?? "").trim()
+      : today;
 
-    // start / scheduled 可选：默认空
-    let start = "";
-    let scheduled = "";
+    // scheduled 可选；不再使用 start（开始日期由「开始处理任务」时写入）
+    let scheduled = /^\d{4}-\d{2}-\d{2}$/.test(String(this.flow?.initialScheduled ?? "").trim())
+      ? String(this.flow?.initialScheduled ?? "").trim()
+      : "";
+    let estimateH = "";
+    let complexity: "high" | "normal" | "light" = "normal";
+    let repeatRule: "none" | "weekly" | "monthly" | "quarterly" | "yearly" = "none";
+    let taskCategory = getDefaultTaskBusinessCategoryName(this.plugin.settings?.taskPanel);
 
     let textInput!: TextAreaComponent;
     let saveBtn!: ButtonComponent;
+    /** 计划开始/结束日行内校验：标红 + 文案 */
+    const dateRefs: { warnEl?: HTMLElement; dueEl?: HTMLInputElement; schedEl?: HTMLInputElement } = {};
 
     const isValidYmd = (s: string) => !s || /^\d{4}-\d{2}-\d{2}$/.test(s);
 
     const refresh = () => {
-      // due 必填
-      const dueOk = /^\d{4}-\d{2}-\d{2}$/.test((due ?? "").trim());
-      const startOk = isValidYmd((start ?? "").trim());
-      const scheduledOk = isValidYmd((scheduled ?? "").trim());
+      const dueTrim = (due ?? "").trim();
+      const schedTrim = (scheduled ?? "").trim();
+      const dueOk = /^\d{4}-\d{2}-\d{2}$/.test(dueTrim);
+      const scheduledOk = isValidYmd(schedTrim);
+      const estOk = !estimateH || /^\d+(\.\d)?$/.test(String(estimateH).trim());
+      const dateOrderBad = Boolean(schedTrim && dueOk && schedTrim > dueTrim);
 
-      const ok = (text ?? "").trim().length > 0 && dueOk && startOk && scheduledOk;
+      const ok =
+        (text ?? "").trim().length > 0 && dueOk && scheduledOk && estOk && !dateOrderBad;
       saveBtn?.setDisabled(!ok);
       textInput?.inputEl?.classList.toggle("is-invalid", !(text ?? "").trim());
+
+      const w = dateRefs.warnEl;
+      if (w) {
+        w.textContent = dateOrderBad ? "计划开始日不能晚于计划结束日，请更正。" : "";
+        w.style.display = dateOrderBad ? "block" : "none";
+      }
+      dateRefs.dueEl?.classList.toggle("is-invalid", !dueOk || dateOrderBad);
+      dateRefs.schedEl?.classList.toggle("is-invalid", !scheduledOk || dateOrderBad);
       return ok;
     };
 
@@ -131,15 +173,15 @@ export class AddTaskModal extends Modal {
       });
 
     new Setting(contentEl)
-      .setName("到期日期*")
-      .setDesc("")
+      .setName("计划结束日*")
+      .setDesc("任务用于需要完成的事项；纯提醒类事项建议使用提醒模块。")
       .addText((t) => {
         // 用浏览器原生日期选择器
         t.inputEl.type = "date";
-        t.setValue(today);
+        t.setValue(due);
+        dateRefs.dueEl = t.inputEl;
         t.onChange((v) => {
           due = (v ?? "").trim();
-          t.inputEl.classList.toggle("is-invalid", !/^\d{4}-\d{2}-\d{2}$/.test(due));
           refresh();
         });
         t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
@@ -151,33 +193,14 @@ export class AddTaskModal extends Modal {
       });
 
     new Setting(contentEl)
-      .setName("开始日期")
+      .setName("计划开始日")
       .setDesc("")
       .addText((t) => {
         t.inputEl.type = "date";
-        t.setValue("");
-        t.onChange((v) => {
-          start = (v ?? "").trim();
-          t.inputEl.classList.toggle("is-invalid", !isValidYmd(start));
-          refresh();
-        });
-        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-          if (ev.key === "Enter" && !ev.shiftKey) {
-            ev.preventDefault();
-            void doSave();
-          }
-        });
-      });
-
-    new Setting(contentEl)
-      .setName("计划日期")
-      .setDesc("")
-      .addText((t) => {
-        t.inputEl.type = "date";
-        t.setValue("");
+        t.setValue(scheduled);
+        dateRefs.schedEl = t.inputEl;
         t.onChange((v) => {
           scheduled = (v ?? "").trim();
-          t.inputEl.classList.toggle("is-invalid", !isValidYmd(scheduled));
           refresh();
         });
         t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
@@ -185,10 +208,69 @@ export class AddTaskModal extends Modal {
             ev.preventDefault();
             void doSave();
           }
+        });
+      });
+
+    dateRefs.warnEl = contentEl.createDiv({ cls: "rslatte-task-date-order-warning" });
+    dateRefs.warnEl.style.display = "none";
+
+    new Setting(contentEl)
+      .setName("工时评估 h")
+      .setDesc("非必填，单位：小时，可小数")
+      .addText((t) => {
+        t.inputEl.type = "number";
+        t.inputEl.placeholder = "例如 2 或 1.5";
+        t.onChange((v) => {
+          estimateH = (v ?? "").trim();
+          t.inputEl.classList.toggle("is-invalid", !!(estimateH && !/^\d+(\.\d)?$/.test(estimateH)));
+          refresh();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("任务复杂度")
+      .addDropdown((dd) => {
+        dd.addOption("normal", "一般任务");
+        dd.addOption("high", "高脑力 🧠");
+        dd.addOption("light", "轻量任务 🍃");
+        dd.setValue(complexity);
+        dd.onChange((v) => {
+          complexity = (v as "high" | "normal" | "light") || "normal";
+          refresh();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("周期任务")
+      .setDesc("每次都需要重新完成一次；仅任务使用该口径。")
+      .addDropdown((d) => {
+        d.addOption("none", "不设置");
+        d.addOption("weekly", "每周");
+        d.addOption("monthly", "每月");
+        d.addOption("quarterly", "每季");
+        d.addOption("yearly", "每年");
+        d.setValue(repeatRule);
+        d.onChange((v) => {
+          const vv = String(v ?? "").trim().toLowerCase();
+          if (vv === "weekly" || vv === "monthly" || vv === "quarterly" || vv === "yearly") repeatRule = vv;
+          else repeatRule = "none";
+          refresh();
         });
       });
 
     const btnRow = contentEl.createDiv({ cls: "rslatte-modal-actions" });
+    if (this.flow?.onBackToTypeSelect) {
+      new ButtonComponent(btnRow)
+        .setButtonText("← 返回类型选择")
+        .onClick(() => {
+          this.close();
+          try {
+            this.flow?.onBackToTypeSelect?.();
+          } catch {
+            // ignore
+          }
+        });
+    }
     saveBtn = new ButtonComponent(btnRow).setButtonText("保存").setCta().onClick(() => void doSave());
     new ButtonComponent(btnRow).setButtonText("关闭").onClick(() => this.close());
 
@@ -196,22 +278,65 @@ export class AddTaskModal extends Modal {
       if (!refresh()) return;
 
       const dueTrim = (due ?? "").trim();
+      const schedTrim = (scheduled ?? "").trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dueTrim)) {
-        new Notice("到期日期为必填，且格式必须为 YYYY-MM-DD");
+        new Notice("计划结束日为必填，且格式必须为 YYYY-MM-DD");
+        return;
+      }
+      if (schedTrim && schedTrim > dueTrim) {
+        new Notice("计划开始日不能晚于计划结束日，请更正");
         return;
       }
 
       try {
-        await this.plugin.taskRSLatte.createTodayTask(text, dueTrim, (start ?? "").trim(), (scheduled ?? "").trim());
-        new Notice("已写入今日日记：任务");
-        // 立即刷新索引 & 同步
-        await this.plugin.taskRSLatte.refreshIndexAndSync({
-          // ✅ D3: DB sync 开关完全接管；URL 不可用时强制视为 OFF
+        const est = (estimateH ?? "").trim();
+        const createOpts: any = {
+          estimate_h: est ? Number(est) : undefined,
+          complexity: complexity !== "normal" ? complexity : undefined,
+          repeatRule: repeatRule !== "none" ? repeatRule : undefined,
+          task_category: taskCategory,
+        };
+        const fr = await writeTaskTodayCreate(
+          this.plugin.taskRSLatte,
+          text,
+          dueTrim,
+          "",
+          (scheduled ?? "").trim(),
+          createOpts
+        );
+        if (!fr) return;
+        const recordDate = this.plugin.getTodayKey().slice(0, 10);
+        const textShort = text.length > 50 ? text.slice(0, 50) + "…" : text;
+        await runExecutionFlowUi(this.plugin, EXECUTION_RECIPE.tripleSaveTask, {
+          facadeResult: { kind: "task", uid: fr.uid, diaryPath: fr.diaryPath },
+          workEvent: this.flow?.captureQuickRecordWorkEvent
+            ? buildCaptureWorkEventUi({
+                action: "create",
+                summary: `🗃️ 快速记录→任务 ${textShort}`,
+                ref: {
+                  capture_op: "quickadd_task",
+                  task_uid: fr.uid,
+                  due: dueTrim,
+                  record_date: recordDate,
+                  ...(schedTrim ? { scheduled: schedTrim } : {}),
+                },
+              })
+            : buildWorkEventTaskCreateUi({
+                uid: fr.uid,
+                text,
+                due: dueTrim,
+                ...(schedTrim ? { scheduled: schedTrim } : {}),
+                recordDate,
+              }),
           sync: (this.plugin.isTaskDbSyncEnabledV2?.() ?? (this.plugin.settings.taskPanel.enableDbSync !== false)),
-          // 手动新增后立刻刷新：允许修复 uid/meta（避免新条目因缺 uid 而无法进入缓存/队列）
           noticeOnError: true,
-        });
-        this.plugin.refreshSidePanel();
+        }, { actionLabel: "创建任务" });
+        if (this.flow?.onCreated) {
+          await this.flow.onCreated({ uid: fr.uid, diaryPath: fr.diaryPath });
+          this.close();
+          return;
+        }
+        if (!this.flow?.skipDefaultNotice) new Notice("已写入今日日记：任务");
         this.close();
       } catch (e: any) {
         new Notice(`写入失败：${e?.message ?? String(e)}`);
@@ -219,6 +344,10 @@ export class AddTaskModal extends Modal {
     };
 
     window.setTimeout(() => {
+      if ((text ?? "").trim() && textInput) {
+        textInput.setValue(text);
+        text = (textInput.getValue() ?? "").replace(/[\r\n]+/g, " ");
+      }
       textInput?.inputEl?.focus();
       refresh();
     }, 0);

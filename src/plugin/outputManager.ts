@@ -2,11 +2,31 @@
  * Output 管理和归档模块
  * 提供输出文件的DB同步、归档等功能
  */
-import { moment, TFile, TFolder, normalizePath } from "obsidian";
+import { moment, Notice, TFile, TFolder, normalizePath } from "obsidian";
 // ✅ moment 从 Obsidian 导入，但 TypeScript 类型定义可能不完整，使用类型断言
 const momentFn = moment as any;
 import { apiTry } from "../api";
 import type RSLattePlugin from "../main";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
+import { runOutputPostPhysicalArchiveRefresh, runOutputPreArchiveRefreshIndexFull } from "../services/pipeline/helpers/archiveOrchestration";
+
+/** 契约 §十三：输出侧栏扩展字段入 `output_files.meta_sync`（白名单） */
+function buildOutputMetaSyncForDb(it: Record<string, any>): Record<string, unknown> | undefined {
+  const schema_version = 1;
+  const o: Record<string, unknown> = { schema_version };
+  const ls = String(it.linkedScheduleUid ?? "").trim();
+  if (ls) o.linked_schedule_uid = ls.slice(0, 128);
+  const kind = it.outputDocumentKind;
+  if (kind === "general" || kind === "project") o.output_document_kind = kind;
+  const pid = String(it.projectId ?? "").trim();
+  if (pid) o.project_id = pid.slice(0, 128);
+  const pn = String(it.projectName ?? "").trim();
+  if (pn) o.project_name = pn.slice(0, 256);
+  const ra = String(it.resumeAt ?? "").trim();
+  if (ra) o.resume_at = ra.slice(0, 32);
+  if (Object.keys(o).length <= 1) return undefined;
+  return o;
+}
 
 export function createOutputManager(plugin: RSLattePlugin) {
   return {
@@ -162,7 +182,7 @@ export function createOutputManager(plugin: RSLattePlugin) {
           cancelled_date = info.cancelledDate;
         }
 
-        files.push({
+        const row: Record<string, any> = {
           output_id: outputId,
           file_path: af.path,
           file_name: af.name,
@@ -179,7 +199,10 @@ export function createOutputManager(plugin: RSLattePlugin) {
             create_date: it.createDate ?? null,
             done_date: it.doneDate ?? null,
           },
-        });
+        };
+        const metaSync = buildOutputMetaSyncForDb(it);
+        if (metaSync) row.meta_sync = metaSync;
+        files.push(row);
 
         const tagsHash = this.hashList(tags);
         const domainsHash = this.hashList(domains);
@@ -353,17 +376,17 @@ export function createOutputManager(plugin: RSLattePlugin) {
     async archiveOutputFilesNow(_opts?: { reason?: string }): Promise<number> {
       const op: any = (plugin.settings as any).outputPanel ?? {};
       const archiveRoot = normalizePath(String(op.archiveRootDir ?? "99-Archive").trim() || "99-Archive");
-      const days = Math.max(1, Number(op.archiveThresholdDays ?? 90));
+      const days = normalizeArchiveThresholdDays(op.archiveThresholdDays ?? 90);
       const cutoffDate = momentFn().subtract(Math.floor(days), "days").format("YYYY-MM-DD");
 
-      await plugin.outputRSLatte.ensureReady();
-      // ✅ 使用 active 模式：archiveOutputFilesNow 会自己处理归档逻辑，不需要 refreshIndexNow 自动清理
-      await plugin.outputRSLatte.refreshIndexNow({ mode: "active" });
+      // §8.2：归档前 full 快照（顺序与错误文案由编排层固定）
+      await runOutputPreArchiveRefreshIndexFull(plugin);
 
       const snap = await plugin.outputRSLatte.getSnapshot();
       const items = (snap.items ?? []) as any[];
 
       let moved = 0;
+      const errors: string[] = [];
 
       const exists = (p: string) => !!plugin.app.vault.getAbstractFileByPath(p);
 
@@ -383,10 +406,9 @@ export function createOutputManager(plugin: RSLattePlugin) {
         const af = plugin.app.vault.getAbstractFileByPath(it.filePath);
         if (!(af instanceof TFile)) continue;
 
-        // DONE：已在全局归档目录内则跳过
-        if (st === "done" && af.path.startsWith(archiveRoot + "/")) continue;
-
-        // CANCELLED：已在 <top>/_archived 内则跳过
+        // 已在设置页「归档目录」内则跳过（DONE 与 CANCELLED 均归档到同一目录下）
+        if (af.path.startsWith(archiveRoot + "/")) continue;
+        // 兼容旧数据：曾在 <top>/_archived 下的已取消文档也视为已归档
         if (st === "cancelled") {
           const parts = af.path.split("/").filter(Boolean);
           if (parts.length >= 2 && parts[1] === "_archived") continue;
@@ -411,66 +433,64 @@ export function createOutputManager(plugin: RSLattePlugin) {
         let destDir = "";
         let destFile = "";
 
-        if (st === "done") {
-          // DONE -> 99-Archive/<原目录路径>
+        // DONE 与 CANCELLED 均归档到设置页「归档目录」下，保持原相对路径（与设置一致：90-Archive/10-Personal/ 等）
+        if (st === "done" || st === "cancelled") {
           if (isNewStructure) {
-            // 新结构：移动整个目录
             destDir = normalizePath(`${archiveRoot}/${fileDir}`);
           } else {
-            // 旧结构：保持原有逻辑（移动单个文件）
             destFile = normalizePath(`${archiveRoot}/${af.path}`);
-          }
-        } else {
-          // CANCELLED -> <top>/_archived/<rest>
-          const parts = (isNewStructure ? fileDir : af.path).split("/").filter(Boolean);
-          if (parts.length >= 2) {
-            const top = parts[0];
-            const rest = parts.slice(1).join("/");
-            if (isNewStructure) {
-              destDir = normalizePath(`${top}/_archived/${rest}`);
-            } else {
-              destFile = normalizePath(`${top}/_archived/${rest}`);
-            }
-          } else {
-            // fallback: file at vault root
-            if (isNewStructure) {
-              destDir = normalizePath(`_archived/${fileDir}`);
-            } else {
-              destFile = normalizePath(`_archived/${af.path}`);
-            }
           }
         }
 
-        if (isNewStructure) {
-          // ✅ 新结构：移动整个目录
-          // 检查目标目录是否存在
-          if (exists(destDir)) {
-            let i = 2;
-            const baseDirName = destDir.substring(destDir.lastIndexOf("/") + 1);
-            const parentDir = destDir.substring(0, destDir.lastIndexOf("/"));
-            while (exists(normalizePath(`${parentDir}/${baseDirName}-${i}`))) i++;
-            destDir = normalizePath(`${parentDir}/${baseDirName}-${i}`);
+        const doMove = async () => {
+          if (isNewStructure) {
+            const dir = plugin.app.vault.getAbstractFileByPath(fileDir);
+            if (dir && dir instanceof TFolder) {
+              await (plugin as any).ensureDirForPath?.(destDir);
+              await plugin.app.vault.rename(dir, destDir);
+            }
+          } else {
+            await (plugin as any).ensureDirForPath?.(destFile);
+            await plugin.app.fileManager.renameFile(af, destFile);
           }
-          
-          // 使用 vault.rename 移动整个目录（包括所有子文件和子文件夹）
-          const dir = plugin.app.vault.getAbstractFileByPath(fileDir);
-          if (dir && dir instanceof TFolder) {
-            await (plugin as any).ensureDirForPath?.(destDir);
-            // 使用 vault.rename 移动整个文件夹
-            await plugin.app.vault.rename(dir, destDir);
-          }
-        } else {
-          // 旧结构：移动单个文件（保持向后兼容）
-          // avoid overwrite
-          if (exists(destFile)) {
-            const base = destFile.replace(/\.md$/i, "");
-            let i = 2;
-            while (exists(normalizePath(`${base}-${i}.md`))) i++;
-            destFile = normalizePath(`${base}-${i}.md`);
-          }
+        };
 
-          await (plugin as any).ensureDirForPath?.(destFile);
-          await plugin.app.fileManager.renameFile(af, destFile);
+        try {
+          if (isNewStructure) {
+            if (exists(destDir)) {
+              let i = 2;
+              const baseDirName = destDir.substring(destDir.lastIndexOf("/") + 1);
+              const parentDir = destDir.substring(0, destDir.lastIndexOf("/"));
+              while (exists(normalizePath(`${parentDir}/${baseDirName}-${i}`))) i++;
+              destDir = normalizePath(`${parentDir}/${baseDirName}-${i}`);
+            }
+          } else {
+            if (exists(destFile)) {
+              const base = destFile.replace(/\.md$/i, "");
+              let i = 2;
+              while (exists(normalizePath(`${base}-${i}.md`))) i++;
+              destFile = normalizePath(`${base}-${i}.md`);
+            }
+          }
+          await doMove();
+        } catch (moveErr: any) {
+          const isBusy = moveErr?.code === "EBUSY" || moveErr?.errno === -4082;
+          if (isBusy) {
+            await new Promise((r) => setTimeout(r, 800));
+            try {
+              await doMove();
+            } catch (retryErr: any) {
+              const errMsg = "文件或文件夹被占用，请关闭该文档后重试";
+              errors.push(`${it.filePath}: ${errMsg}`);
+              (plugin as any).dbg?.("output", "archiveOutputFilesNow move failed (EBUSY retry)", { filePath: it.filePath, err: retryErr });
+              continue;
+            }
+          } else {
+            const errMsg = moveErr?.message ?? String(moveErr);
+            errors.push(`${it.filePath}: ${errMsg}`);
+            (plugin as any).dbg?.("output", "archiveOutputFilesNow move failed", { filePath: it.filePath, err: moveErr });
+            continue;
+          }
         }
         
         // ✅ Work Event (success only)
@@ -507,19 +527,17 @@ export function createOutputManager(plugin: RSLattePlugin) {
         moved++;
       }
 
-      // After moving, refresh index for consistent UI/DB sync
-      // ✅ 归档后，先使用 full 模式刷新索引（扫描归档目录，更新文件路径），然后清理主索引
-      try {
-        // 先刷新索引，让索引包含移动后的新路径
-        await plugin.outputRSLatte.refreshIndexNow({ mode: "full" });
-        // refreshIndexNow({ mode: "full" }) 会自动调用 archiveIndexForArchivedFiles() 清理主索引
-        // 所以这里不需要再手动调用 archiveIndexForArchivedFiles()
-      } catch (e) {
-        // 如果刷新失败，尝试手动清理索引
-        try {
-          await plugin.outputRSLatte?.archiveIndexForArchivedFiles?.();
-        } catch {}
+      if (errors.length > 0) {
+        const first = errors[0];
+        const allBusy = errors.every((e) => e.includes("文件或文件夹被占用"));
+        if (allBusy && moved >= 0) {
+          new Notice(`已归档 ${moved} 项；${errors.length} 项因文件被占用未移动，请关闭相关文档后再次点击归档`);
+          return moved;
+        }
+        throw new Error(`部分文件归档失败（${errors.length} 个）：${first}${errors.length > 1 ? " …" : ""}`);
       }
+
+      await runOutputPostPhysicalArchiveRefresh(plugin, moved);
 
       return moved;
     },

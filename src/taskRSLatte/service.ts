@@ -4,23 +4,55 @@ import type { RSLattePluginSettings } from "../types/settings";
 import type { JournalService } from "../services/journalService";
 import { RSLatteIndexStore } from "./indexStore";
 import { SyncQueue } from "./syncQueue";
-import { parseRSLatteFile } from "./parser";
-import { writeBackMetaIdByUid } from "./metaWriter";
+import { parseRSLatteFile, buildDescPrefix, TASK_DESC_PREFIX_STRIP_RE } from "./parser";
+import {
+  writeBackMetaIdByUid,
+  patchMetaLineIfUid,
+  appendLinkedScheduleUidToTaskMeta,
+  writeBackMetaIdByUidRemoveKeys,
+  metaLineHasUid,
+} from "./shared";
+import { getDefaultScheduleCategoryId, sanitizeScheduleCategoryIdForMeta } from "./schedule";
 import { archiveIndexByMonths, type ArchiveResult } from "./archiver";
-import type { RSLatteIndexItem, RSLatteItemType, RSLatteParsedLine } from "./types";
+import { isScheduleMemoLine, type RSLatteIndexItem, type RSLatteItemType, type RSLatteParsedLine } from "./types";
 import { archiveStableKey } from "./keys";
 // import { buildIndexLocator } from "./indexLocator";
-import type { BuiltinTaskListDef, BuiltinTaskListId, TaskCategoryDef, TaskDateField, TaskTimeRangeDef } from "../types/taskTypes";
+import type { TaskCategoryDef, TaskDateField, TaskTimeRangeDef } from "../types/taskTypes";
 import { fnv1a32 } from "../utils/hash";
 import { scanAllCachedWithStore } from "../rslatteSync/scanPipeline";
 import type { ContactsInteractionEntry } from "../contactsRSLatte/types";
 import { extractContactUidFromWikiTarget, parseContactRefsFromMarkdown } from "../services/contacts/contactRefParser";
+import { enrichWorkEventRefWithTaskContacts } from "../services/contacts/taskWorkEventContactRef";
 import { getNearestHeadingTitle } from "../services/markdown/headingLocator";
 import { flushQueueUpsertV2 } from "../rslatteSync/upsertFlusher";
-import { runReconcileAfterRebuild, runReconcileForType } from "../rslatteSync/reconcileRunner";
+import { runReconcileAfterRebuild, runReconcileForType, runReconcileSchedule } from "../rslatteSync/reconcileRunner";
 import type { WorkEventService } from "../services/workEventService";
 import { nextSolarDateForLunarBirthday } from "../utils/lunar";
-import { resolveSpaceIndexDir, resolveSpaceQueueDir } from "../services/spaceContext";
+import { resolveSpaceIndexDir, resolveSpaceQueueDir } from "../services/space/spaceContext";
+import {
+  computeTaskTags,
+  getTaskTodayKey,
+  getTopImportantTasks,
+  sanitizeTaskCategoryForMeta,
+} from "./task";
+import {
+  applyMemoIndexDerivedFields,
+  applyScheduleIndexDerivedFields,
+  applyTaskIndexDerivedFields,
+  filterParsedLinesForMemoIndex,
+  mergeScheduleItemsByFiles,
+  normalizeScheduleItems,
+} from "./indexMerge";
+import {
+  displayPhaseAfterTaskCheckbox,
+  indexItemTaskDisplayPhase,
+  normalizeRepeatRuleToken,
+  reconcileTaskDisplayPhase,
+  toIsoNow,
+} from "./utils";
+import { toLocalOffsetIsoString } from "../utils/localCalendarYmd";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
+import type { ScheduleCreateInput } from "../types/scheduleTypes";
 
 export type TaskRSLatteHost = {
   app: App;
@@ -193,6 +225,104 @@ function extractTags(app: App, file: TFile, content?: string): Set<string> {
   return out;
 }
 
+const META_SYNC_TAG_MAX_LEN = 64;
+const META_SYNC_MAX_TAGS = 48;
+const META_SYNC_MAX_SCHEDULE_LINKS = 32;
+const META_SYNC_MAX_CONTACT_UIDS = 16;
+
+/** 契约 §十三：白名单 meta_sync，供后端 jsonb 与手机 JSON 管道透传 */
+function buildMetaSyncFromParsedLine(p: RSLatteParsedLine): Record<string, unknown> | undefined {
+  const schema_version = 1;
+  const out: Record<string, unknown> = { schema_version };
+  const ex: Record<string, unknown> = ((p as any).extra ?? {}) as Record<string, unknown>;
+
+  const pushTrimmedTags = (key: string, arr: unknown) => {
+    if (!Array.isArray(arr)) return;
+    const slim = arr
+      .map((x) => String(x ?? "").trim().slice(0, META_SYNC_TAG_MAX_LEN))
+      .filter(Boolean)
+      .slice(0, META_SYNC_MAX_TAGS);
+    if (slim.length) out[key] = slim;
+  };
+
+  const parseLinkedSchedules = (): string[] => {
+    const fromArr = (p as any).linked_schedule_uids;
+    if (Array.isArray(fromArr)) {
+      return fromArr
+        .map((x: unknown) => String(x ?? "").trim())
+        .filter(Boolean)
+        .slice(0, META_SYNC_MAX_SCHEDULE_LINKS);
+    }
+    const raw = String(ex.linked_schedule_uids ?? "").trim();
+    if (!raw) return [];
+    return raw
+      .split(/[,;]/g)
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .slice(0, META_SYNC_MAX_SCHEDULE_LINKS);
+  };
+
+  if (p.itemType === "task") {
+    const links = parseLinkedSchedules();
+    if (links.length) out.linked_schedule_uids = links;
+
+    if (p.task_phase) out.task_phase = String(p.task_phase).slice(0, 64);
+    if (p.wait_until) out.wait_until = String(p.wait_until).slice(0, 32);
+    if (p.follow_up) out.follow_up = String(p.follow_up).slice(0, 32);
+    if (p.original_due) out.original_due = String(p.original_due).slice(0, 32);
+    if (typeof p.postpone_count === "number" && Number.isFinite(p.postpone_count)) {
+      out.postpone_count = Math.max(0, Math.floor(p.postpone_count));
+    }
+    if (p.starred === true) out.starred = true;
+    if (p.complexity) out.complexity = String(p.complexity).slice(0, 32);
+    if (typeof p.estimate_h === "number" && Number.isFinite(p.estimate_h)) {
+      out.estimate_h = p.estimate_h;
+    }
+    if (typeof p.importance_score === "number" && Number.isFinite(p.importance_score)) {
+      out.importance_score = p.importance_score;
+    }
+    if (p.importance_is_risk === true) out.importance_is_risk = true;
+    if (p.importance_is_today_action === true) out.importance_is_today_action = true;
+    if (p.progress_updated) out.progress_updated = String(p.progress_updated).slice(0, 48);
+
+    const uids = p.follow_contact_uids;
+    if (Array.isArray(uids) && uids.length) {
+      out.follow_contact_uids = uids
+        .map((x) => String(x ?? "").trim())
+        .filter(Boolean)
+        .slice(0, META_SYNC_MAX_CONTACT_UIDS);
+    }
+
+    pushTrimmedTags("task_tags", p.task_tags);
+  }
+
+  if (p.itemType === "memo") {
+    const ltu = String(ex.linked_task_uid ?? "").trim();
+    if (ltu) out.linked_task_uid = ltu.slice(0, 128);
+    pushTrimmedTags("memo_tags", p.memo_tags);
+    pushTrimmedTags("schedule_tags", p.schedule_tags);
+    for (const k of ["arranged_date", "arranged_start", "arranged_end"] as const) {
+      const v = ex[k];
+      if (v !== undefined && v !== null && String(v).trim()) {
+        out[k] = String(v).trim().slice(0, 32);
+      }
+    }
+  }
+
+  if (p.itemType === "schedule") {
+    pushTrimmedTags("schedule_tags", p.schedule_tags);
+    const ltu = String(ex.linked_task_uid ?? "").trim();
+    if (ltu) out.linked_task_uid = ltu.slice(0, 128);
+    const lo = String(ex.linked_output_id ?? "").trim();
+    if (lo) out.linked_output_id = lo.slice(0, 128);
+    const sc = String(ex.schedule_category ?? "").trim();
+    if (sc) out.schedule_category = sc.slice(0, 64);
+  }
+
+  if (Object.keys(out).length <= 1) return undefined;
+  return out;
+}
+
 function fileMatchesTags(app: App, file: TFile, content: string, includeTags: string[], excludeTags: string[]): boolean {
   const tags = extractTags(app, file, content);
   const ex = (excludeTags ?? []).map(normTag).filter(Boolean);
@@ -201,6 +331,52 @@ function fileMatchesTags(app: App, file: TFile, content: string, includeTags: st
   const inc = (includeTags ?? []).map(normTag).filter(Boolean);
   if (!inc.length) return true;
   return inc.some((t) => tags.has(t));
+}
+
+/** 日程入库载荷 → POST /schedules/upsert-batch（与 rslatte_schedule 对齐） */
+function buildScheduleCreatePayload(p: RSLatteParsedLine): any | null {
+  const sanitize = (s: any): string | undefined => {
+    if (s === undefined || s === null) return undefined;
+    const str = String(s);
+    try {
+      return str.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
+    } catch {
+      return str.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
+    }
+  };
+  const ex = ((p as any).extra ?? {}) as Record<string, unknown>;
+  const sd = String(ex.schedule_date ?? (p as any).memoDate ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(sd)) return null;
+
+  let durationMin: number | undefined;
+  const dmr = ex.duration_min;
+  if (dmr !== undefined && dmr !== null && String(dmr).trim() !== "") {
+    const n = Number(dmr);
+    if (Number.isFinite(n) && n >= 0) durationMin = Math.floor(n);
+  }
+
+  const payload: any = {
+    uid: (p as any).uid,
+    status: p.status,
+    text: sanitize(p.text) ?? "",
+    raw: sanitize(p.raw) ?? "",
+    file_path: p.filePath,
+    line_no: p.lineNo,
+    source_hash: p.sourceHash,
+    schedule_date: sd,
+    start_time: String(ex.start_time ?? "").trim() || undefined,
+    end_time: String(ex.end_time ?? "").trim() || undefined,
+    duration_min: durationMin,
+    schedule_category: String(ex.schedule_category ?? "").trim() || undefined,
+    linked_task_uid: String(ex.linked_task_uid ?? "").trim() || undefined,
+    linked_output_id: String(ex.linked_output_id ?? "").trim() || undefined,
+  };
+  const metaSync = buildMetaSyncFromParsedLine(p as RSLatteParsedLine);
+  if (metaSync) payload.meta_sync = metaSync;
+  for (const k of Object.keys(payload)) {
+    if (payload[k] === undefined || payload[k] === null || payload[k] === "") delete payload[k];
+  }
+  return payload;
 }
 
 function buildCreatePayload(p: RSLatteParsedLine): any {
@@ -218,6 +394,11 @@ function buildCreatePayload(p: RSLatteParsedLine): any {
     }
   };
 
+  if (p.itemType === "schedule") {
+    const sp = buildScheduleCreatePayload(p);
+    if (sp) return sp;
+  }
+
   const payload: any = {
     item_type: p.itemType,
     uid: (p as any).uid,
@@ -228,12 +409,12 @@ function buildCreatePayload(p: RSLatteParsedLine): any {
     line_no: p.lineNo,
     source_hash: p.sourceHash,
 
-    created_date: p.createdDate,
-    due_date: p.dueDate,
-    start_date: p.startDate,
-    scheduled_date: p.scheduledDate,
-    done_date: p.doneDate,
-    cancelled_date: p.cancelledDate,
+    created_date: p.created_date,
+    due_date: p.planned_end,
+    start_date: p.actual_start,
+    scheduled_date: p.planned_start,
+    done_date: p.done_date,
+    cancelled_date: p.cancelled_date,
 
     memo_date: p.memoDate,
     memo_mmdd: p.memoMmdd,
@@ -269,14 +450,20 @@ function buildCreatePayload(p: RSLatteParsedLine): any {
     if (extra.leap === "1" || extra.leap === 1 || extra.leap === true) payload.memo_leap = true;
   }
 
+  const metaSync = buildMetaSyncFromParsedLine(p as RSLatteParsedLine);
+  if (metaSync) payload.meta_sync = metaSync;
+
   // clean undefined
   for (const k of Object.keys(payload)) {
     if (payload[k] === undefined || payload[k] === null || payload[k] === "") delete payload[k];
   }
 
   // repeat_rule normalize
-  const rrAllowed = new Set(["none","weekly","monthly","seasonly","yearly"]); 
-  if (payload.repeat_rule && !rrAllowed.has(payload.repeat_rule)) payload.repeat_rule = "none";
+  const rrAllowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
+  if (payload.repeat_rule) {
+    const n = normalizeRepeatRuleToken(String(payload.repeat_rule));
+    payload.repeat_rule = rrAllowed.has(n) ? (n as any) : "none";
+  }
 
   return payload;
 }
@@ -363,6 +550,86 @@ export class TaskRSLatteService {
     this.queue = new SyncQueue(() => this.store.readQueue(), (q) => this.store.writeQueue(q));
   }
 
+  private addCycleDate(fromYmd: string, rule: string, steps = 1): string | null {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromYmd)) return null;
+    const d = new Date(`${fromYmd}T12:00:00`);
+    const rr = normalizeRepeatRuleToken(String(rule ?? "").trim().toLowerCase());
+    const n = Math.max(1, Number(steps) || 1);
+    if (rr === "weekly") d.setDate(d.getDate() + 7 * n);
+    else if (rr === "monthly") d.setMonth(d.getMonth() + n);
+    else if (rr === "quarterly") d.setMonth(d.getMonth() + 3 * n);
+    else if (rr === "yearly") d.setFullYear(d.getFullYear() + n);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${dd}`;
+  }
+
+  private async createNextCycleTaskFromDone(
+    it: Pick<RSLatteIndexItem, "uid" | "text"> & Partial<RSLatteIndexItem>,
+    repeatRule: string,
+    generatedOnYmd: string,
+    plannedEndYmd: string,
+    plannedStartYmd?: string
+  ): Promise<void> {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(plannedEndYmd)) return;
+
+    const text = String((it as any).text ?? "").trim();
+    if (!text) return;
+    const anchor = /^\d{4}-\d{2}-\d{2}$/.test(String(plannedStartYmd ?? "")) ? String(plannedStartYmd) : plannedEndYmd;
+    const toUtcDay = (ymd: string) => {
+      const [y, m, d] = ymd.split("-").map((x) => Number(x));
+      return Date.UTC(y, (m || 1) - 1, d || 1);
+    };
+    const todayUtc = toUtcDay(generatedOnYmd);
+    let step = 1;
+    while (step < 200) {
+      const nextAnchor = this.addCycleDate(anchor, repeatRule, step);
+      if (!nextAnchor) return;
+      if (toUtcDay(nextAnchor) >= todayUtc) break;
+      step += 1;
+    }
+    const nextDue = this.addCycleDate(plannedEndYmd, repeatRule, step);
+    const nextStart = plannedStartYmd ? this.addCycleDate(plannedStartYmd, repeatRule, step) : null;
+    if (!nextDue) return;
+
+    const uid = `lg_${Math.random().toString(16).slice(2, 12)}`;
+    const tsIso = nowIso();
+    const descPrefix = buildDescPrefix({
+      starred: !!(it as any).starred,
+      complexity: (it as any).complexity,
+    });
+    const estimate = Number((it as any).estimate_h ?? 0);
+    const metaParts = [`uid=${uid}`, `type=task`, `ts=${tsIso}`, `task_phase=todo`];
+    if (estimate > 0) metaParts.push(`estimate_h=${estimate}`);
+    if ((it as any).complexity && (it as any).complexity !== "normal") metaParts.push(`complexity=${(it as any).complexity}`);
+    const line = `- [ ] ${descPrefix}${text} 📅 ${nextDue}${nextStart ? ` ⏳ ${nextStart}` : ""} 🔁 ${repeatRule} ➕ ${generatedOnYmd}`;
+    const meta = `  <!-- rslatte:${metaParts.join(";")} -->`;
+
+    const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
+    const r = (rules.find((x) => x.module === "task") ?? { h1: "# 任务追踪", h2: "## 新增任务" }) as any;
+    const currentSpaceId = (this.host as any).getCurrentSpaceId?.() || "";
+    const spaces = (this.host.settingsRef() as any).spaces || {};
+    const currentSpace = spaces[currentSpaceId];
+    const spaceSnapshot = currentSpace?.settingsSnapshot || {};
+    const spaceDiaryPath = spaceSnapshot.diaryPath;
+    const spaceDiaryNameFormat = spaceSnapshot.diaryNameFormat;
+    const spaceDiaryTemplate = spaceSnapshot.diaryTemplate;
+    const originalPathOverride = (this.host.journalSvc as any)._diaryPathOverride;
+    const originalFormatOverride = (this.host.journalSvc as any)._diaryNameFormatOverride;
+    const originalTemplateOverride = (this.host.journalSvc as any)._diaryTemplateOverride;
+    try {
+      this.host.journalSvc.setDiaryPathOverride(
+        spaceDiaryPath || null,
+        spaceDiaryNameFormat || null,
+        spaceDiaryTemplate || null
+      );
+      await this.host.journalSvc.upsertLinesToDiaryH1H2(nextDue, r.h1, r.h2, [line, meta], { mode: "append" });
+    } finally {
+      this.host.journalSvc.setDiaryPathOverride(originalPathOverride, originalFormatOverride, originalTemplateOverride);
+    }
+  }
+
   /** settings change -> update base dir */
   public refreshStoreBaseDir() {
     const tp = this.host.settingsRef().taskPanel;
@@ -396,8 +663,8 @@ export class TaskRSLatteService {
 
     let updated = 0;
 
-    // 1) rewrite task/memo indexes
-    for (const type of ["task", "memo"] as const) {
+    // 1) rewrite task / memo / schedule indexes
+    for (const type of ["task", "memo", "schedule"] as const) {
       const idx = await this.store.readIndex(type);
       let changed = false;
       for (const it of idx.items ?? []) {
@@ -468,10 +735,39 @@ export class TaskRSLatteService {
     return (this.tp?.enableDbSync ?? true) === true;
   }
 
-  private async listCandidateMarkdownFiles(): Promise<TFile[]> {
-    const tp = this.tp;
-    const folders = uniq((tp?.taskFolders ?? []).map(safeNormFolder).filter(Boolean));
+  /** 当前空间日记根（与 record 扫描一致），用于并入 task/memo/schedule 候选路径 */
+  private getEffectiveDiaryRootForTaskScan(): string {
+    const s = this.host.settingsRef() as any;
+    const currentSpaceId = String(s?.currentSpaceId ?? "");
+    const spaces = s?.spaces || {};
+    const currentSpace = spaces[currentSpaceId];
+    const spaceDiaryPath = currentSpace?.settingsSnapshot?.diaryPath;
+    return normalizePath(String(spaceDiaryPath ?? s.diaryPath ?? "").trim());
+  }
 
+  /**
+   * 任务域扫描目录：taskFolders +（若未被任一 folder 覆盖则并入）日记根，保证「日记按月」子目录下的 `.md` 参与重建。
+   */
+  private getTaskScanFolders(): string[] {
+    const tp = this.tp;
+    let folders = uniq((tp?.taskFolders ?? []).map(safeNormFolder).filter(Boolean));
+    const diaryRoot = this.getEffectiveDiaryRootForTaskScan();
+    if (diaryRoot) {
+      const covered = folders.some((f) => {
+        if (!f) return false;
+        return (
+          diaryRoot === f ||
+          diaryRoot.startsWith(f + "/") ||
+          f.startsWith(diaryRoot + "/")
+        );
+      });
+      if (!covered) folders.push(diaryRoot);
+    }
+    return uniq(folders.filter(Boolean));
+  }
+
+  private async listCandidateMarkdownFiles(): Promise<TFile[]> {
+    const folders = this.getTaskScanFolders();
     const files = this.host.app.vault.getMarkdownFiles();
     return files.filter((f) => withinFolders(f.path, folders));
   }
@@ -490,12 +786,15 @@ export class TaskRSLatteService {
     if (debugLogEnabled && files.length > 0) {
       console.log(`[RSLatte][taskRSLatte] scanAllCached: Starting scan with ${files.length} candidate files:`, {
         totalFiles: files.length,
-        files: files.slice(0, 50).map(f => ({ path: f.path, mtime: new Date((f.stat as any)?.mtime ?? 0).toISOString() })), // 只显示前50个
+        files: files.slice(0, 50).map((f) => ({
+          path: f.path,
+          mtime: toLocalOffsetIsoString(new Date((f.stat as any)?.mtime ?? 0)),
+        })), // 只显示前50个
       });
     }
 
     // Build a filter key that invalidates the cache when relevant settings change.
-    const folders = uniq((tp?.taskFolders ?? []).map(safeNormFolder).filter(Boolean)).sort();
+    const folders = this.getTaskScanFolders().sort();
     const inc = uniq((tp?.includeTags ?? []).map(normTag).filter(Boolean)).sort();
     const ex = uniq((tp?.excludeTags ?? []).map(normTag).filter(Boolean)).sort();
     const filterKey = fnv1a32(JSON.stringify({ folders, inc, ex }));
@@ -527,22 +826,35 @@ export class TaskRSLatteService {
           // Step3: extract contact refs from *task lines* only, with status derived from task parser.
           // Best-effort: never throw.
           try {
-            const nowIso = new Date().toISOString();
+            const nowIso = toIsoNow();
             const contentLines = String(content ?? "").replace(/\r\n/g, "\n").split("\n");
-            const all = parseContactRefsFromMarkdown(content, {
+            const allTask = parseContactRefsFromMarkdown(content, {
               source_path: filePath,
               source_type: "task",
+              updated_at: nowIso,
+            });
+            const allMemo = parseContactRefsFromMarkdown(content, {
+              source_path: filePath,
+              source_type: "memo",
               updated_at: nowIso,
             });
 
             // Group refs by line_no (1-based)
             const byLine = new Map<number, ContactsInteractionEntry[]>();
-            for (const e of all) {
+            for (const e of allTask) {
               const ln = Number(e.line_no ?? 0);
               if (!ln) continue;
               const arr = byLine.get(ln) ?? [];
               arr.push(e);
               byLine.set(ln, arr);
+            }
+            const byLineMemo = new Map<number, ContactsInteractionEntry[]>();
+            for (const e of allMemo) {
+              const ln = Number(e.line_no ?? 0);
+              if (!ln) continue;
+              const arr = byLineMemo.get(ln) ?? [];
+              arr.push(e);
+              byLineMemo.set(ln, arr);
             }
 
             const out: ContactsInteractionEntry[] = [];
@@ -551,10 +863,9 @@ export class TaskRSLatteService {
               if (ln < 0) continue;
               const lineNo1 = ln + 1;
               const refs = (byLine.get(lineNo1) ?? []).slice();
+              for (const r of refs) (r as any).follow_association_type = "strong";
 
-              // Extra-robust: if a single task line contains multiple contact refs but the
-              // file-level parser missed some (e.g. unusual link target/path), parse the
-              // current line again and补齐缺失联系人。
+              // Extra-robust: 任务描述中 [[C_xxx]] 为强关联，整段活跃期「关注中」，完成/取消后「已结束」
               try {
                 const lineText = String(contentLines[ln] ?? (t as any)?.raw ?? "");
                 const re = /\[\[([^\]]+)\]\]/g;
@@ -582,6 +893,83 @@ export class TaskRSLatteService {
                       heading,
                       updated_at: nowIso,
                       key: `${uid}|${filePath}|task|${lineNo1}`,
+                      follow_association_type: "strong",
+                    } as any);
+                  }
+                }
+              } catch {
+                // ignore
+              }
+              // meta 中 follow_contact_uids 为弱关联，仅「跟进中」「等待中」时「关注中」，其他状态「已结束」
+              const followUids: string[] = Array.isArray((t as any)?.follow_contact_uids) ? (t as any).follow_contact_uids : [];
+              const existingRefUids = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
+              if (followUids.length > 0) {
+                const heading = getNearestHeadingTitle(contentLines, ln);
+                const snippet = String(contentLines[ln] ?? (t as any)?.raw ?? "").trimEnd().slice(0, 240);
+                for (const uid of followUids) {
+                  const u = String(uid ?? "").trim();
+                  if (!u || existingRefUids.has(u)) continue;
+                  refs.push({
+                    contact_uid: u,
+                    source_path: filePath,
+                    source_type: "task",
+                    snippet,
+                    line_no: lineNo1,
+                    heading,
+                    updated_at: nowIso,
+                    key: `${u}|${filePath}|task|${lineNo1}`,
+                    follow_association_type: "weak",
+                  } as any);
+                  existingRefUids.add(u);
+                }
+              }
+
+              if (!refs || refs.length === 0) continue;
+              const status = mapTaskStatus((t as any)?.status);
+              const taskPhase = String((t as any)?.task_phase ?? "").trim();
+              const taskPhaseOpt = taskPhase || undefined;
+              for (const r of refs) {
+                const assoc = (r as any).follow_association_type as "strong" | "weak" | undefined;
+                const followStatus: "following" | "ended" =
+                  assoc === "strong"
+                    ? (status === "done" || status === "cancelled" ? "ended" : "following")
+                    : (taskPhase === "waiting_others" || taskPhase === "waiting_until" ? "following" : "ended");
+                out.push({
+                  ...r,
+                  status,
+                  follow_status: followStatus,
+                  task_phase: taskPhaseOpt,
+                  updated_at: nowIso,
+                  source_block_id: String((t as any)?.uid ?? "") || undefined,
+                } as any);
+              }
+            }
+
+            for (const m of parsed?.memos ?? []) {
+              const ln = Number((m as any)?.lineNo ?? -1);
+              if (ln < 0) continue;
+              const lineNo1 = ln + 1;
+              const refs = (byLineMemo.get(lineNo1) ?? []).slice();
+              for (const r of refs) (r as any).follow_association_type = "strong";
+              // 兜底：生日提醒等场景可能没有 [[C_xxx|姓名]]，但会在 meta 中写 contact_uid
+              try {
+                const rawMetaUid = String((m as any)?.extra?.contact_uid ?? "").trim();
+                const metaUid = extractContactUidFromWikiTarget(rawMetaUid) || rawMetaUid.replace(/^C_/, "");
+                if (metaUid) {
+                  const existing = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
+                  if (!existing.has(metaUid)) {
+                    const heading = getNearestHeadingTitle(contentLines, ln);
+                    const snippet = String(contentLines[ln] ?? (m as any)?.raw ?? "").trimEnd().slice(0, 240);
+                    refs.push({
+                      contact_uid: metaUid,
+                      source_path: filePath,
+                      source_type: "memo",
+                      snippet,
+                      line_no: lineNo1,
+                      heading,
+                      updated_at: nowIso,
+                      key: `${metaUid}|${filePath}|memo|${lineNo1}`,
+                      follow_association_type: "strong",
                     } as any);
                   }
                 }
@@ -590,13 +978,16 @@ export class TaskRSLatteService {
               }
 
               if (!refs || refs.length === 0) continue;
-              const status = mapTaskStatus((t as any)?.status);
+              const status = mapTaskStatus((m as any)?.status);
+              const memoSourceType = isScheduleMemoLine(m as any) ? "schedule" : "memo";
               for (const r of refs) {
                 out.push({
                   ...r,
+                  source_type: memoSourceType,
                   status,
+                  follow_status: status === "done" || status === "cancelled" ? "ended" : "following",
                   updated_at: nowIso,
-                  source_block_id: String((t as any)?.uid ?? "") || undefined,
+                  source_block_id: String((m as any)?.uid ?? "") || undefined,
                 } as any);
               }
             }
@@ -611,6 +1002,176 @@ export class TaskRSLatteService {
     );
 
     return { ...r, contactInteractionsByFile };
+  }
+
+  /**
+   * 针对单个任务文件构建联系人互动条目（与 scanAllCached 中 onIncludedFileParsed 逻辑一致）。
+   * 用于新增/编辑任务后立即刷新该文件对应的 contacts-interactions，避免依赖全量扫描时序。
+   */
+  public async buildContactInteractionsForFile(filePath: string): Promise<{ mtime: number; entries: ContactsInteractionEntry[] }> {
+    const path = normalizePath(String(filePath ?? "").trim());
+    if (!path) return { mtime: 0, entries: [] };
+    const af = this.host.app.vault.getAbstractFileByPath(path);
+    if (!af || !(af instanceof TFile)) return { mtime: 0, entries: [] };
+    const content = await this.host.app.vault.read(af);
+    const mtime = Number((af.stat as any)?.mtime ?? 0);
+    const contentLines = String(content ?? "").replace(/\r\n/g, "\n").split("\n");
+    const nowIso = toIsoNow();
+    const parsed = parseRSLatteFile(path, content, { fixUidAndMeta: false });
+    const mapTaskStatus = (st: any): string => {
+      const s = String(st ?? "").toUpperCase();
+      if (s === "DONE") return "done";
+      if (s === "IN_PROGRESS") return "in_progress";
+      if (s === "CANCELLED") return "cancelled";
+      if (s === "TODO") return "todo";
+      return "unknown";
+    };
+    const all = parseContactRefsFromMarkdown(content, { source_path: path, source_type: "task", updated_at: nowIso });
+    const allMemo = parseContactRefsFromMarkdown(content, { source_path: path, source_type: "memo", updated_at: nowIso });
+    const byLine = new Map<number, ContactsInteractionEntry[]>();
+    for (const e of all) {
+      const ln = Number(e.line_no ?? 0);
+      if (!ln) continue;
+      const arr = byLine.get(ln) ?? [];
+      arr.push(e);
+      byLine.set(ln, arr);
+    }
+    const byLineMemo = new Map<number, ContactsInteractionEntry[]>();
+    for (const e of allMemo) {
+      const ln = Number(e.line_no ?? 0);
+      if (!ln) continue;
+      const arr = byLineMemo.get(ln) ?? [];
+      arr.push(e);
+      byLineMemo.set(ln, arr);
+    }
+    const out: ContactsInteractionEntry[] = [];
+    for (const t of parsed?.tasks ?? []) {
+      const ln = Number((t as any)?.lineNo ?? -1);
+      if (ln < 0) continue;
+      const lineNo1 = ln + 1;
+      const refs = (byLine.get(lineNo1) ?? []).slice();
+      for (const r of refs) (r as any).follow_association_type = "strong";
+      try {
+        const lineText = String(contentLines[ln] ?? (t as any)?.raw ?? "");
+        const re = /\[\[([^\]]+)\]\]/g;
+        let m: RegExpExecArray | null;
+        const found = new Set<string>();
+        while ((m = re.exec(lineText)) !== null) {
+          const target = (String(m[1] ?? "").split("|")[0] ?? "").trim();
+          const uid = extractContactUidFromWikiTarget(target);
+          if (uid) found.add(uid);
+        }
+        if (found.size > 0) {
+          const existing = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
+          const heading = getNearestHeadingTitle(contentLines, ln);
+          const snippet = String(lineText ?? "").trimEnd().slice(0, 240);
+          for (const uid of found) {
+            if (!uid || existing.has(uid)) continue;
+            refs.push({
+              contact_uid: uid,
+              source_path: path,
+              source_type: "task",
+              snippet,
+              line_no: lineNo1,
+              heading,
+              updated_at: nowIso,
+              key: `${uid}|${path}|task|${lineNo1}`,
+              follow_association_type: "strong",
+            } as any);
+            existing.add(uid);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      const followUids: string[] = Array.isArray((t as any)?.follow_contact_uids) ? (t as any).follow_contact_uids : [];
+      const existingRefUids = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
+      if (followUids.length > 0) {
+        const heading = getNearestHeadingTitle(contentLines, ln);
+        const snippet = String(contentLines[ln] ?? (t as any)?.raw ?? "").trimEnd().slice(0, 240);
+        for (const uid of followUids) {
+          const u = String(uid ?? "").trim();
+          if (!u || existingRefUids.has(u)) continue;
+          refs.push({
+            contact_uid: u,
+            source_path: path,
+            source_type: "task",
+            snippet,
+            line_no: lineNo1,
+            heading,
+            updated_at: nowIso,
+            key: `${u}|${path}|task|${lineNo1}`,
+            follow_association_type: "weak",
+          } as any);
+          existingRefUids.add(u);
+        }
+      }
+      if (!refs?.length) continue;
+      const status = mapTaskStatus((t as any)?.status);
+      const taskPhase = String((t as any)?.task_phase ?? "").trim();
+      const taskPhaseOpt = taskPhase || undefined;
+      for (const r of refs) {
+        const assoc = (r as any).follow_association_type as "strong" | "weak" | undefined;
+        const followStatus: "following" | "ended" =
+          assoc === "strong"
+            ? (status === "done" || status === "cancelled" ? "ended" : "following")
+            : (taskPhase === "waiting_others" || taskPhase === "waiting_until" ? "following" : "ended");
+        out.push({
+          ...r,
+          status,
+          follow_status: followStatus,
+          task_phase: taskPhaseOpt,
+          updated_at: nowIso,
+          source_block_id: String((t as any)?.uid ?? "") || undefined,
+        } as any);
+      }
+    }
+    for (const m of parsed?.memos ?? []) {
+      const ln = Number((m as any)?.lineNo ?? -1);
+      if (ln < 0) continue;
+      const lineNo1 = ln + 1;
+      const refs = (byLineMemo.get(lineNo1) ?? []).slice();
+      for (const r of refs) (r as any).follow_association_type = "strong";
+      // 兜底：生日提醒等场景可能没有 [[C_xxx|姓名]]，但会在 meta 中写 contact_uid
+      try {
+        const rawMetaUid = String((m as any)?.extra?.contact_uid ?? "").trim();
+        const metaUid = extractContactUidFromWikiTarget(rawMetaUid) || rawMetaUid.replace(/^C_/, "");
+        if (metaUid) {
+          const existing = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
+          if (!existing.has(metaUid)) {
+            const heading = getNearestHeadingTitle(contentLines, ln);
+            const snippet = String(contentLines[ln] ?? (m as any)?.raw ?? "").trimEnd().slice(0, 240);
+            refs.push({
+              contact_uid: metaUid,
+              source_path: path,
+              source_type: "memo",
+              snippet,
+              line_no: lineNo1,
+              heading,
+              updated_at: nowIso,
+              key: `${metaUid}|${path}|memo|${lineNo1}`,
+              follow_association_type: "strong",
+            } as any);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      if (!refs?.length) continue;
+      const status = mapTaskStatus((m as any)?.status);
+      const memoSourceType = isScheduleMemoLine(m as any) ? "schedule" : "memo";
+      for (const r of refs) {
+        out.push({
+          ...r,
+          source_type: memoSourceType,
+          status,
+          follow_status: status === "done" || status === "cancelled" ? "ended" : "following",
+          updated_at: nowIso,
+          source_block_id: String((m as any)?.uid ?? "") || undefined,
+        } as any);
+      }
+    }
+    return { mtime, entries: out };
   }
 
   // =========================
@@ -640,12 +1201,12 @@ export class TaskRSLatteService {
 
   private getFieldDate(it: RSLatteIndexItem, field: TaskDateField): string | undefined {
     switch (field) {
-      case "due": return it.dueDate;
-      case "start": return it.startDate;
-      case "scheduled": return it.scheduledDate;
-      case "created": return it.createdDate;
-      case "done": return it.doneDate;
-      case "cancelled": return it.cancelledDate;
+      case "due": return it.planned_end;
+      case "start": return it.actual_start;
+      case "scheduled": return it.planned_start;
+      case "created": return it.created_date;
+      case "done": return it.done_date;
+      case "cancelled": return it.cancelled_date;
       default: return undefined;
     }
   }
@@ -739,97 +1300,222 @@ export class TaskRSLatteService {
   }
 
   /**
-   * 供 Side Panel 2 使用：从索引中查询内置任务清单
-   * （不再支持自定义 timeRanges/categories）
+   * 任务清单分区数据（第十二节新结构）：供侧栏 1→2→3→4 渲染，互斥与排序在内部完成
    */
-  public async queryBuiltinListWithTotal(
-    listId: BuiltinTaskListId,
-    cfg: BuiltinTaskListDef
-  ): Promise<{ items: RSLatteIndexItem[]; total: number }> {
+  public async getTaskListsForSidePanel(): Promise<{
+    focus: RSLatteIndexItem[];
+    todayAction: RSLatteIndexItem[];
+    todayFollowUp: RSLatteIndexItem[];
+    overdue: RSLatteIndexItem[];
+    otherRisk: RSLatteIndexItem[];
+    otherActive: RSLatteIndexItem[];
+    closedCancelled: RSLatteIndexItem[];
+    closedDone: RSLatteIndexItem[];
+  }> {
     await this.ensureReady();
-
     let idx = await this.store.readIndex("task");
     if (!(idx.items ?? []).length) {
       await this.refreshIndexAndSync({ sync: this.enableSync });
       idx = await this.store.readIndex("task");
     }
+    const today = getTaskTodayKey(this.tp);
+    const overdueWithinDays = Math.min(30, Math.max(1, Number(this.tp?.overdueWithinDays) ?? 3));
+    const closedWindowDays = Math.min(90, Math.max(1, Number(this.tp?.closedTaskWindowDays) ?? 7));
+    const focusTopN = Math.min(10, Math.max(3, Number(this.tp?.focusTopN) ?? 3));
+    const closedStart = momentFn(today, "YYYY-MM-DD").subtract(closedWindowDays - 1, "days").format("YYYY-MM-DD");
 
-    const today = momentFn().format("YYYY-MM-DD");
-    const weekStart = momentFn(today).startOf("isoWeek").format("YYYY-MM-DD");
-    const weekEnd = momentFn(today).endOf("isoWeek").format("YYYY-MM-DD");
-    const cancelled7dStart = momentFn(today).startOf("day").subtract(6, "days").format("YYYY-MM-DD");
-
-    const isTodoLike = (s: string) => s === "TODO" || s === "IN_PROGRESS";
-
-    const match = (it: RSLatteIndexItem): boolean => {
-      if (it.archived) return false;
-
-      const st = (it.status ?? "UNKNOWN").toUpperCase();
-      const due = it.dueDate;
-      const start = it.startDate;
-      const done = it.doneDate;
-      const cancelled = it.cancelledDate;
-
-      switch (listId) {
-        case "todayTodo":
-          return !!due && due === today && isTodoLike(st);
-        case "weekTodo":
-          return !!due && due >= weekStart && due <= weekEnd && isTodoLike(st);
-        case "inProgress":
-          if (st === "IN_PROGRESS") return true;
-          return st === "TODO" && !!start && start < today;
-        case "overdue":
-          return !!due && due < today && isTodoLike(st);
-        case "todayDone":
-          return (st === "DONE" || st === "CANCELLED") && ((done === today) || (cancelled === today));
-        case "cancelled7d":
-          return st === "CANCELLED" && !!cancelled && cancelled >= cancelled7dStart && cancelled <= today;
-        case "allTasks":
-          // 全量任务清单：返回所有未归档的任务，不限制状态和日期
-          return true;
-        default:
-          return false;
-      }
+    const itemKey = (it: RSLatteIndexItem) =>
+      String((it as any).uid ?? "").trim() || `${(it as any).filePath ?? ""}#${(it as any).lineNo ?? 0}`;
+    const isActive = (it: RSLatteIndexItem) => {
+      if ((it as any).archived) return false;
+      const st = String((it as any).status ?? "").toUpperCase();
+      return st !== "DONE" && st !== "CANCELLED";
     };
+    const toYmd = (s?: string) => (s && /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : undefined);
+    const addDays = (ymd: string, days: number) =>
+      momentFn(ymd, "YYYY-MM-DD").add(days, "days").format("YYYY-MM-DD");
+    const todayEnd = addDays(today, overdueWithinDays);
 
-    const max = Math.min(Math.max(Number(cfg.maxItems || 0), 1), 30);
-    const itemsAll = (idx.items ?? []).filter(match);
-    const total = itemsAll.length;
+    const all = (idx.items ?? []) as RSLatteIndexItem[];
+    const active = all.filter(isActive);
+    const inSet = (set: Set<string>, it: RSLatteIndexItem) => set.has(itemKey(it));
+    const addToSet = (set: Set<string>, items: RSLatteIndexItem[]) =>
+      items.forEach((it) => set.add(itemKey(it)));
 
-    const field = cfg.sortField;
-    const order = cfg.sortOrder;
-    const getKey = (t: RSLatteIndexItem) => this.getFieldDate(t, field);
+    const indexTagsDay = (idx as { tagsDerivedForYmd?: string }).tagsDerivedForYmd;
+    const focus = getTopImportantTasks(active, today, this.tp, focusTopN, { indexTagsDay });
+    const inFocus = new Set<string>();
+    addToSet(inFocus, focus);
 
-    itemsAll.sort((a, b) => {
-      const ka = getKey(a);
-      const kb = getKey(b);
-      const aMiss = !ka;
-      const bMiss = !kb;
-      if (aMiss && bMiss) {
-        if (a.filePath !== b.filePath) return a.filePath.localeCompare(b.filePath);
-        return (a.lineNo ?? 0) - (b.lineNo ?? 0);
+    const todayAction: RSLatteIndexItem[] = [];
+    for (const it of active) {
+      if (inSet(inFocus, it)) continue;
+      const due = toYmd((it as any).planned_end);
+      const start = toYmd((it as any).actual_start);
+      if (due === today || start === today) todayAction.push(it);
+    }
+    todayAction.sort((a, b) => ((b as any).importance_score ?? 0) - ((a as any).importance_score ?? 0));
+    const inTodayAction = new Set<string>();
+    addToSet(inTodayAction, todayAction);
+
+    const todayFollowUp: RSLatteIndexItem[] = [];
+    const phase = (it: RSLatteIndexItem) =>
+      reconcileTaskDisplayPhase(String((it as any).status ?? ""), (it as any).task_phase, {
+        wait_until: (it as any).wait_until,
+        follow_up: (it as any).follow_up,
+      });
+    const waitUntil = (it: RSLatteIndexItem) => toYmd((it as any).wait_until);
+    const followUp = (it: RSLatteIndexItem) => toYmd((it as any).follow_up);
+    for (const it of active) {
+      if (inSet(inTodayAction, it)) continue;
+      if (inSet(inFocus, it)) continue;
+      if ((phase(it) === "waiting_until" && waitUntil(it) === today) || (phase(it) === "waiting_others" && followUp(it) === today))
+        todayFollowUp.push(it);
+    }
+    todayFollowUp.sort((a, b) => ((b as any).importance_score ?? 0) - ((a as any).importance_score ?? 0));
+    const inTodayFollowUp = new Set<string>();
+    addToSet(inTodayFollowUp, todayFollowUp);
+
+    const overdue: RSLatteIndexItem[] = [];
+    const due = (it: RSLatteIndexItem) => toYmd((it as any).planned_end);
+    const postponeCount = (it: RSLatteIndexItem) => Math.max(0, Number((it as any).postpone_count) ?? 0);
+    const originalDue = (it: RSLatteIndexItem) => toYmd((it as any).original_due);
+    for (const it of active) {
+      if (inSet(inTodayAction, it) || inSet(inTodayFollowUp, it)) continue;
+      if (inSet(inFocus, it)) continue;
+      const d = due(it);
+      if (!d) continue;
+      if (d < today) overdue.push(it);
+      else if (d >= today && d <= todayEnd) overdue.push(it);
+      else if (postponeCount(it) > 2 && originalDue(it) && today > originalDue(it)!) overdue.push(it);
+    }
+    overdue.sort((a, b) => {
+      const da = due(a) ?? "9999-99-99";
+      const db = due(b) ?? "9999-99-99";
+      return da.localeCompare(db);
+    });
+    const inOverdue = new Set<string>();
+    addToSet(inOverdue, overdue);
+
+    const riskTags = new Set(["已延期", "高拖延风险", "假活跃"]);
+    const tagsFresh = indexTagsDay === today;
+    const hasRiskTag = (it: RSLatteIndexItem) => {
+      const arr = (it as any).task_tags as string[] | undefined;
+      if (tagsFresh && Array.isArray(arr) && arr.length > 0) {
+        return arr.some((t) => riskTags.has(t));
       }
-      if (aMiss) return 1;
-      if (bMiss) return -1;
-      if (ka === kb) {
-        if (a.filePath !== b.filePath) return a.filePath.localeCompare(b.filePath);
-        return (a.lineNo ?? 0) - (b.lineNo ?? 0);
-      }
-      const cmp = ka! < kb! ? -1 : 1;
-      return order === "desc" ? -cmp : cmp;
+      const tags = computeTaskTags(it, today, this.tp);
+      return tags.some((t) => riskTags.has(t));
+    };
+    const otherRisk: RSLatteIndexItem[] = [];
+    for (const it of active) {
+      if (inSet(inTodayAction, it) || inSet(inTodayFollowUp, it) || inSet(inOverdue, it)) continue;
+      if (inSet(inFocus, it)) continue;
+      if (hasRiskTag(it)) otherRisk.push(it);
+    }
+    otherRisk.sort((a, b) => {
+      const da = due(a) ?? "9999-99-99";
+      const db = due(b) ?? "9999-99-99";
+      return da.localeCompare(db);
+    });
+    const inOtherRisk = new Set<string>();
+    addToSet(inOtherRisk, otherRisk);
+
+    const otherActive: RSLatteIndexItem[] = [];
+    for (const it of active) {
+      if (inSet(inTodayAction, it) || inSet(inTodayFollowUp, it) || inSet(inOverdue, it) || inSet(inOtherRisk, it))
+        continue;
+      otherActive.push(it);
+    }
+    otherActive.sort((a, b) => {
+      const da = due(a) ?? "9999-99-99";
+      const db = due(b) ?? "9999-99-99";
+      return da.localeCompare(db);
     });
 
-    return { items: itemsAll.slice(0, max), total };
+    const closed = all.filter((it) => (it as any).status === "DONE" || (it as any).status === "CANCELLED");
+    const cancelledDate = (it: RSLatteIndexItem) => toYmd((it as any).cancelled_date);
+    const doneDate = (it: RSLatteIndexItem) => toYmd((it as any).done_date);
+    const closedCancelled = closed
+      .filter((it) => (it as any).status === "CANCELLED" && cancelledDate(it) && cancelledDate(it)! >= closedStart && cancelledDate(it)! <= today)
+      .sort((a, b) => (cancelledDate(b) ?? "").localeCompare(cancelledDate(a) ?? ""));
+    const closedDone = closed
+      .filter((it) => (it as any).status === "DONE" && doneDate(it) && doneDate(it)! >= closedStart && doneDate(it)! <= today)
+      .sort((a, b) => (doneDate(b) ?? "").localeCompare(doneDate(a) ?? ""));
+
+    return {
+      focus,
+      todayAction,
+      todayFollowUp,
+      overdue,
+      otherRisk,
+      otherActive,
+      closedCancelled,
+      closedDone,
+    };
   }
 
-  public async queryBuiltinList(listId: BuiltinTaskListId, cfg: BuiltinTaskListDef): Promise<RSLatteIndexItem[]> {
-    const { items } = await this.queryBuiltinListWithTotal(listId, cfg);
-    return items;
+  /**
+   * 重要性 Top N：从候选池中取前 n 条并应用约束（风险类最多 1 条，至少 1 条今天明确要处理）
+   */
+  public async getTopImportantTasks(n: number): Promise<RSLatteIndexItem[]> {
+    await this.ensureReady();
+    let idx = await this.store.readIndex("task");
+    if (!(idx.items ?? []).length) {
+      await this.refreshIndexAndSync({ sync: this.enableSync });
+      idx = await this.store.readIndex("task");
+    }
+    const active = (idx.items ?? []).filter((it) => {
+      if ((it as any).archived) return false;
+      const st = String((it as any).status ?? "").toUpperCase();
+      return st !== "DONE" && st !== "CANCELLED";
+    });
+    const today = getTaskTodayKey(this.tp);
+    const indexTagsDay = (idx as { tagsDerivedForYmd?: string }).tagsDerivedForYmd;
+    return getTopImportantTasks(active, today, this.tp, Math.max(0, Math.min(10, n)), { indexTagsDay });
   }
 
-  private async mergeIntoIndex(type: RSLatteItemType, parsed: RSLatteParsedLine[]): Promise<RSLatteIndexItem[]> {
+  /** 提醒索引根级 tagsDerivedForYmd（与 memo_tags 是否可直读相关） */
+  public async getMemoIndexTagsDerivedDay(): Promise<string | undefined> {
+    const idx = await this.store.readIndex("memo");
+    return idx.tagsDerivedForYmd;
+  }
+
+  /** 日程索引根级 tagsDerivedForYmd */
+  public async getScheduleIndexTagsDerivedDay(): Promise<string | undefined> {
+    const idx = await this.store.readIndex("schedule");
+    return idx.tagsDerivedForYmd;
+  }
+
+  /** 任务索引根级 tagsDerivedForYmd（与 task_tags 是否可直读一致，见 getTaskListsForSidePanel） */
+  public async getTaskIndexTagsDerivedDay(): Promise<string | undefined> {
+    const idx = await this.store.readIndex("task");
+    return idx.tagsDerivedForYmd;
+  }
+
+  /** schedule pipeline 归档等：读取 schedule-index 条目（经 IndexStore，与 mergeIntoIndex 路径一致） */
+  public async readScheduleIndexItems(): Promise<RSLatteIndexItem[]> {
+    const idx = await this.store.readIndex("schedule");
+    return (idx.items ?? []) as RSLatteIndexItem[];
+  }
+
+  /**
+   * 合并写入索引：task / memo / **schedule**（日程走 schedule-index，与 schedule pipeline 同源逻辑）。
+   * @param scheduleOpts 仅当 type==="schedule" 时有效：`replaceAll` 表示全量替换（重建/归档裁剪）；否则按 touched/removed 做增量合并。
+   */
+  public async mergeIntoIndex(
+    type: RSLatteItemType,
+    parsed: RSLatteParsedLine[],
+    scheduleOpts?: { touchedFilePaths?: string[]; removedFilePaths?: string[]; replaceAll?: boolean }
+  ): Promise<RSLatteIndexItem[]> {
+    if (type === "schedule") {
+      return this.mergeScheduleIntoIndex(parsed ?? [], scheduleOpts);
+    }
+
     const idx = await this.store.readIndex(type);
     const existing = idx.items ?? [];
+
+    const linesToMerge = type === "memo" ? filterParsedLinesForMemoIndex(parsed ?? []) : (parsed ?? []);
 
     // Idempotent archive support: closed tasks/memos may remain in daily notes and thus be re-scanned.
     // If they were archived already (and removed from main index), we should not re-add them to main index
@@ -839,9 +1525,13 @@ export class TaskRSLatteService {
     const today = momentFn().format("YYYY-MM-DD");
     const thresholdDaysRaw = this.tp.archiveThresholdDays;
     const keepMonthsRaw = this.tp.archiveKeepMonths;
-    const thresholdDays = Number.isFinite(thresholdDaysRaw)
-      ? Math.max(1, Math.min(3650, Math.floor(Number(thresholdDaysRaw))))
-      : (Number.isFinite(keepMonthsRaw) ? Math.max(0, Math.floor(Number(keepMonthsRaw))) * 30 : 90);
+    const thresholdDays = normalizeArchiveThresholdDays(
+      Number.isFinite(thresholdDaysRaw)
+        ? Number(thresholdDaysRaw)
+        : Number.isFinite(keepMonthsRaw)
+          ? Math.max(0, Math.floor(Number(keepMonthsRaw))) * 30
+          : 90,
+    );
     const cutoff = momentFn(today).startOf("day").subtract(thresholdDays, "days").format("YYYY-MM-DD");
 
     const mapFile = await this.store.readArchiveMap();
@@ -856,10 +1546,10 @@ export class TaskRSLatteService {
       byLoc.set(`${it.filePath}#${it.lineNo}`, it);
     }
 
-    const seenAt = new Date().toISOString();
+    const seenAt = toIsoNow();
     const merged: RSLatteIndexItem[] = [];
 
-    for (const p of parsed) {
+    for (const p of linesToMerge) {
       const old = p.uid ? byUid.get(p.uid) : byLoc.get(`${p.filePath}#${p.lineNo}`);
 
       const itemId = p.itemType === "task" ? (p.tid ?? old?.itemId) : (p.mid ?? old?.itemId);
@@ -875,16 +1565,16 @@ export class TaskRSLatteService {
 
       const getArchiveDateForIdempotency = (): string | null => {
         // 1) CLOSED items (task + memo): archive by ✅/❌ date
-        if (p.status === "CANCELLED") return p.cancelledDate || today;
-        if (p.status === "DONE") return p.doneDate || today;
+        if (p.status === "CANCELLED") return p.cancelled_date || today;
+        if (p.status === "DONE") return p.done_date || today;
 
         // 2) task: non-closed tasks are never archived
         if (type === "task") return null;
 
         // 3) memo: non-closed
-        let rule = String((p as any).repeatRule || "").trim().toLowerCase();
+        let rule = normalizeRepeatRuleToken(String((p as any).repeatRule || "").trim().toLowerCase());
         if (!rule) rule = (p as any).memoMmdd ? "yearly" : "none";
-        const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+        const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
         const rr = allowed.has(rule) ? rule : "none";
         if (rr !== "none") return null;
 
@@ -911,8 +1601,106 @@ export class TaskRSLatteService {
       } as RSLatteIndexItem);
     }
 
-    await this.store.writeIndex(type, { version: 1, updatedAt: seenAt, items: merged });
+    if (type === "task") {
+      const { items: taskItems, tagsDerivedForYmd } = applyTaskIndexDerivedFields(merged, this.tp);
+      await this.store.writeIndex(type, {
+        version: 1,
+        updatedAt: seenAt,
+        items: taskItems,
+        tagsDerivedForYmd,
+      });
+      await this.writeImportanceToTaskMeta(taskItems);
+    } else {
+      await this.writeMemoIndexWithDerivedTags(merged, seenAt);
+    }
     return merged;
+  }
+
+  /** 日程索引：增量/全量合并、写 schedule_tags、触发 e2 自动下一条提醒（与 schedule pipeline 共用） */
+  private async mergeScheduleIntoIndex(
+    parsed: RSLatteParsedLine[],
+    opts?: { touchedFilePaths?: string[]; removedFilePaths?: string[]; replaceAll?: boolean }
+  ): Promise<RSLatteIndexItem[]> {
+    const seenAt = toIsoNow();
+    const panel = (this.host.settingsRef() as any)?.taskPanel;
+    const idx = await this.store.readIndex("schedule");
+    const existing = idx.items ?? [];
+    let merged: RSLatteIndexItem[];
+    if (opts?.replaceAll) {
+      merged = normalizeScheduleItems(parsed as any[]);
+    } else {
+      merged = mergeScheduleItemsByFiles({
+        existing,
+        scanned: parsed ?? [],
+        touchedFilePaths: opts?.touchedFilePaths,
+        removedFilePaths: opts?.removedFilePaths,
+      });
+    }
+    const { items, tagsDerivedForYmd } = applyScheduleIndexDerivedFields(merged, panel);
+    await this.store.writeIndex("schedule", {
+      version: 1,
+      updatedAt: seenAt,
+      items,
+      tagsDerivedForYmd,
+    });
+    await this.e2AutoCreateNextMemoEntries(items);
+    if (this.enableSync) {
+      const list = (items ?? []).filter((x) => !(x as any)?.archived) as RSLatteIndexItem[];
+      await this.enqueueMissingIds("schedule", list);
+      await this.enqueueUpdates("schedule", list);
+      const raw = Number(this.tp?.upsertBatchSize ?? 50);
+      const batchSize = Math.max(1, Math.min(500, Number.isFinite(raw) ? Math.floor(raw) : 50));
+      await this.flushQueue(batchSize, 10, { maxBatches: 3 });
+    }
+    return items;
+  }
+
+  /** 提醒索引：写入 memo_tags 与根级 tagsDerivedForYmd（日历日，与 queryReminderBuckets 一致） */
+  private async writeMemoIndexWithDerivedTags(items: RSLatteIndexItem[], updatedAtIso?: string): Promise<void> {
+    const seenAt = updatedAtIso ?? toIsoNow();
+    const panel = (this.host.settingsRef() as any)?.taskPanel;
+    const { items: withTags, tagsDerivedForYmd } = applyMemoIndexDerivedFields(items, panel);
+    await this.store.writeIndex("memo", { version: 1, updatedAt: seenAt, items: withTags, tagsDerivedForYmd });
+  }
+
+  /** 将任务重要性得分写回各任务 meta 行（与标签触发场景一致） */
+  private async writeImportanceToTaskMeta(items: RSLatteIndexItem[]): Promise<void> {
+    const app = this.host.app;
+    const byPath = new Map<string, RSLatteIndexItem[]>();
+    for (const it of items) {
+      if ((it as any).itemType !== "task") continue;
+      const fp = String((it as any).filePath ?? "").trim();
+      if (!fp) continue;
+      const list = byPath.get(fp) ?? [];
+      list.push(it);
+      byPath.set(fp, list);
+    }
+    for (const [filePath, list] of byPath) {
+      const af = app.vault.getAbstractFileByPath(filePath);
+      if (!af || !(af instanceof TFile)) continue;
+      try {
+        const content = await app.vault.read(af);
+        const lines = (content ?? "").split(/\r?\n/);
+        let fileChanged = false;
+        for (const it of list) {
+          const uid = String((it as any).uid ?? "").trim();
+          if (!uid) continue;
+          const lineNo = Number((it as any).lineNo ?? 0);
+          const lineIdx = lineNo + 1;
+          if (lineIdx < 0 || lineIdx >= lines.length) continue;
+          const score = (it as any).importance_score;
+          const scoreStr = typeof score === "number" && Number.isFinite(score) ? String(Math.round(score)) : "0";
+          const res = patchMetaLineIfUid(lines[lineIdx], uid, { importance: scoreStr });
+          if (res?.changed) {
+            lines[lineIdx] = res.line;
+            fileChanged = true;
+          }
+        }
+        if (fileChanged) await app.vault.modify(af, lines.join("\n"));
+      } catch (e) {
+        console.warn("[RSLatte][task] writeImportanceToTaskMeta failed for", filePath, e);
+      }
+    }
   }
 
   // =========================
@@ -923,7 +1711,8 @@ export class TaskRSLatteService {
     return !!(s ?? "").match(/^\d{4}-\d{2}-\d{2}$/);
   }
 
-  private computeNextByRepeat(baseYmd: string, rr: string, todayYmd: string, mmddHint?: string): string {
+  private computeNextByRepeat(baseYmd: string, rrRaw: string, todayYmd: string, mmddHint?: string): string {
+    const rr = normalizeRepeatRuleToken(String(rrRaw ?? "").trim().toLowerCase());
     const today = momentFn(todayYmd, "YYYY-MM-DD").startOf("day");
     const base = momentFn(baseYmd, "YYYY-MM-DD").startOf("day");
     if (!base.isValid()) return baseYmd;
@@ -976,7 +1765,7 @@ export class TaskRSLatteService {
       return next.format("YYYY-MM-DD");
     }
 
-    if (rr === "seasonly") {
+    if (rr === "quarterly") {
       const dd = base.date();
       next = base.clone().startOf("day");
       // every 3 months from base date
@@ -1115,8 +1904,8 @@ export class TaskRSLatteService {
   }
 
   private async autoAdvanceMemoNextDates(memos: RSLatteIndexItem[]): Promise<RSLatteIndexItem[]> {
-    const today = todayYmd();
-    const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+    const today = getTaskTodayKey((this.host.settingsRef() as any)?.taskPanel ?? {});
+    const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
 
     const patches: Array<{ uid: string; filePath: string; lineNo: number; newNext: string; patchLine: boolean }> = [];
     const uidToNext = new Map<string, string>();
@@ -1126,13 +1915,16 @@ export class TaskRSLatteService {
       if (!uid) continue;
       if (it.archived) continue;
       if (it.status === "DONE" || it.status === "CANCELLED") continue;
+      if (String((it as any)?.extra?.invalidated ?? "").trim() === "1") continue;
 
       const extra: Record<string, string> = (it as any).extra ?? {};
       const cat = String(extra["cat"] ?? "").trim();
       const dateType = String(extra["date_type"] ?? "").trim();
 
       let rr = String((it as any).repeatRule ?? "").trim().toLowerCase();
+      if (!rr) rr = String(extra["repeat_rule"] ?? "").trim().toLowerCase();
       if (!rr) rr = (it as any).memoMmdd ? "yearly" : "none";
+      rr = normalizeRepeatRuleToken(rr);
       if (!allowed.has(rr)) rr = "none";
 
       const metaNextRaw = String(extra["next"] ?? "").trim();
@@ -1196,11 +1988,141 @@ export class TaskRSLatteService {
     }
 
     if (changed) {
-      const seenAt = new Date().toISOString();
-      await this.store.writeIndex("memo", { version: 1, updatedAt: seenAt, items: memos });
+      const seenAt = toIsoNow();
+      await this.writeMemoIndexWithDerivedTags(memos, seenAt);
     }
 
     return memos;
+  }
+
+  private async autoCreateNextMemoEntries(memos: RSLatteIndexItem[]): Promise<number> {
+    const today = todayYmd();
+    const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
+    const getScheduleBaseDate = (x: any): string => {
+      const memoDate = String(x?.memoDate ?? "").trim();
+      if (this.isYmd(memoDate)) return memoDate;
+      const extra = (x?.extra ?? {}) as Record<string, string>;
+      const scheduleDate = String(extra?.schedule_date ?? "").trim();
+      return this.isYmd(scheduleDate) ? scheduleDate : "";
+    };
+    const childKey = new Set<string>();
+    for (const it of memos) {
+      const extra: Record<string, string> = (it as any).extra ?? {};
+      const parentUid = String(extra["auto_parent_uid"] ?? "").trim();
+      const d = getScheduleBaseDate(it as any);
+      if (parentUid && this.isYmd(d)) childKey.add(`${parentUid}|${d}`);
+    }
+
+    let created = 0;
+    const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
+    const sanitize = (v: any) => String(v ?? "").trim().replace(/[;\s]+/g, "_");
+    const genUid = () => `lg_${Math.random().toString(16).slice(2, 12)}`;
+
+    for (const it of memos) {
+      const uid = String((it as any).uid ?? "").trim();
+      if (!uid) continue;
+      if (it.archived) continue;
+      const extra: Record<string, string> = (it as any).extra ?? {};
+      const cat = String(extra["cat"] ?? "").trim();
+      const isSchedule = isScheduleMemoLine({ extra } as any);
+      const status = String((it as any).status ?? "").trim().toUpperCase();
+      const isClosed = status === "DONE" || status === "CANCELLED";
+      if (isClosed && !isSchedule) continue;
+      if (String(extra["invalidated"] ?? "").trim() === "1") continue;
+
+      const baseDate = getScheduleBaseDate(it as any);
+      if (!this.isYmd(baseDate)) continue;
+
+      let rr = String((it as any).repeatRule ?? "").trim().toLowerCase();
+      if (!rr) rr = (it as any).memoMmdd ? "yearly" : "none";
+      rr = normalizeRepeatRuleToken(rr);
+      if (!allowed.has(rr)) rr = "none";
+
+      const isLunar = cat === "lunarBirthday" || String(extra["date_type"] ?? "").trim() === "lunar";
+      if (!isLunar && rr === "none") continue;
+      // 生成条件：
+      // - 周期条目一旦超期（baseDate < today）自动续下一条；
+      // - 日程在未超期时手动完成/取消，也提前续下一条。
+      const shouldSpawnByOverdue = baseDate < today;
+      const shouldSpawnByEarlyClose = isSchedule && isClosed && baseDate > today;
+      if (!shouldSpawnByOverdue && !shouldSpawnByEarlyClose) continue;
+
+      let nextYmd = "";
+      const seed = shouldSpawnByEarlyClose
+        ? momentFn(baseDate, "YYYY-MM-DD").add(1, "day").format("YYYY-MM-DD")
+        : today;
+      if (isLunar) {
+        const lunarMmdd = String(extra["lunar"] ?? (it as any).memoMmdd ?? "").trim();
+        const leap = String(extra["leap"] ?? "").trim() === "1";
+        if (/^\d{2}-\d{2}$/.test(lunarMmdd)) {
+          nextYmd = nextSolarDateForLunarBirthday(lunarMmdd, leap, seed);
+        }
+      } else {
+        nextYmd = this.computeNextByRepeat(baseDate, rr, seed, (it as any).memoMmdd);
+      }
+      if (!this.isYmd(nextYmd)) continue;
+
+      const already = childKey.has(`${uid}|${nextYmd}`);
+      // 仅用“子条目是否已存在”做防重；
+      // last_auto_spawned 可能在历史异常时已写入但子条目并未真正落盘，不能再作为强阻断条件。
+      if (already) continue;
+
+      const tsIso = nowIso();
+      const text = String((it as any).text ?? "").trim() || String((it as any).raw ?? "").trim();
+      if (!text) continue;
+      const repToken = rr !== "none" ? ` 🔁 ${rr}` : "";
+      const line = `- [/] ${text} 📅 ${nextYmd}${repToken} ➕ ${today}`;
+
+      const carry: Record<string, string> = {};
+      for (const [k, v] of Object.entries(extra ?? {})) {
+        const kk = String(k ?? "").trim();
+        if (!kk) continue;
+        if (kk === "next" || kk === "last_auto_spawned" || kk === "invalidated" || kk === "invalidated_date" || kk === "invalidated_time") continue;
+        const vv = String(v ?? "").trim();
+        if (!vv) continue;
+        carry[kk] = vv;
+      }
+      carry["auto_parent_uid"] = uid;
+      carry["auto_spawned_from"] = baseDate;
+      if (isSchedule) {
+        carry["schedule_date"] = nextYmd;
+      }
+
+      const uidNew = genUid();
+      const metaParts: string[] = [`uid=${uidNew}`, `type=${isSchedule ? "schedule" : "memo"}`, `ts=${sanitize(tsIso)}`];
+      if (isSchedule) metaParts.push(`todo_time=${sanitize(tsIso)}`);
+      else metaParts.push(`in_progress_time=${sanitize(tsIso)}`);
+      for (const [k, v] of Object.entries(carry)) {
+        const sv = sanitize(v);
+        if (!sv) continue;
+        metaParts.push(`${k}=${sv}`);
+      }
+      const meta = `  <!-- rslatte:${metaParts.join(";")} -->`;
+
+      const rule = (isSchedule
+        ? rules.find((x) => x.module === "schedule")
+        : rules.find((x) => x.module === "memo")
+      ) ?? { h1: "# 任务追踪", h2: isSchedule ? "## 新增日程" : "## 新增提醒" };
+      const r = rule as any;
+      await this.host.journalSvc.upsertLinesToDiaryH1H2(nextYmd, r.h1, r.h2, [line, meta], { mode: "append" });
+      await writeBackMetaIdByUid(this.host.app, it.filePath, uid, { last_auto_spawned: nextYmd }, Number((it as any).lineNo ?? 0));
+      if (cat === "solarBirthday" || cat === "lunarBirthday") {
+        const rawContactUid = String(extra["contact_uid"] ?? "").trim();
+        const contactUid = extractContactUidFromWikiTarget(rawContactUid) || rawContactUid.replace(/^C_/, "");
+        if (contactUid) {
+          await this.appendBirthMemoUidToContact(contactUid, uidNew, String(extra["contact_file"] ?? "").trim());
+        }
+      }
+      childKey.add(`${uid}|${nextYmd}`);
+      created++;
+    }
+
+    return created;
+  }
+
+  /** 供 schedule pipeline 调用：按当前 schedule-index 执行一次周期续写（防重）。 */
+  public async e2AutoCreateNextMemoEntries(items: RSLatteIndexItem[]): Promise<number> {
+    return this.autoCreateNextMemoEntries(Array.isArray(items) ? items : []);
   }
 
   /**
@@ -1213,12 +2135,12 @@ export class TaskRSLatteService {
     // For Notice clarity: label by selected modules.
     const label = (() => {
       const m = opts?.modules;
-      if (!m) return "任务/备忘";
+      if (!m) return "任务/提醒";
       const onlyTask = m.task === true && m.memo !== true;
       const onlyMemo = m.memo === true && m.task !== true;
       if (onlyTask) return "任务";
-      if (onlyMemo) return "备忘";
-      return "任务/备忘";
+      if (onlyMemo) return "提醒";
+      return "任务/提醒";
     })();
     this.refreshPromise = this.refreshIndexAndSyncInner(opts)
       .catch((e) => {
@@ -1238,6 +2160,15 @@ export class TaskRSLatteService {
   // =========================
   // E2: atomic pipeline helpers (Engine.runE2)
   // =========================
+
+  /** 清除扫描缓存，使下次扫描强制重新读取并解析所有文件。用于 manual_refresh 时避免复用旧缓存导致已删除任务仍显示。 */
+  public async clearScanCache(): Promise<void> {
+    try {
+      await this.store.writeScanCache({ filterKey: "", files: {} } as any);
+    } catch {
+      // ignore
+    }
+  }
 
   public async e2ScanIncremental(
     modules?: TaskMemoModules,
@@ -1295,12 +2226,8 @@ export class TaskRSLatteService {
     };
     const mods = normModules(modules);
 
-    // Clear scan cache (real implementation; previous main.ts attempted a non-existing signature).
-    try {
-      await this.store.writeScanCache({ filterKey: "", files: {} } as any);
-    } catch {
-      // ignore
-    }
+    // Clear scan cache so full scan re-reads all files.
+    await this.clearScanCache();
 
     const prevTaskIndex = await this.store.readIndex("task");
     const prevMemoIndex = await this.store.readIndex("memo");
@@ -1347,9 +2274,7 @@ export class TaskRSLatteService {
     if (mods.memo) await this.queue.pruneCreatesWithIds("memo", memoKeysWithId, memoHashWithId);
 
     if (mods.memo) {
-      // Memo: keep the same behavior as the non-E2 refresh pipeline.
-      // Auto advance next reminder date and write back to files if needed.
-      memoIndexItems = await this.autoAdvanceMemoNextDates(memoIndexItems);
+      await this.autoCreateNextMemoEntries(memoIndexItems);
     }
 
     // Update status-lamp counts (pending/failed)
@@ -1409,6 +2334,28 @@ export class TaskRSLatteService {
     return { enqueued: Math.max(0, after - before) };
   }
 
+  /** 日程索引 → 同步队列（与 scheduleSpecAtomic.buildOps 对齐） */
+  public async e2BuildOpsSchedule(opts?: { forceFullSync?: boolean }): Promise<{ enqueued: number }> {
+    await this.ensureReady();
+    if (!this.enableSync) return { enqueued: 0 };
+
+    const before = (await this.queue.listAll())?.length ?? 0;
+    const forceFullSync = opts?.forceFullSync === true;
+
+    const idx = await this.store.readIndex("schedule");
+    const items = (idx.items ?? []) as any as RSLatteIndexItem[];
+
+    await this.enqueueMissingIds("schedule", items);
+    if (forceFullSync) {
+      const missing = await this.findMissingDbItemIds("schedule", items);
+      await this.enqueueRepairOrForceUpdates("schedule", items, missing);
+    } else {
+      await this.enqueueUpdates("schedule", items);
+    }
+
+    const after = (await this.queue.listAll())?.length ?? 0;
+    return { enqueued: Math.max(0, after - before) };
+  }
 
   public async e2ReconcileForType(
     itemType: "task" | "memo",
@@ -1432,6 +2379,28 @@ export class TaskRSLatteService {
       lines,
     });
   }
+
+  /** 日程：扫描重建后与 POST /schedules/reconcile 对齐（scan.memos 为日程行） */
+  public async e2ReconcileSchedule(scan: { includedFilePaths: string[]; memos?: RSLatteParsedLine[] }): Promise<void> {
+    await this.ensureReady();
+
+    const requireQueueEmpty = (this.tp as any)?.reconcileRequireQueueEmpty !== false;
+    const requireFileClean = (this.tp as any)?.reconcileRequireFileClean !== false;
+
+    const lines = (scan?.memos ?? []) as RSLatteParsedLine[];
+
+    await runReconcileSchedule({
+      enableSync: this.enableSync,
+      api: this.host.api,
+      queue: this.queue as any,
+      requireQueueEmpty,
+      requireFileClean,
+      includedFilePaths: scan?.includedFilePaths ?? [],
+      lines,
+      dbg: (this.host as any).dbg,
+    });
+  }
+
   private async refreshIndexAndSyncInner(opts?: { sync?: boolean; noticeOnError?: boolean; forceFullSync?: boolean; modules?: TaskMemoModules }): Promise<void> {
     await this.ensureReady();
 
@@ -1448,11 +2417,28 @@ export class TaskRSLatteService {
     const prevTaskIndex = await this.store.readIndex("task");
     const prevMemoIndex = await this.store.readIndex("memo");
     const fixUidAndMeta = !!opts?.forceFullSync || opts?.noticeOnError === true;
-    const { tasks, memos, includedFilePaths } = await this.scanAllCached(
+    const { tasks, memos, includedFilePaths, removedFilePaths, contactInteractionsByFile } = await this.scanAllCached(
       prevTaskIndex.items ?? [],
       prevMemoIndex.items ?? [],
       { fixUidAndMeta }
     );
+
+    // 同步任务/提醒中的联系人引用到 contacts-interactions，使联系人侧栏与笔记中的「动态互动」能显示最新任务
+    try {
+      const store = (this.host as any)?.contactsIndex?.getInteractionsStore?.();
+      if (store && typeof (store as any).applyFileUpdates === "function") {
+        const byFile = contactInteractionsByFile ?? {};
+        const upserts = Object.keys(byFile).map((fp) => ({
+          source_path: fp,
+          mtime: Number((byFile as any)[fp]?.mtime ?? 0),
+          entries: Array.isArray((byFile as any)[fp]?.entries) ? (byFile as any)[fp].entries : [],
+        }));
+        const removals = Array.isArray(removedFilePaths) ? removedFilePaths : [];
+        await (store as any).applyFileUpdates({ upserts, removals });
+      }
+    } catch {
+      // never block task refresh
+    }
 
     // Only update selected module indexes; keep others untouched.
     let taskIndexItems = (prevTaskIndex.items ?? []) as any;
@@ -1477,9 +2463,8 @@ export class TaskRSLatteService {
     if (mods.task) await this.queue.pruneCreatesWithIds("task", taskKeysWithId, taskHashWithId);
     if (mods.memo) await this.queue.pruneCreatesWithIds("memo", memoKeysWithId, memoHashWithId);
 
-    // ✅ Step5-2b: auto-advance memo "next" reminder date (e.g., birthdays/anniversaries)
-    // when the current next date is overdue. Write back to meta + keep index/UI consistent.
-    if (mods.memo) memoIndexItems = await this.autoAdvanceMemoNextDates(memoIndexItems);
+    // 周期提醒超过提醒日后：自动新增下一条到对应提醒日记（幂等检查：child + last_auto_spawned）。
+    if (mods.memo) await this.autoCreateNextMemoEntries(memoIndexItems);
 
     if (opts?.sync !== false) {
       if (mods.task) await this.enqueueMissingIds("task", taskIndexItems);
@@ -1565,7 +2550,7 @@ export class TaskRSLatteService {
         pendingCount: c.pending,
         failedCount: c.failed,
         ok: c.failed === 0,
-        err: c.failed > 0 ? "部分备忘入库失败（可刷新重试）" : undefined,
+        err: c.failed > 0 ? "部分提醒入库失败（可刷新重试）" : undefined,
       });
     }
   }
@@ -1593,8 +2578,11 @@ export class TaskRSLatteService {
       const chunk = ids.slice(i, i + chunkSize);
       try {
         const resp: any = await apiTry(
-          "检查任务/备忘是否入库",
-          () => (this.host.api as any).rslatteItemsExists({ ids: chunk }, { type, include_deleted: true })
+          type === "schedule" ? "检查日程是否入库" : "检查任务/提醒是否入库",
+          () =>
+            type === "schedule"
+              ? (this.host.api as any).schedulesExists({ ids: chunk }, { include_deleted: true })
+              : (this.host.api as any).rslatteItemsExists({ ids: chunk }, { type, include_deleted: true })
         );
         const miss = (resp?.missing ?? []) as any[];
         for (const m of miss) {
@@ -1647,7 +2635,7 @@ export class TaskRSLatteService {
     }
 
     if (changed) {
-      const now = new Date().toISOString();
+      const now = toIsoNow();
       await this.store.writeIndex(type, { version: 1, updatedAt: now, items: list as any });
     }
 
@@ -1745,7 +2733,7 @@ export class TaskRSLatteService {
   private async markIndexPushed(type: RSLatteItemType, filePath: string, lineNo: number, itemId: number | undefined, sourceHash: string | undefined): Promise<void> {
     const idx = await this.store.readIndex(type);
     let changed = false;
-    const now = new Date().toISOString();
+    const now = toIsoNow();
 
     idx.items = (idx.items ?? []).map((it: any) => {
       if (it.filePath === filePath && it.lineNo === lineNo) {
@@ -1862,7 +2850,11 @@ export class TaskRSLatteService {
    * - Writes v2 meta comment timestamp fields (append-only; does not delete old keys).
    * - Emits a Work Event (success only).
    */
-  public async applyTaskStatusAction(it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw" | "status">, to: TaskStatusAction): Promise<void> {
+  public async applyTaskStatusAction(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw" | "status">,
+    to: TaskStatusAction,
+    opts?: { skipWorkEvent?: boolean }
+  ): Promise<void> {
     const filePath = String(it.filePath ?? "");
     const uid = String((it as any).uid ?? "").trim();
     if (!filePath) throw new Error("missing filePath");
@@ -1875,17 +2867,10 @@ export class TaskRSLatteService {
 
     const findTaskLineByUid = (): number | null => {
       if (!uid) return null;
-      const metaLineRe = /^\s*<!--\s*rslatte:([^>]*)-->\s*$/i;
       for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(metaLineRe);
-        if (!m) continue;
-        const kvRaw = String(m[1] ?? "");
-        if (!kvRaw.includes("uid=")) continue;
-        // quick check first
-        if (!kvRaw.includes(`uid=${uid}`)) continue;
+        if (!metaLineHasUid(lines[i], uid)) continue;
         const taskIdx = i - 1;
-        if (taskIdx >= 0) return taskIdx;
-        return null;
+        if (taskIdx >= 0 && String(lines[taskIdx] ?? "").match(TASK_LINE_RE)) return taskIdx;
       }
       return null;
     };
@@ -1922,7 +2907,7 @@ export class TaskRSLatteService {
     } else if (to === "TODO") {
       body = stripStatusTokens(body, { done: true, cancelled: true });
     } else if (to === "IN_PROGRESS") {
-      // keep tokens as-is
+      if (!/\s*🛫\uFE0F?\s*\d{4}-\d{2}-\d{2}/u.test(body)) body = ensureToken(body, `🛫 ${today}`);
     }
 
     const newLine = `${prefix}[${newMark}] ${body.trim()}`;
@@ -1934,13 +2919,24 @@ export class TaskRSLatteService {
 
     const tsIso = nowIso();
     const patch: Record<string, string> = {};
-    if (to === "DONE") patch["done_time"] = tsIso;
-    if (to === "CANCELLED") patch["cancelled_time"] = tsIso;
-    if (to === "IN_PROGRESS") patch["in_progress_time"] = tsIso;
-    if (to === "TODO") patch["todo_time"] = tsIso;
+    if (to === "DONE") {
+      patch["done_time"] = tsIso;
+      patch["task_phase"] = "done";
+    }
+    if (to === "CANCELLED") {
+      patch["cancelled_time"] = tsIso;
+      patch["task_phase"] = "cancelled";
+    }
+    if (to === "IN_PROGRESS") {
+      patch["in_progress_time"] = tsIso;
+      patch["task_phase"] = "in_progress";
+    }
+    if (to === "TODO") {
+      patch["todo_time"] = tsIso;
+      patch["task_phase"] = "todo";
+    }
 
     if (uid) {
-      // Best-effort: do not fail the action if meta patch fails.
       try {
         await writeBackMetaIdByUid(this.host.app, filePath, uid, patch, idx);
       } catch (e) {
@@ -1949,57 +2945,411 @@ export class TaskRSLatteService {
     }
 
     // ✅ Work Event (success only)
-    try {
-      const txt = String(it.text ?? "").trim() || String(it.raw ?? "").trim();
-      const short = txt.length > 80 ? txt.slice(0, 80) + "…" : txt;
-      let short_desc = short;
-      const icon = to === "DONE" ? "✅" : to === "CANCELLED" ? "❌" : to === "IN_PROGRESS" ? "▶" : "⏸";
-      
-      // ✅ 判断任务状态变更的具体 action
-      let action: string;
-      if (to === "DONE") {
-        action = "done";
-        short_desc = "任务完成 " + short_desc;
-      } else if (to === "CANCELLED") {
-        action = "cancelled";
-        short_desc = "任务取消 " + short_desc;
-      } else if (to === "IN_PROGRESS") {
-        // 从 oldLine 解析之前的状态（修改前的 checkbox mark）
-        const prevStatusMatch = oldLine.match(TASK_LINE_RE);
-        const prevStatusMark = prevStatusMatch?.[2] ?? " "; // checkbox mark 在第二个捕获组
-        const prevStatus = prevStatusMark === " " ? "TODO" : prevStatusMark === "/" ? "IN_PROGRESS" : prevStatusMark === "x" ? "DONE" : "CANCELLED";
-        
-        // 检查任务是否曾经开始过（通过检查是否有 🛫 标记）
-        // 注意：START_TOKEN_RE_G 是全局正则，使用 match 而不是 test 来避免状态问题
-        const hasStartDate = /🛫\uFE0F?\s*\d{4}-\d{2}-\d{2}/.test(oldLine);
-        
-        // 判断逻辑：
-        // 1. 如果之前是 TODO 且从未开始过（没有 🛫 标记），则是 start（首次开始）
-        // 2. 如果之前是 TODO 但曾经开始过（有 🛫 标记），则是 continued（恢复进行中）
-        // 3. 如果之前是其他状态（DONE/CANCELLED/IN_PROGRESS），则是 continued（恢复或继续）
-        if (prevStatus === "TODO" && !hasStartDate) {
-          action = "start"; // 首次开始
-          short_desc = "任务开始 " + short_desc;
+    if (!opts?.skipWorkEvent) {
+      try {
+        const phaseBefore = indexItemTaskDisplayPhase(it as any);
+        const phaseAfter = displayPhaseAfterTaskCheckbox(to);
+        const txt = String(it.text ?? "").trim() || String(it.raw ?? "").trim();
+        const short = txt.length > 80 ? txt.slice(0, 80) + "…" : txt;
+        let short_desc = short;
+        const icon = to === "DONE" ? "✅" : to === "CANCELLED" ? "❌" : to === "IN_PROGRESS" ? "▶" : "⏸";
+
+        // ✅ 判断任务状态变更的具体 action
+        let action: string;
+        if (to === "DONE") {
+          action = "done";
+          short_desc = "任务完成 " + short_desc;
+        } else if (to === "CANCELLED") {
+          action = "cancelled";
+          short_desc = "任务取消 " + short_desc;
+        } else if (to === "IN_PROGRESS") {
+          const prevStatusMatch = oldLine.match(TASK_LINE_RE);
+          const prevStatusMark = prevStatusMatch?.[2] ?? " ";
+          const prevStatus = prevStatusMark === " " ? "TODO" : prevStatusMark === "/" ? "IN_PROGRESS" : prevStatusMark === "x" ? "DONE" : "CANCELLED";
+          const hasStartDate = /🛫\uFE0F?\s*\d{4}-\d{2}-\d{2}/.test(oldLine);
+          if (prevStatus === "TODO" && !hasStartDate) {
+            action = "start";
+            short_desc = "任务开始 " + short_desc;
+          } else {
+            action = "continued";
+            short_desc = "任务继续 " + short_desc;
+          }
         } else {
-          action = "continued"; // 继续（恢复进行中）
-          short_desc = "任务继续 " + short_desc;
+          action = "paused";
+          short_desc = "任务暂停 " + short_desc;
         }
-      } else {
-        // to === "TODO"
-        action = "paused";
-        short_desc = "任务暂停 " + short_desc;
+
+        void this.host.workEventSvc?.append({
+          ts: tsIso,
+          kind: "task",
+          action: action as any,
+          source: "ui",
+          summary: `${icon} ${short_desc}`,
+          ref: enrichWorkEventRefWithTaskContacts(
+            {
+              uid: uid || undefined,
+              file_path: filePath,
+              line_no: idx,
+              to,
+              task_phase_before: phaseBefore,
+              task_phase_after: phaseAfter,
+            },
+            {
+              taskLine: oldLine,
+              followContactUids: Array.isArray((it as any).follow_contact_uids)
+                ? ((it as any).follow_contact_uids as string[]).map((x) => String(x ?? "").trim()).filter(Boolean)
+                : [],
+            }
+          ),
+        } as any);
+      } catch {
+        // ignore
       }
-      
-      void this.host.workEventSvc?.append({
-        ts: tsIso,
-        kind: "task",
-        action: action as any,
-        source: "ui",
-        summary: `${icon} ${short_desc}`,
-        ref: { uid: uid || undefined, file_path: filePath, line_no: idx, to },
-      } as any);
-    } catch {
-      // ignore
+    }
+  }
+
+  /**
+   * 带进度信息的任务状态变更（开始处理/等待他人/进入等待/完成任务时使用）
+   * 更新 checkbox、可选 progress_note / task_phase / wait_until，并写 meta progress_updated。
+   */
+  public async applyTaskStatusWithProgress(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw" | "status">,
+    to: "IN_PROGRESS" | "DONE",
+    opts: {
+      progress_note?: string;
+      task_phase?: "in_progress" | "waiting_others" | "waiting_until";
+      wait_until?: string;
+      follow_up?: string;
+      follow_contact_uids?: string[];
+      followContactUids?: string[];
+      follow_contact_names?: string[];
+      followContactNames?: string[];
+      /** 标记完成时写入 meta 的工时评估（小时），须 > 0 */
+      estimate_h?: number;
+      skipWorkEvent?: boolean;
+    }
+  ): Promise<void> {
+    const filePath = String(it.filePath ?? "");
+    const uid = String((it as any).uid ?? "").trim();
+    if (!filePath) throw new Error("missing filePath");
+
+    const af = this.host.app.vault.getAbstractFileByPath(filePath);
+    if (!af || !(af instanceof TFile)) throw new Error("file not found");
+
+    const content = await this.host.app.vault.read(af);
+    const lines = (content ?? "").split(/\r?\n/);
+
+    const findTaskLineByUid = (): number | null => {
+      if (!uid) return null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!metaLineHasUid(lines[i], uid)) continue;
+        const taskIdx = i - 1;
+        if (taskIdx >= 0 && String(lines[taskIdx] ?? "").match(TASK_LINE_RE)) return taskIdx;
+      }
+      return null;
+    };
+
+    let idx = Number(it.lineNo);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= lines.length) idx = -1;
+    if (idx >= 0 && !String(lines[idx] ?? "").match(TASK_LINE_RE)) idx = -1;
+    if (idx < 0) {
+      const byUid = findTaskLineByUid();
+      if (byUid == null) throw new Error("cannot locate task line");
+      idx = byUid;
+    }
+
+    const oldLine = lines[idx] ?? "";
+    const m = oldLine.match(TASK_LINE_RE);
+    if (!m) throw new Error("target line is not a task checkbox line");
+
+    const prefix = m[1] ?? "- ";
+    let body = String(m[3] ?? " ").trimEnd();
+    const today = todayYmd();
+    const tsIso = nowIso();
+
+    if (to === "DONE") {
+      body = stripStatusTokens(body, { done: true, cancelled: true });
+      body = ensureToken(body, `✅ ${today}`);
+      lines[idx] = `${prefix}[x] ${body}`;
+    } else {
+      if (!/\s*🛫\uFE0F?\s*\d{4}-\d{2}-\d{2}/u.test(body)) body = ensureToken(body, `🛫 ${today}`);
+      lines[idx] = `${prefix}[/] ${body}`;
+    }
+
+    await this.host.app.vault.modify(af, lines.join("\n"));
+
+    // 周期任务：完成后自动在“当前日期的下一次周期日”创建下一条任务
+    if (to === "DONE") {
+      const rrFromLine = (() => {
+        const mm = String(oldLine ?? "").match(/🔁\uFE0F?\s*(weekly|monthly|seasonly|quarterly|yearly)\b/i);
+        return mm ? String(mm[1] ?? "").trim().toLowerCase() : "";
+      })();
+      const rr = normalizeRepeatRuleToken(rrFromLine || String((it as any).repeatRule ?? "").trim().toLowerCase());
+      if (rr === "weekly" || rr === "monthly" || rr === "quarterly" || rr === "yearly") {
+        const dueFromLine = (() => {
+          const mm = String(oldLine ?? "").match(/📅\uFE0F?\s*(\d{4}-\d{2}-\d{2})/);
+          return mm ? String(mm[1] ?? "").trim() : "";
+        })();
+        const startFromLine = (() => {
+          const mm = String(oldLine ?? "").match(/⏳\uFE0F?\s*(\d{4}-\d{2}-\d{2})/);
+          return mm ? String(mm[1] ?? "").trim() : "";
+        })();
+        const plannedEnd = dueFromLine || String((it as any).planned_end ?? "").trim();
+        const plannedStart = startFromLine || String((it as any).planned_start ?? "").trim() || undefined;
+        await this.createNextCycleTaskFromDone(it as any, rr, today, plannedEnd, plannedStart);
+      }
+    }
+
+    const progressNoteRaw = opts.progress_note != null && opts.progress_note !== "" ? opts.progress_note.trim().slice(0, 2000) : "";
+    const patch: Record<string, string> = {
+      progress_updated: tsIso,
+      ...(progressNoteRaw && { progress_note: progressNoteRaw.replace(/\s+/g, "\u200B") }),
+    };
+    if (to === "IN_PROGRESS") {
+      patch["in_progress_time"] = tsIso;
+      patch["task_phase"] = opts.task_phase ?? "in_progress";
+      if (opts.wait_until && /^\d{4}-\d{2}-\d{2}$/.test(opts.wait_until)) patch["wait_until"] = opts.wait_until;
+      if (opts.task_phase === "waiting_others" && opts.follow_up && /^\d{4}-\d{2}-\d{2}$/.test(opts.follow_up)) patch["follow_up"] = opts.follow_up;
+      const followUids = Array.isArray(opts.follow_contact_uids)
+        ? opts.follow_contact_uids
+        : Array.isArray(opts.followContactUids)
+          ? opts.followContactUids
+          : [];
+      if ((opts.task_phase === "waiting_others" || opts.task_phase === "waiting_until") && followUids.length > 0) {
+        const normUids = followUids.map((u) => String(u ?? "").trim()).filter(Boolean);
+        if (normUids.length > 0) patch["follow_contact_uids"] = normUids.join(",");
+        const followNames = Array.isArray(opts.follow_contact_names)
+          ? opts.follow_contact_names
+          : Array.isArray(opts.followContactNames)
+            ? opts.followContactNames
+            : [];
+        if (followNames.length > 0 && normUids.length > 0) {
+          const normNames = normUids.map((uid, idx) => {
+            const raw = String(followNames[idx] ?? "").trim();
+            const fallback = uid;
+            return (raw || fallback).replace(/[;\r\n|]+/g, " ").trim() || fallback;
+          });
+          patch["follow_contact_name"] = normNames.join("|");
+        }
+      }
+    } else {
+      patch["done_time"] = tsIso;
+      patch["task_phase"] = "done";
+      const est = Number(opts.estimate_h);
+      if (Number.isFinite(est) && est > 0) {
+        patch["estimate_h"] = String(est);
+      }
+    }
+
+    if (uid) {
+      try {
+        await writeBackMetaIdByUid(this.host.app, filePath, uid, patch, idx);
+      } catch (e) {
+        (this.host as any).dbg?.("taskRSLatte", "applyTaskStatusWithProgress meta patch failed", { filePath, uid });
+      }
+    }
+
+    if (!opts?.skipWorkEvent) {
+      try {
+        const phaseBefore = indexItemTaskDisplayPhase(it as any);
+        const phaseAfter = to === "DONE" ? "done" : (opts.task_phase ?? "in_progress");
+        const txt = String(it.text ?? "").trim() || String(it.raw ?? "").trim();
+        const short = txt.length > 80 ? txt.slice(0, 80) + "…" : txt;
+        const icon = to === "DONE" ? "✅" : "▶";
+        const summary = to === "DONE" ? `任务完成 ${short}` : `任务进行 ${short}`;
+        const followUids = Array.isArray(opts.follow_contact_uids)
+          ? opts.follow_contact_uids.map((u) => String(u ?? "").trim()).filter(Boolean)
+          : Array.isArray(opts.followContactUids)
+            ? opts.followContactUids.map((u) => String(u ?? "").trim()).filter(Boolean)
+            : [];
+        void this.host.workEventSvc?.append({
+          ts: tsIso,
+          kind: "task",
+          action: to === "DONE" ? "done" : "continued",
+          source: "ui",
+          summary: `${icon} ${summary}`,
+          ref: enrichWorkEventRefWithTaskContacts(
+            {
+              uid,
+              file_path: filePath,
+              line_no: idx,
+              to,
+              task_phase: opts.task_phase,
+              task_phase_before: phaseBefore,
+              task_phase_after: phaseAfter,
+            },
+            { taskLine: oldLine, followContactUids: followUids }
+          ),
+        } as any);
+      } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * 延期：到期日 + N 天，延期原因追加到 progress_note，postpone_count +1，仅首次延期写入 original_due。
+   */
+  public async postponeTask(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw" | "planned_end" | "postpone_count" | "original_due" | "progress_note">,
+    days: number,
+    reason: string
+  ): Promise<void> {
+    const filePath = String(it.filePath ?? "");
+    const uid = String((it as any).uid ?? "").trim();
+    if (!filePath) throw new Error("missing filePath");
+    if (!Number.isFinite(days) || days < 1) throw new Error("延期天数须为正整数");
+
+    const af = this.host.app.vault.getAbstractFileByPath(filePath);
+    if (!af || !(af instanceof TFile)) throw new Error("file not found");
+
+    const content = await this.host.app.vault.read(af);
+    const lines = (content ?? "").split(/\r?\n/);
+
+    const findTaskLineByUid = (): number | null => {
+      if (!uid) return null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!metaLineHasUid(lines[i], uid)) continue;
+        const taskIdx = i - 1;
+        if (taskIdx >= 0 && String(lines[taskIdx] ?? "").match(TASK_LINE_RE)) return taskIdx;
+      }
+      return null;
+    };
+
+    let idx = Number(it.lineNo);
+    if (idx < 0 || idx >= lines.length) idx = -1;
+    if (idx >= 0 && !String(lines[idx] ?? "").match(TASK_LINE_RE)) idx = -1;
+    if (idx < 0) {
+      const byUid = findTaskLineByUid();
+      if (byUid == null) throw new Error("cannot locate task line");
+      idx = byUid;
+    }
+
+    const oldLine = lines[idx] ?? "";
+    const mm = oldLine.match(TASK_LINE_RE);
+    if (!mm) throw new Error("target line is not a task checkbox line");
+
+    const currentDue = (it as any).planned_end ?? "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(currentDue)) throw new Error("当前到期日格式异常");
+
+    const nextDue = (() => {
+      const d = new Date(currentDue + "T12:00:00");
+      d.setDate(d.getDate() + days);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    })();
+
+    const pc = ((it as any).postpone_count ?? 0) + 1;
+    const prefix = mm[1] ?? "- ";
+    const mark = mm[2] ?? " ";
+    let body = String(mm[3] ?? " ");
+    const tokenRe = /\s(📅|➕|⏳|🛫|✅|❌|🔁)\s/u;
+    const tokenMatch = body.match(tokenRe);
+    let descPart = body;
+    let tokenPart = "";
+    if (tokenMatch && typeof (tokenMatch as any).index === "number") {
+      const cut = (tokenMatch as any).index as number;
+      descPart = body.slice(0, cut).trimEnd();
+      tokenPart = body.slice(cut).trimStart();
+    }
+    const pureDesc = descPart.replace(TASK_DESC_PREFIX_STRIP_RE, "").trim();
+    const newPrefixDesc = buildDescPrefix({
+      starred: !!(it as any).starred,
+      postpone_count: pc,
+      complexity: (it as any).complexity,
+    });
+    const restTokens = tokenPart.replace(/\s*📅\uFE0F?\s*\d{4}-\d{2}-\d{2}/g, "").replace(/\s{2,}/g, " ").trim();
+    const newBody = `${newPrefixDesc}${pureDesc} 📅 ${nextDue}${restTokens ? " " + restTokens : ""}`.replace(/\s{2,}/g, " ").trim();
+    lines[idx] = `${prefix}[${mark}] ${newBody}`;
+    await this.host.app.vault.modify(af, lines.join("\n"));
+    const progressNoteValue = [((it as any).progress_note ?? "").trim(), `延期${days}天：${(reason ?? "").trim() || "无说明"}`].filter(Boolean).join("\n").slice(0, 2000);
+    const patch: Record<string, string> = {
+      postpone_count: String(pc),
+      progress_updated: nowIso(),
+      progress_note: progressNoteValue.replace(/\s+/g, "\u200B"),
+    };
+    if ((it as any).original_due == null || (it as any).original_due === "") patch["original_due"] = currentDue;
+
+    if (uid) {
+      try {
+        await writeBackMetaIdByUid(this.host.app, filePath, uid, patch, idx);
+      } catch (e) {
+        (this.host as any).dbg?.("taskRSLatte", "postponeTask meta patch failed", { filePath, uid });
+      }
+    }
+  }
+
+  /**
+   * 星标/取消星标：写 meta starred，并更新任务行描述首字符 ⭐
+   */
+  public async setTaskStarred(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw" | "starred" | "postpone_count" | "complexity">,
+    starred: boolean
+  ): Promise<void> {
+    const filePath = String(it.filePath ?? "");
+    const uid = String((it as any).uid ?? "").trim();
+    if (!filePath) throw new Error("missing filePath");
+
+    const af = this.host.app.vault.getAbstractFileByPath(filePath);
+    if (!af || !(af instanceof TFile)) throw new Error("file not found");
+
+    const content = await this.host.app.vault.read(af);
+    const lines = (content ?? "").split(/\r?\n/);
+
+    const findTaskLineByUid = (): number | null => {
+      if (!uid) return null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!metaLineHasUid(lines[i], uid)) continue;
+        const taskIdx = i - 1;
+        if (taskIdx >= 0 && String(lines[taskIdx] ?? "").match(TASK_LINE_RE)) return taskIdx;
+      }
+      return null;
+    };
+
+    let idx = Number(it.lineNo);
+    if (idx < 0 || idx >= lines.length) idx = -1;
+    if (idx >= 0 && !String(lines[idx] ?? "").match(TASK_LINE_RE)) idx = -1;
+    if (idx < 0) {
+      const byUid = findTaskLineByUid();
+      if (byUid == null) throw new Error("cannot locate task line");
+      idx = byUid;
+    }
+
+    const oldLine = lines[idx] ?? "";
+    const m = oldLine.match(TASK_LINE_RE);
+    if (!m) throw new Error("target line is not a task checkbox line");
+
+    const bodyAll = String(m[3] ?? " ");
+    const tokenRe = /\s(📅|➕|⏳|🛫|✅|❌|🔁)\s/u;
+    const mt = bodyAll.match(tokenRe);
+    let descPart = bodyAll;
+    let tokenPart = "";
+    if (mt && typeof (mt as any).index === "number") {
+      const cut = (mt as any).index as number;
+      descPart = bodyAll.slice(0, cut).trimEnd();
+      tokenPart = bodyAll.slice(cut).trimStart();
+    }
+
+    const descPrefix = buildDescPrefix({
+      starred,
+      postpone_count: (it as any).postpone_count,
+      complexity: (it as any).complexity,
+    });
+    const pureDesc = (descPart ?? "").replace(TASK_DESC_PREFIX_STRIP_RE, "").trim();
+    const newDesc = `${descPrefix}${pureDesc}`.trim();
+    const newBody = `${newDesc} ${tokenPart}`.replace(/\s{2,}/g, " ").trimEnd();
+    const newLine = `${m[1] ?? "- "}[${m[2] ?? " "}] ${newBody}`;
+    if (newLine !== oldLine) {
+      lines[idx] = newLine;
+      await this.host.app.vault.modify(af, lines.join("\n"));
+    }
+
+    if (uid) {
+      try {
+        await writeBackMetaIdByUid(this.host.app, filePath, uid, { starred: starred ? "1" : "0" }, idx);
+      } catch (e) {
+        (this.host as any).dbg?.("taskRSLatte", "setTaskStarred meta patch failed", { filePath, uid });
+      }
     }
   }
 
@@ -2017,7 +3367,7 @@ export class TaskRSLatteService {
   public async applyMemoStatusAction(
     it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "text" | "raw" | "status"> & { uid?: string },
     to: TaskStatusAction,
-    opts?: { skipWorkEvent?: boolean }
+    opts?: { skipWorkEvent?: boolean; /** 为 true 时不执行「提前闭环周期提醒」自动生成下一条（如提醒→任务/日程安排后） */ skipPeriodicReschedule?: boolean }
   ): Promise<void> {
     const filePath = String(it.filePath ?? "");
     const uid = String((it as any).uid ?? "").trim();
@@ -2031,13 +3381,8 @@ export class TaskRSLatteService {
 
     const findLineByUid = (): number | null => {
       if (!uid) return null;
-      const metaLineRe = /^\s*<!--\s*rslatte:([^>]*)-->\s*$/i;
       for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(metaLineRe);
-        if (!m) continue;
-        const kvRaw = String(m[1] ?? "");
-        if (!kvRaw.includes("uid=")) continue;
-        if (!kvRaw.includes(`uid=${uid}`)) continue;
+        if (!metaLineHasUid(lines[i], uid)) continue;
         const idx = i - 1;
         if (idx >= 0 && lines[idx] && /^\s*-\s*\[.\]\s+/.test(lines[idx])) return idx;
       }
@@ -2108,32 +3453,157 @@ export class TaskRSLatteService {
       }
     }
 
-    // ✅ Work Event (success only)；手机同步时由 mobileSync 统一写入，传 skipWorkEvent: true
+    // 提前闭环周期提醒：若当前提醒尚未到期且被手动完成/取消，立即生成下一条提醒。
+    if ((to === "DONE" || to === "CANCELLED") && uid && opts?.skipPeriodicReschedule !== true) {
+      try {
+        const anyIt = it as any;
+        const extra: Record<string, string> = (anyIt?.extra ?? {}) as any;
+        const cat = String(extra["cat"] ?? "").trim();
+        const isLunar = cat === "lunarBirthday" || String(extra["date_type"] ?? "").trim() === "lunar";
+        const isSchedule = isScheduleMemoLine({ extra } as any);
+        const baseDate = this.isYmd(String(anyIt?.memoDate ?? "").trim())
+          ? String(anyIt?.memoDate ?? "").trim()
+          : String(extra["schedule_date"] ?? "").trim();
+        const today = todayYmd();
+        let rr = String(anyIt?.repeatRule ?? "").trim().toLowerCase();
+        if (!rr) rr = String(extra["repeat_rule"] ?? "").trim().toLowerCase();
+        if (!rr) rr = anyIt?.memoMmdd ? "yearly" : "none";
+        rr = normalizeRepeatRuleToken(rr);
+        const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
+        if (!allowed.has(rr)) rr = "none";
+
+        const isRepeating = isLunar || rr !== "none";
+        const isEarlyClose = this.isYmd(baseDate) && baseDate > today;
+        const invalidated = String(extra["invalidated"] ?? "").trim() === "1";
+        if (isRepeating && isEarlyClose && !invalidated) {
+          const seed = momentFn(baseDate, "YYYY-MM-DD").add(1, "day").format("YYYY-MM-DD");
+          let nextYmd = "";
+          if (isLunar) {
+            const lunarMmdd = String(extra["lunar"] ?? anyIt?.memoMmdd ?? "").trim();
+            const leap = String(extra["leap"] ?? "").trim() === "1";
+            if (/^\d{2}-\d{2}$/.test(lunarMmdd)) {
+              nextYmd = nextSolarDateForLunarBirthday(lunarMmdd, leap, seed);
+            }
+          } else {
+            nextYmd = this.computeNextByRepeat(baseDate, rr, seed, anyIt?.memoMmdd);
+          }
+
+          if (this.isYmd(nextYmd)) {
+            const itemsForDedup = isSchedule
+              ? await (async () => {
+                try {
+                  const baseDir = String((this.store as any)?.getBaseDir?.() ?? "").trim();
+                  if (!baseDir) return [] as RSLatteIndexItem[];
+                  const p = normalizePath(`${baseDir}/schedule-index.json`);
+                  const ok = await this.host.app.vault.adapter.exists(p);
+                  if (!ok) return [] as RSLatteIndexItem[];
+                  const raw = await this.host.app.vault.adapter.read(p);
+                  const parsed = raw ? JSON.parse(raw) : null;
+                  return (Array.isArray(parsed?.items) ? parsed.items : []) as RSLatteIndexItem[];
+                } catch {
+                  return [] as RSLatteIndexItem[];
+                }
+              })()
+              : (((await this.store.readIndex("memo")).items ?? []) as RSLatteIndexItem[]);
+            const exists = itemsForDedup.some((x) => {
+              const ex = (x as any)?.extra ?? {};
+              const p = String(ex?.auto_parent_uid ?? "").trim();
+              const d = this.isYmd(String((x as any)?.memoDate ?? "").trim())
+                ? String((x as any)?.memoDate ?? "").trim()
+                : String(((x as any)?.extra ?? {})?.schedule_date ?? "").trim();
+              return p === uid && d === nextYmd;
+            });
+            if (!exists) {
+              const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
+              const rule = (isSchedule
+                ? rules.find((x) => x.module === "schedule")
+                : rules.find((x) => x.module === "memo")
+              ) ?? { h1: "# 任务追踪", h2: isSchedule ? "## 新增日程" : "## 新增提醒" };
+              const r = rule as any;
+              const text = String(anyIt?.text ?? "").trim() || String(anyIt?.raw ?? "").trim();
+              const repToken = rr !== "none" ? ` 🔁 ${rr}` : "";
+              const line = `- [/] ${text} 📅 ${nextYmd}${repToken} ➕ ${today}`;
+              const tsCreate = nowIso();
+              const sanitize = (v: any) => String(v ?? "").trim().replace(/[;\s]+/g, "_");
+              const uidNew = `lg_${Math.random().toString(16).slice(2, 12)}`;
+              const carry: Record<string, string> = {};
+              for (const [k, v] of Object.entries(extra ?? {})) {
+                const kk = String(k ?? "").trim();
+                if (!kk) continue;
+                if (kk === "next" || kk === "last_auto_spawned" || kk === "invalidated" || kk === "invalidated_date" || kk === "invalidated_time") continue;
+                const vv = String(v ?? "").trim();
+                if (!vv) continue;
+                carry[kk] = vv;
+              }
+              carry["auto_parent_uid"] = uid;
+              carry["auto_spawned_from"] = baseDate;
+              if (isSchedule) carry["schedule_date"] = nextYmd;
+              const metaParts: string[] = [`uid=${uidNew}`, `type=${isSchedule ? "schedule" : "memo"}`, `ts=${sanitize(tsCreate)}`];
+              if (isSchedule) metaParts.push(`todo_time=${sanitize(tsCreate)}`);
+              else metaParts.push(`in_progress_time=${sanitize(tsCreate)}`);
+              for (const [k, v] of Object.entries(carry)) {
+                const sv = sanitize(v);
+                if (!sv) continue;
+                metaParts.push(`${k}=${sv}`);
+              }
+              const meta = `  <!-- rslatte:${metaParts.join(";")} -->`;
+              await this.host.journalSvc.upsertLinesToDiaryH1H2(nextYmd, r.h1, r.h2, [line, meta], { mode: "append" });
+              await writeBackMetaIdByUid(this.host.app, filePath, uid, { last_auto_spawned: nextYmd }, idx);
+              if (cat === "solarBirthday" || cat === "lunarBirthday") {
+                const rawContactUid = String(extra["contact_uid"] ?? "").trim();
+                const contactUid = extractContactUidFromWikiTarget(rawContactUid) || rawContactUid.replace(/^C_/, "");
+                if (contactUid) {
+                  await this.appendBirthMemoUidToContact(contactUid, uidNew, String(extra["contact_file"] ?? "").trim());
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // ✅ Work Event (success only)；外部批量写入若已由统一入口记事件，可传 skipWorkEvent: true
     if (!opts?.skipWorkEvent) {
       try {
+        const isSched = isScheduleMemoLine(it as any);
         const txt = String((it as any).text ?? "").trim() || String((it as any).raw ?? "").trim();
         const short = txt.length > 80 ? txt.slice(0, 80) + "…" : txt;
         let short_desc = short;
         const icon = to === "DONE" ? "✅" : to === "CANCELLED" ? "❌" : to === "IN_PROGRESS" ? "▶" : "⏸";
-        if (to === "DONE") {
-          short_desc = "备忘完成 " + short_desc;
-        } else if (to === "CANCELLED") {
-          short_desc = "备忘取消 " + short_desc;
-        } else if (to === "IN_PROGRESS") {
-          short_desc = "备忘继续 " + short_desc;
+        if (isSched) {
+          if (to === "DONE") short_desc = "日程完成 " + short_desc;
+          else if (to === "CANCELLED") short_desc = "日程取消 " + short_desc;
+          else if (to === "IN_PROGRESS") short_desc = "日程继续 " + short_desc;
+          else short_desc = "日程待办 " + short_desc;
         } else {
-          short_desc = "备忘暂停 " + short_desc;
+          if (to === "DONE") {
+            short_desc = "提醒完成 " + short_desc;
+          } else if (to === "CANCELLED") {
+            short_desc = "提醒取消 " + short_desc;
+          } else if (to === "IN_PROGRESS") {
+            short_desc = "提醒继续 " + short_desc;
+          } else {
+            short_desc = "提醒暂停 " + short_desc;
+          }
         }
         // 当状态为 CANCELLED 时，使用 action: "cancelled"，其他状态使用 action: "status"
         const action = to === "CANCELLED" ? "cancelled" : "status";
         void this.host.workEventSvc?.append({
           ts: tsIso,
-          kind: "memo",
+          kind: isSched ? "schedule" : "memo",
           action: action as any,
           source: "ui",
-          ref: { uid, file_path: filePath, line_no: idx, status: to },
+          ref: {
+            uid,
+            file_path: filePath,
+            line_no: idx,
+            status: to,
+            ...(isSched ? { category: "schedule" } : {}),
+          },
           summary: `${icon} ${short_desc}`,
-          metrics: { status: to },
+          metrics: { status: to, ...(isSched ? { category: "schedule" } : {}) },
         });
       } catch (e) {
         // ignore
@@ -2141,9 +3611,42 @@ export class TaskRSLatteService {
     }
   }
 
+  /**
+   * 提醒经「安排」生成任务或日程后：将清单行置为已完成（`- [x]`）并写入关联 uid（不触发周期提醒提前生成下一条）。
+   */
+  public async markMemoAsArrangedAfterDerivation(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "text" | "raw" | "status"> & { uid?: string },
+    link: { kind: "task" | "schedule"; targetUid: string }
+  ): Promise<void> {
+    await this.applyMemoStatusAction(it, "DONE", { skipWorkEvent: true, skipPeriodicReschedule: true });
+    const uid = String((it as any).uid ?? "").trim();
+    const filePath = String(it.filePath ?? "").trim();
+    const targetUid = String(link.targetUid ?? "").trim();
+    if (!uid || !filePath || !targetUid) return;
+    const idx = Number((it as any).lineNo ?? -1);
+    const today = todayYmd();
+    const patch: Record<string, string> = {
+      arranged_at: today,
+      memo_arranged: "1",
+      ...(link.kind === "task"
+        ? { arranged_task_uid: targetUid }
+        : { arranged_schedule_uid: targetUid }),
+    };
+    await writeBackMetaIdByUid(this.host.app, filePath, uid, patch, Number.isFinite(idx) && idx >= 0 ? idx : undefined);
+  }
+
 public async updateTaskBasicInfo(
     it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw">,
-    patch: { text: string; due: string; start?: string; scheduled?: string },
+    patch: {
+      text: string;
+      planned_end: string;
+      planned_start?: string;
+      estimate_h?: number;
+      complexity?: "high" | "normal" | "light";
+      repeatRule?: string;
+      /** 有键且非空则写入；有键且空串则删除 meta 中的 task_category */
+      task_category?: string | null;
+    },
     opts?: { skipWorkEvent?: boolean }
   ): Promise<void> {
     const filePath = String(it.filePath ?? "");
@@ -2151,14 +3654,15 @@ public async updateTaskBasicInfo(
     if (!filePath) throw new Error("missing filePath");
 
     const newText = String(patch.text ?? "").trim();
-    const due = String(patch.due ?? "").trim();
-    const start = String(patch.start ?? "").trim();
-    const scheduled = String(patch.scheduled ?? "").trim();
+    const planned_end = String(patch.planned_end ?? "").trim();
+    const planned_start = String(patch.planned_start ?? "").trim();
+    const rrRaw = normalizeRepeatRuleToken(String(patch.repeatRule ?? "").trim().toLowerCase());
+    const rrAllowed = new Set(["weekly", "monthly", "quarterly", "yearly"]);
+    const rr = rrAllowed.has(rrRaw) ? rrRaw : "";
 
     if (!newText) throw new Error("任务描述不能为空");
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) throw new Error("到期日期（due）为必填，且格式必须为 YYYY-MM-DD");
-    if (start && !/^\d{4}-\d{2}-\d{2}$/.test(start)) throw new Error("开始日期（start）格式必须为 YYYY-MM-DD");
-    if (scheduled && !/^\d{4}-\d{2}-\d{2}$/.test(scheduled)) throw new Error("计划日期（scheduled）格式必须为 YYYY-MM-DD");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(planned_end)) throw new Error("计划结束日为必填，且格式必须为 YYYY-MM-DD");
+    if (planned_start && !/^\d{4}-\d{2}-\d{2}$/.test(planned_start)) throw new Error("计划开始日格式必须为 YYYY-MM-DD");
 
     const af = this.host.app.vault.getAbstractFileByPath(filePath);
     if (!af || !(af instanceof TFile)) throw new Error("file not found");
@@ -2168,16 +3672,10 @@ public async updateTaskBasicInfo(
 
     const findTaskLineByUid = (): number | null => {
       if (!uid) return null;
-      const metaLineRe = /^\s*<!--\s*rslatte:([^>]*)-->\s*$/i;
       for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(metaLineRe);
-        if (!m) continue;
-        const kvRaw = String(m[1] ?? "");
-        if (!kvRaw.includes("uid=")) continue;
-        if (!kvRaw.includes(`uid=${uid}`)) continue;
+        if (!metaLineHasUid(lines[i], uid)) continue;
         const taskIdx = i - 1;
-        if (taskIdx >= 0) return taskIdx;
-        return null;
+        if (taskIdx >= 0 && String(lines[taskIdx] ?? "").match(TASK_LINE_RE)) return taskIdx;
       }
       return null;
     };
@@ -2222,16 +3720,25 @@ public async updateTaskBasicInfo(
       comments.push(cm[0]);
     }
 
-    const newDesc = `${newText}${comments.length ? " " + comments.join(" ") : ""}`.trimEnd();
+    // 描述首字符标记（⭐↪🧠🍃，延期为 ↪）；开始日期不在此编辑，保留行上已有的 🛫
+    const descPrefix = buildDescPrefix({
+      starred: !!(it as any).starred,
+      postpone_count: (it as any).postpone_count,
+      complexity: patch.complexity && patch.complexity !== "normal" ? patch.complexity : (it as any).complexity,
+    });
+    const newDesc = `${descPrefix}${newText}${comments.length ? " " + comments.join(" ") : ""}`.trimEnd();
 
-    // Remove existing 📅/🛫/⏳ tokens only; keep others intact.
+    // Remove existing 📅/🛫/⏳ tokens only; keep others intact. 保留已有 🛫（实际开始日由「开始处理任务」写入）
+    const startMatch = tokenPart.match(/\s*🛫\uFE0F?\s*(\d{4}-\d{2}-\d{2})/);
+    const existingStart = startMatch ? startMatch[1] : "";
     let rest = tokenPart;
-    rest = rest.replace(/\s📅\s\d{4}-\d{2}-\d{2}/g, "");
-    rest = rest.replace(/\s🛫\s\d{4}-\d{2}-\d{2}/g, "");
-    rest = rest.replace(/\s⏳\s\d{4}-\d{2}-\d{2}/g, "");
+    rest = rest.replace(/\s*📅\uFE0F?\s*\d{4}-\d{2}-\d{2}/g, "");
+    rest = rest.replace(/\s*🛫\uFE0F?\s*\d{4}-\d{2}-\d{2}/g, "");
+    rest = rest.replace(/\s*⏳\uFE0F?\s*\d{4}-\d{2}-\d{2}/g, "");
+    rest = rest.replace(/\s*🔁\uFE0F?\s*(none|weekly|monthly|seasonly|quarterly|yearly)/gi, "");
     rest = rest.replace(/\s{2,}/g, " ").trim();
 
-    const insert = `📅 ${due}${start ? ` 🛫 ${start}` : ""}${scheduled ? ` ⏳ ${scheduled}` : ""}`.trim();
+    const insert = `📅 ${planned_end}${existingStart ? ` 🛫 ${existingStart}` : ""}${planned_start ? ` ⏳ ${planned_start}` : ""}${rr ? ` 🔁 ${rr}` : ""}`.trim();
     const newBody = `${newDesc} ${insert}${rest ? " " + rest : ""}`.replace(/\s{2,}/g, " ").trimEnd();
     const newLine = `${prefix}[${mark}] ${newBody}`.replace(/\s{2,}/g, " ").trimEnd();
 
@@ -2241,17 +3748,27 @@ public async updateTaskBasicInfo(
     }
 
     const tsIso = nowIso();
+    const metaPatch: Record<string, string> = { updated_time: tsIso };
+    if (patch.estimate_h != null && patch.estimate_h > 0) metaPatch.estimate_h = String(patch.estimate_h);
+    if (patch.complexity && patch.complexity !== "normal") metaPatch.complexity = patch.complexity;
+    if ("task_category" in patch && patch.task_category != null && String(patch.task_category).trim() !== "") {
+      metaPatch.task_category = sanitizeTaskCategoryForMeta(String(patch.task_category));
+    }
     if (uid) {
       try {
-        await writeBackMetaIdByUid(this.host.app, filePath, uid, { updated_time: tsIso }, idx);
+        await writeBackMetaIdByUid(this.host.app, filePath, uid, metaPatch, idx);
+        if ("task_category" in patch && (patch.task_category == null || String(patch.task_category).trim() === "")) {
+          await writeBackMetaIdByUidRemoveKeys(this.host.app, filePath, uid, ["task_category"], idx);
+        }
       } catch (e) {
         (this.host as any).dbg?.("taskRSLatte", "updateTaskBasicInfo meta patch failed", { filePath, uid, err: String((e as any)?.message ?? e) });
       }
     }
 
-    // Work Event (success only)；手机同步时由 mobileSync 统一写入，传 skipWorkEvent: true
+    // Work Event (success only)；外部批量写入若已由统一入口记事件，可传 skipWorkEvent: true
     if (!opts?.skipWorkEvent) {
       try {
+        const ph = indexItemTaskDisplayPhase(it as any);
         const short = newText.length > 80 ? newText.slice(0, 80) + "…" : newText;
         void this.host.workEventSvc?.append({
           ts: tsIso,
@@ -2259,8 +3776,22 @@ public async updateTaskBasicInfo(
           action: "update",
           source: "ui",
           summary: `✏️ 修改任务 ${short}`,
-          ref: { uid: uid || undefined, file_path: filePath, line_no: idx },
-          metrics: { due, start: start || undefined, scheduled: scheduled || undefined },
+          ref: enrichWorkEventRefWithTaskContacts(
+            {
+              uid: uid || undefined,
+              file_path: filePath,
+              line_no: idx,
+              task_phase_before: ph,
+              task_phase_after: ph,
+            },
+            {
+              taskLine: newLine,
+              followContactUids: Array.isArray((it as any).follow_contact_uids)
+                ? ((it as any).follow_contact_uids as string[]).map((x) => String(x ?? "").trim()).filter(Boolean)
+                : [],
+            }
+          ),
+          metrics: { due: planned_end, scheduled: planned_start || undefined },
         } as any);
       } catch {
         // ignore
@@ -2290,14 +3821,14 @@ public async updateTaskBasicInfo(
 
     const newText = String(patch.text ?? "").trim();
     const memoDate = String(patch.memoDate ?? "").trim();
-    const repeat = String(patch.repeatRule ?? "").trim().toLowerCase();
+    const repeat = normalizeRepeatRuleToken(String(patch.repeatRule ?? "").trim().toLowerCase());
 
-    if (!newText) throw new Error("备忘内容不能为空");
+    if (!newText) throw new Error("提醒内容不能为空");
     const isYmd = /^\d{4}-\d{2}-\d{2}$/.test(memoDate);
     const isMmdd = /^\d{2}-\d{2}$/.test(memoDate);
     if (!isYmd && !isMmdd) throw new Error("日期必须为 YYYY-MM-DD 或 MM-DD");
 
-    const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+    const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
     const rr = allowed.has(repeat) ? repeat : "none";
 
     const af = this.host.app.vault.getAbstractFileByPath(filePath);
@@ -2308,13 +3839,8 @@ public async updateTaskBasicInfo(
 
     const findLineByUid = (): number | null => {
       if (!uid) return null;
-      const metaLineRe = /^\s*<!--\s*rslatte:([^>]*)-->\s*$/i;
       for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(metaLineRe);
-        if (!m) continue;
-        const kvRaw = String(m[1] ?? "");
-        if (!kvRaw.includes("uid=")) continue;
-        if (!kvRaw.includes(`uid=${uid}`)) continue;
+        if (!metaLineHasUid(lines[i], uid)) continue;
         const idx = i - 1;
         if (idx >= 0 && lines[idx] && /^\s*-\s*\[.\]\s+/.test(lines[idx])) return idx;
       }
@@ -2408,7 +3934,7 @@ public async updateTaskBasicInfo(
           action: "update",
           source: "ui",
           ref: { uid, file_path: filePath, line_no: idx },
-          summary: `✏️ 修改备忘 ${short}`,
+          summary: `✏️ 修改提醒 ${short}`,
           metrics: { memoDate, repeatRule: rr },
         });
       } catch (e) {
@@ -2420,38 +3946,45 @@ public async updateTaskBasicInfo(
 public async createTodayTask(
     text: string,
     dueDate: string,
-    startDate?: string,
+    _startDate?: string,
     scheduledDate?: string,
-    opts?: { source?: "ui" | "mobile"; mobile_op_id?: string }
-  ): Promise<void> {
-    // const tp = this.tp;
+    opts?: {
+      estimate_h?: number;
+      complexity?: "high" | "normal" | "light";
+      repeatRule?: string;
+      /** 任务业务分类名称快照，写入 meta `task_category` */
+      task_category?: string;
+    }
+  ): Promise<{ uid: string; diaryPath?: string } | undefined> {
     const t = (text ?? "").trim();
-    if (!t) return;
+    if (!t) return undefined;
 
     const today = todayYmd();
     const due = (dueDate ?? "").trim();
-    const start = (startDate ?? "").trim();
     const scheduled = (scheduledDate ?? "").trim();
+    const rrRaw = normalizeRepeatRuleToken(String(opts?.repeatRule ?? "").trim().toLowerCase());
+    const rrAllowed = new Set(["weekly", "monthly", "quarterly", "yearly"]);
+    const rr = rrAllowed.has(rrRaw) ? rrRaw : "";
 
-    // due 必填
     if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) {
       throw new Error("到期日期（due）为必填，且格式必须为 YYYY-MM-DD");
-    }
-
-    // optional dates validation
-    if (start && !/^\d{4}-\d{2}-\d{2}$/.test(start)) {
-      throw new Error("开始日期（start）格式必须为 YYYY-MM-DD");
     }
     if (scheduled && !/^\d{4}-\d{2}-\d{2}$/.test(scheduled)) {
       throw new Error("计划日期（scheduled）格式必须为 YYYY-MM-DD");
     }
 
-    // v2: create with uid + next-line meta comment (do NOT insert legacy inline comment)
-    const uid = `lg_${Math.random().toString(16).slice(2, 12)}`; // 10 hex chars
-    const line = `- [ ] ${t} 📅 ${due}${start ? ` 🛫 ${start}` : ""}${scheduled ? ` ⏳ ${scheduled}` : ""} ➕ ${today}`;
-    // ts: ISO with timezone offset (for intra-day ordering on stats)
+    const descPrefix = buildDescPrefix({
+      complexity: opts?.complexity && opts.complexity !== "normal" ? opts.complexity : undefined,
+    });
+    const uid = `lg_${Math.random().toString(16).slice(2, 12)}`;
+    const line = `- [ ] ${descPrefix}${t} 📅 ${due}${scheduled ? ` ⏳ ${scheduled}` : ""}${rr ? ` 🔁 ${rr}` : ""} ➕ ${today}`;
     const tsIso = momentFn().format("YYYY-MM-DDTHH:mm:ssZ");
-    const meta = `  <!-- rslatte:uid=${uid};type=task;ts=${tsIso} -->`;
+    const metaParts = [`uid=${uid}`, `type=task`, `ts=${tsIso}`, `task_phase=todo`];
+    if (opts?.estimate_h != null && opts.estimate_h > 0) metaParts.push(`estimate_h=${opts.estimate_h}`);
+    if (opts?.complexity && opts.complexity !== "normal") metaParts.push(`complexity=${opts.complexity}`);
+    const tcSafe = opts?.task_category ? sanitizeTaskCategoryForMeta(opts.task_category) : "";
+    if (tcSafe) metaParts.push(`task_category=${tcSafe}`);
+    const meta = `  <!-- rslatte:${metaParts.join(";")} -->`;
     // ✅ 按“日志追加清单”配置写入日记（强制启用：任务）
     const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
     const r = (rules.find((x) => x.module === "task") ?? { h1: "# 任务追踪", h2: "## 新增任务" }) as any;
@@ -2469,6 +4002,7 @@ public async createTodayTask(
     const originalFormatOverride = (this.host.journalSvc as any)._diaryNameFormatOverride;
     const originalTemplateOverride = (this.host.journalSvc as any)._diaryTemplateOverride;
     
+    let writtenDiaryPath: string | undefined;
     try {
       // 优先使用空间的配置，否则使用全局配置（null 表示使用全局设置）
       this.host.journalSvc.setDiaryPathOverride(
@@ -2476,36 +4010,20 @@ public async createTodayTask(
         spaceDiaryNameFormat || null,
         spaceDiaryTemplate || null
       );
-      
       await this.host.journalSvc.upsertLinesToDiaryH1H2(today, r.h1, r.h2, [line, meta], { mode: "append" });
+      const file = await this.host.journalSvc.ensureDailyNoteForDateKey(today);
+      writtenDiaryPath = file?.path;
     } finally {
       // 恢复原来的覆盖设置
       this.host.journalSvc.setDiaryPathOverride(originalPathOverride, originalFormatOverride, originalTemplateOverride);
     }
 
-    // ✅ Work Event (success only)
-    const source = opts?.source ?? "ui";
-    void this.host.workEventSvc?.append({
-      ts: tsIso,
-      kind: "task",
-      action: "create",
-      source,
-      ref: {
-        uid,
-        text: t,
-        due,
-        start: start || undefined,
-        scheduled: scheduled || undefined,
-        record_date: today,
-        ...(opts?.mobile_op_id && { mobile_op_id: opts.mobile_op_id }),
-      },
-      summary: `📝 新建任务 ${t}`,
-      metrics: { due, start: start || undefined, scheduled: scheduled || undefined },
-    });
+    // WorkEvent：由 executionOrchestrator 在 UI 经 runExecutionFlow 写入
+    return { uid, diaryPath: writtenDiaryPath };
   }
 
   /**
-   * ✅ 查找已存在的联系人生日备忘（通过 contact_uid）
+   * ✅ 查找已存在的联系人生日提醒（通过 contact_uid）
    */
   public async findContactBirthdayMemo(contactUid: string): Promise<RSLatteIndexItem | null> {
     await this.ensureReady();
@@ -2518,7 +4036,7 @@ public async createTodayTask(
       const extra = (it as any).extra ?? {};
       const memoContactUid = String(extra.contact_uid ?? "").trim();
       if (memoContactUid === contactUid) {
-        // 检查是否是生日备忘（有 yearly 重复规则，且是 lunarBirthday 或 solarBirthday）
+        // 检查是否是生日提醒（有 yearly 重复规则，且是 lunarBirthday 或 solarBirthday）
         const rule = String(it.repeatRule ?? "").trim().toLowerCase();
         const cat = String(extra.cat ?? "").trim();
         if (rule === "yearly" && (cat === "lunarBirthday" || cat === "solarBirthday")) {
@@ -2529,8 +4047,162 @@ public async createTodayTask(
     return null;
   }
 
+  public async findMemoByUid(memoUid: string): Promise<RSLatteIndexItem | null> {
+    await this.ensureReady();
+    const uid = String(memoUid ?? "").trim();
+    if (!uid) return null;
+    const idx = await this.store.readIndex("memo");
+    const items = (idx.items ?? []) as RSLatteIndexItem[];
+    const hit = items.find((it) => !it.archived && it.itemType === "memo" && String((it as any).uid ?? "").trim() === uid) ?? null;
+    if (!hit) return null;
+    const af = this.host.app.vault.getAbstractFileByPath(String(hit.filePath ?? "").trim());
+    if (!(af instanceof TFile)) return null;
+    return hit;
+  }
+
+  public async findTaskByUid(taskUid: string): Promise<RSLatteIndexItem | null> {
+    await this.ensureReady();
+    const uid = String(taskUid ?? "").trim();
+    if (!uid) return null;
+    const idx = await this.store.readIndex("task");
+    const items = (idx.items ?? []) as RSLatteIndexItem[];
+    const hit =
+      items.find((it) => !it.archived && it.itemType === "task" && String((it as any).uid ?? "").trim() === uid) ?? null;
+    if (!hit) return null;
+    const af = this.host.app.vault.getAbstractFileByPath(String(hit.filePath ?? "").trim());
+    if (!(af instanceof TFile)) return null;
+    return hit;
+  }
+
+  /** 从 schedule-index 按 uid 查找日程条目（与 queryScheduleBuckets 数据源一致） */
+  public async findScheduleByUid(scheduleUid: string): Promise<RSLatteIndexItem | null> {
+    await this.ensureReady();
+    const uid = String(scheduleUid ?? "").trim();
+    if (!uid) return null;
+    const idx = await this.store.readIndex("schedule");
+    const rows = (idx.items ?? []) as RSLatteIndexItem[];
+    const hit = rows.find((it) => !it.archived && String((it as any).uid ?? "").trim() === uid) ?? null;
+    if (!hit) return null;
+    const af = this.host.app.vault.getAbstractFileByPath(String(hit.filePath ?? "").trim());
+    if (!(af instanceof TFile)) return null;
+    return hit;
+  }
+
   /**
-   * ✅ 创建或更新联系人生日备忘（支持农历和阳历）
+   * 将日程 uid 追加写入任务 meta `linked_schedule_uids`（逗号分隔），并写入 `progress_updated` 为当前时间；不修改任务勾选行与状态。
+   */
+  public async appendLinkedScheduleUidToTask(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid">,
+    scheduleUid: string
+  ): Promise<{ ok: boolean; changed: boolean; reason?: string }> {
+    const filePath = String(it.filePath ?? "").trim();
+    const taskUid = String((it as any).uid ?? "").trim();
+    const su = String(scheduleUid ?? "").trim();
+    if (!filePath || !taskUid || !su) return { ok: false, changed: false, reason: "missing filePath/taskUid/scheduleUid" };
+    const hint = Number.isFinite(Number(it.lineNo)) ? Number(it.lineNo) : undefined;
+    return appendLinkedScheduleUidToTaskMeta(this.host.app, filePath, taskUid, su, hint);
+  }
+
+  public async appendBirthMemoUidToContact(contactUid: string, memoUid: string, contactFilePath?: string): Promise<boolean> {
+    await this.ensureReady();
+    const uid = String(contactUid ?? "").trim();
+    const memo = String(memoUid ?? "").trim();
+    if (!uid || !memo) return false;
+
+    let file: TFile | null = null;
+    const directPath = normalizePath(String(contactFilePath ?? "").trim());
+    if (directPath) {
+      const af = this.host.app.vault.getAbstractFileByPath(directPath);
+      if (af instanceof TFile) file = af;
+    }
+    if (!file) {
+      try {
+        const idx = await (this.host as any)?.contactsIndex?.getIndexStore?.().readIndex?.();
+        const hit = (idx?.items ?? []).find((it: any) => String(it?.contact_uid ?? "").trim() === uid);
+        const p = normalizePath(String(hit?.file_path ?? "").trim());
+        if (p) {
+          const af = this.host.app.vault.getAbstractFileByPath(p);
+          if (af instanceof TFile) file = af;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (!file) return false;
+
+    try {
+      await this.host.app.fileManager.processFrontMatter(file, (fm: any) => {
+        const extra = (fm?.extra && typeof fm.extra === "object") ? { ...fm.extra } : {};
+        const oldListRaw = (extra as any).birth_memo_uids;
+        const listRaw = Array.isArray(oldListRaw)
+          ? oldListRaw.map((x: any) => String(x ?? "").trim()).filter(Boolean)
+          : String(oldListRaw ?? "").split(/[|,;\s]+/g).map((x) => x.trim()).filter(Boolean);
+        const oldSingle = String((extra as any).birth_memo_uid ?? "").trim();
+        if (oldSingle) listRaw.push(oldSingle);
+        if (!listRaw.includes(memo)) listRaw.push(memo);
+        const list = [...new Set(listRaw)];
+        extra.birth_memo_uids = list;
+        extra.birth_memo_uid = memo;
+        extra.birthday_memo = true;
+        fm.extra = extra;
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 按联系人 uid 取消其关联的提醒条目（仅取消未闭环条目）。
+   */
+  public async cancelMemosByContactUid(contactUid: string): Promise<number> {
+    await this.ensureReady();
+    const uid = String(contactUid ?? "").trim();
+    if (!uid) return 0;
+    const idx = await this.store.readIndex("memo");
+    const items = (idx.items ?? []) as RSLatteIndexItem[];
+    let changed = 0;
+    for (const it of items) {
+      if (it.archived || it.itemType !== "memo") continue;
+      const extra = (it as any).extra ?? {};
+      const memoUidRaw = String(extra.contact_uid ?? "").trim();
+      const memoUidNorm = extractContactUidFromWikiTarget(memoUidRaw) || memoUidRaw.replace(/^C_/, "");
+      if (!memoUidNorm || memoUidNorm !== uid) continue;
+      const st = String((it as any).status ?? "").trim().toUpperCase();
+      if (st === "DONE" || st === "CANCELLED") continue;
+      await this.applyMemoStatusAction(it as any, "CANCELLED", { skipWorkEvent: true });
+      changed += 1;
+    }
+    return changed;
+  }
+
+  public async invalidateMemosByUids(memoUids: string[]): Promise<number> {
+    await this.ensureReady();
+    const uids = [...new Set((memoUids ?? []).map((x) => String(x ?? "").trim()).filter(Boolean))];
+    if (!uids.length) return 0;
+    // 先刷新一次 memo 索引，避免刚写入/自动生成后的 uid 查找不到
+    try {
+      await this.refreshIndexAndSync({ sync: false, noticeOnError: false, modules: { memo: true } as any });
+    } catch {
+      // ignore
+    }
+    let changed = 0;
+    for (const uid of uids) {
+      const it = await this.findMemoByUid(uid);
+      if (!it) continue;
+      const st = String((it as any)?.status ?? "").trim().toUpperCase();
+      // 仅处理“进行中”条目（对应 - [/]）；历史已完成/取消不强制改为失效
+      if (st !== "IN_PROGRESS" && st !== "IN-PROGRESS") continue;
+      const invalidated = String(((it as any)?.extra ?? {}).invalidated ?? "").trim() === "1";
+      if (invalidated) continue;
+      await this.setMemoInvalidated(it as any, true);
+      changed += 1;
+    }
+    return changed;
+  }
+
+  /**
+   * ✅ 创建或更新联系人生日提醒（支持农历和阳历）
    */
   public async createOrUpdateContactBirthdayMemo(opts: {
     contactUid: string;
@@ -2540,20 +4212,23 @@ public async createTodayTask(
     month: number;
     day: number;
     leapMonth?: boolean;
-  }): Promise<void> {
+    birthMemoUid?: string;
+  }): Promise<string | undefined> {
     await this.ensureReady();
     const { contactUid, contactName, contactFile, birthdayType, month, day, leapMonth = false } = opts;
     
-    if (!month || !day) return;
+    if (!month || !day) return undefined;
     
     const today = todayYmd();
     const tsIso = momentFn().format("YYYY-MM-DDTHH:mm:ssZ");
-    const memoText = `${contactName}的生日`;
+    const contactRef = `[[C_${contactUid}|${contactName}]]`;
+    const memoText = `${contactRef} 的${birthdayType === "solar" ? "阳历" : "农历"}生日`;
     
     let displayDate: string; // 显示在 📅 后面的日期（YYYY-MM-DD）
     let metaExtra: Record<string, string> = {
       contact_uid: contactUid,
       contact_file: contactFile,
+      contact_name: contactName,
     };
     
     if (birthdayType === "lunar") {
@@ -2583,11 +4258,19 @@ public async createTodayTask(
       metaExtra.next = displayDate;
     }
     
-    // 检查是否已存在
-    const existingMemo = await this.findContactBirthdayMemo(contactUid);
+    // v2: 强绑定联系人 frontmatter 中的 birth_memo_uid
+    // - 有 uid：优先按 uid 找，找不到则新建
+    // - 无 uid：按规则新建（不再按 contact_uid 回捞旧记录）
+    const boundUid = String(opts.birthMemoUid ?? "").trim();
+    const existingMemo = boundUid ? await this.findMemoByUid(boundUid) : null;
     
     if (existingMemo) {
-      // 更新现有备忘
+      const st = String((existingMemo as any)?.status ?? "").trim().toUpperCase();
+      if (st === "CANCELLED" || st === "DONE") {
+        // 重新开启生日提醒时，先恢复状态，再覆盖最新内容与日期。
+        await this.applyMemoStatusAction(existingMemo as any, "IN_PROGRESS", { skipWorkEvent: true });
+      }
+      // 更新现有提醒
       await this.updateMemoBasicInfo(
         existingMemo,
         {
@@ -2597,11 +4280,16 @@ public async createTodayTask(
           metaExtra: metaExtra,
         }
       );
+      const retUid = String((existingMemo as any)?.uid ?? "").trim() || boundUid || undefined;
+      if (retUid) {
+        await this.appendBirthMemoUidToContact(contactUid, retUid, contactFile);
+      }
+      return retUid;
     } else {
-      // 创建新备忘
+      // 创建新提醒
       const uid = `lg_${Math.random().toString(16).slice(2, 12)}`; // 10 hex chars
       const repToken = " 🔁 yearly";
-      const line = `- [ ] ${memoText} 📅 ${displayDate}${repToken} ➕ ${today}`;
+      const line = `- [/] ${memoText} 📅 ${displayDate}${repToken} ➕ ${today}`;
       
       const extraParts: string[] = [];
       for (const [k0, v0] of Object.entries(metaExtra)) {
@@ -2613,11 +4301,11 @@ public async createTodayTask(
         const safeV = v.replace(/[;\s]+/g, "_");
         extraParts.push(`${k}=${safeV}`);
       }
-      const meta = `  <!-- rslatte:uid=${uid};type=memo;ts=${tsIso}${extraParts.length ? `;${extraParts.join(";")}` : ""} -->`;
+      const meta = `  <!-- rslatte:uid=${uid};type=memo;ts=${tsIso};in_progress_time=${tsIso}${extraParts.length ? `;${extraParts.join(";")}` : ""} -->`;
 
-      // ✅ 按"日志追加清单"配置写入日记（强制启用：备忘）
+      // ✅ 按"日志追加清单"配置写入日记（强制启用：提醒）
       const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
-      const r = (rules.find((x) => x.module === "memo") ?? { h1: "# 任务追踪", h2: "## 新增备忘" }) as any;
+      const r = (rules.find((x) => x.module === "memo") ?? { h1: "# 任务追踪", h2: "## 新增提醒" }) as any;
       // ✅ 获取当前空间的日记配置，确保写入到正确的空间日记
       const currentSpaceId = (this.host as any).getCurrentSpaceId?.() || "";
       const spaces = (this.host.settingsRef() as any).spaces || {};
@@ -2652,9 +4340,11 @@ public async createTodayTask(
         action: "create",
         source: "ui",
         ref: { uid, text: memoText, memo_date: displayDate, repeat_rule: "yearly", record_date: today, ...(metaExtra ? { meta_extra: metaExtra as any } : {}) },
-        summary: `🗒 新建备忘 ${memoText}`,
+        summary: `🗒 新建提醒 ${memoText}`,
         metrics: { memo_date: displayDate, repeat_rule: "yearly" },
       });
+      await this.appendBirthMemoUidToContact(contactUid, uid, contactFile);
+      return uid;
     }
   }
 
@@ -2663,26 +4353,26 @@ public async createTodayTask(
     dateOrMmdd: string,
     repeatRule?: string,
     metaExtra?: Record<string, string | number | boolean | undefined | null>
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     // const tp = this.tp;
     const t = (text ?? "").trim();
-    if (!t) return;
+    if (!t) return undefined;
 
     const today = todayYmd();
     const d = (dateOrMmdd ?? "").trim();
-    if (!d) return;
+    if (!d) return undefined;
 
     const isMmdd = /^\d{2}-\d{2}$/.test(d);
     const isYmd = /^\d{4}-\d{2}-\d{2}$/.test(d);
-    if (!isMmdd && !isYmd) return;
+    if (!isMmdd && !isYmd) return undefined;
 
     const repeat = (repeatRule ?? "").trim().toLowerCase();
-    const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+    const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
     const rr = allowed.has(repeat) ? repeat : "none";
     const repToken = rr !== "none" ? ` 🔁 ${rr}` : "";
     // v2: create with uid + next-line meta comment (do NOT insert legacy inline comment)
     const uid = `lg_${Math.random().toString(16).slice(2, 12)}`; // 10 hex chars
-    const line = `- [ ] ${t} 📅 ${d}${repToken} ➕ ${today}`;
+    const line = `- [/] ${t} 📅 ${d}${repToken} ➕ ${today}`;
     const tsIso = momentFn().format("YYYY-MM-DDTHH:mm:ssZ");
     const extraParts: string[] = [];
     for (const [k0, v0] of Object.entries(metaExtra ?? {})) {
@@ -2696,11 +4386,11 @@ public async createTodayTask(
       const safeV = sv.replace(/[;\s]+/g, "_");
       extraParts.push(`${k}=${safeV}`);
     }
-    const meta = `  <!-- rslatte:uid=${uid};type=memo;ts=${tsIso}${extraParts.length ? `;${extraParts.join(";")}` : ""} -->`;
+    const meta = `  <!-- rslatte:uid=${uid};type=memo;ts=${tsIso};in_progress_time=${tsIso}${extraParts.length ? `;${extraParts.join(";")}` : ""} -->`;
 
-    // ✅ 按“日志追加清单”配置写入日记（强制启用：备忘）
+    // ✅ 按“日志追加清单”配置写入日记（强制启用：提醒）
     const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
-    const r = (rules.find((x) => x.module === "memo") ?? { h1: "# 任务追踪", h2: "## 新增备忘" }) as any;
+    const r = (rules.find((x) => x.module === "memo") ?? { h1: "# 任务追踪", h2: "## 新增提醒" }) as any;
     // ✅ 获取当前空间的日记配置，确保写入到正确的空间日记
     const currentSpaceId = (this.host as any).getCurrentSpaceId?.() || "";
     const spaces = (this.host.settingsRef() as any).spaces || {};
@@ -2729,15 +4419,368 @@ public async createTodayTask(
       this.host.journalSvc.setDiaryPathOverride(originalPathOverride, originalFormatOverride, originalTemplateOverride);
     }
 
-    void this.host.workEventSvc?.append({
-      ts: tsIso,
-      kind: "memo",
-      action: "create",
-      source: "ui",
-      ref: { uid, text: t, memo_date: d, repeat_rule: rr, record_date: today, ...(metaExtra ? { meta_extra: metaExtra as any } : {}) },
-      summary: `🗒 新建备忘 ${t}`,
-      metrics: { memo_date: d, repeat_rule: rr },
-    });
+    // WorkEvent：由 executionOrchestrator（经 runExecutionFlow）写入
+    return uid;
+  }
+
+  public async createScheduleMemo(opts: ScheduleCreateInput): Promise<string | undefined> {
+    const text = String(opts?.text ?? "").trim();
+    const scheduleDate = String(opts?.scheduleDate ?? "").trim();
+    const startTime = String(opts?.startTime ?? "").trim();
+    const durationMin = Math.max(5, Math.min(24 * 60, Math.floor(Number(opts?.durationMin ?? 60))));
+    if (!text || !this.isYmd(scheduleDate) || !/^\d{2}:\d{2}$/.test(startTime)) return undefined;
+
+    const start = momentFn(`${scheduleDate} ${startTime}`, "YYYY-MM-DD HH:mm");
+    if (!start?.isValid?.()) return undefined;
+    const end = start.clone().add(durationMin, "minutes");
+    const endTime = end.format("HH:mm");
+    const timePrefix = `${startTime}-${endTime}`;
+    const lineText = `${timePrefix} ${text}`.trim();
+    const repeat = String(opts?.repeatRule ?? "none").trim().toLowerCase();
+    const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
+    const rr = allowed.has(repeat) ? repeat : "none";
+
+    const uid = `lg_${Math.random().toString(16).slice(2, 12)}`;
+    const repToken = rr !== "none" ? ` 🔁 ${rr}` : "";
+    const createdYmd = todayYmd();
+    const line = `- [/] ${lineText} 📅 ${scheduleDate}${repToken} ➕ ${createdYmd}`;
+    const tsIso = momentFn().format("YYYY-MM-DDTHH:mm:ssZ");
+    const sm = (this.host.settingsRef() as any)?.scheduleModule;
+    const fallbackId = getDefaultScheduleCategoryId(sm);
+    const category =
+      sanitizeScheduleCategoryIdForMeta(String(opts?.category ?? "").trim()) || fallbackId;
+    const linkedTaskRaw = String(opts?.linkedTaskUid ?? "").trim();
+    const linkedTaskSafe = linkedTaskRaw.replace(/[;\s]+/g, "_");
+    const linkedMeta = linkedTaskSafe ? `;linked_task_uid=${linkedTaskSafe}` : "";
+    const linkedOutRaw = String(opts?.linkedOutputId ?? "").trim();
+    const linkedOutSafe = linkedOutRaw.replace(/[;\s]+/g, "_");
+    const linkedOutMeta = linkedOutSafe ? `;linked_output_id=${linkedOutSafe}` : "";
+    const timerLogRaw = String(opts?.timerLog ?? "").trim();
+    const timerLogEncoded = timerLogRaw ? encodeURIComponent(timerLogRaw) : "";
+    const timerMeta = timerLogEncoded ? `;timer_log=${timerLogEncoded}` : "";
+    const meta = `  <!-- rslatte:uid=${uid};type=schedule;ts=${tsIso};schedule_category=${category};schedule_date=${scheduleDate};start_time=${startTime};end_time=${endTime};duration_min=${durationMin}${linkedMeta}${linkedOutMeta}${timerMeta} -->`;
+
+    const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
+    const r = (rules.find((x) => x.module === "schedule")
+      ?? { h1: "# 任务追踪", h2: "## 新增日程" }) as any;
+    const currentSpaceId = (this.host as any).getCurrentSpaceId?.() || "";
+    const spaces = (this.host.settingsRef() as any).spaces || {};
+    const currentSpace = spaces[currentSpaceId];
+    const spaceSnapshot = currentSpace?.settingsSnapshot || {};
+    const spaceDiaryPath = spaceSnapshot.diaryPath;
+    const spaceDiaryNameFormat = spaceSnapshot.diaryNameFormat;
+    const spaceDiaryTemplate = spaceSnapshot.diaryTemplate;
+
+    const originalPathOverride = (this.host.journalSvc as any)._diaryPathOverride;
+    const originalFormatOverride = (this.host.journalSvc as any)._diaryNameFormatOverride;
+    const originalTemplateOverride = (this.host.journalSvc as any)._diaryTemplateOverride;
+    try {
+      this.host.journalSvc.setDiaryPathOverride(spaceDiaryPath || null, spaceDiaryNameFormat || null, spaceDiaryTemplate || null);
+      await this.host.journalSvc.upsertLinesToDiaryH1H2(scheduleDate, r.h1, r.h2, [line, meta], { mode: "append" });
+    } finally {
+      this.host.journalSvc.setDiaryPathOverride(originalPathOverride, originalFormatOverride, originalTemplateOverride);
+    }
+
+    // WorkEvent：由 executionOrchestrator（经 runExecutionFlow）写入
+    return uid;
+  }
+
+  /**
+   * 合并写入匹配 uid 的 rslatte meta 行（日程结束后的 followup_* 等；任务/提醒条目不必回写日程）。
+   */
+  public async patchMemoRslatteMetaByUid(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid">,
+    patch: Record<string, string>
+  ): Promise<void> {
+    const filePath = normalizePath(String(it.filePath ?? "").trim());
+    const uid = String((it as any).uid ?? "").trim();
+    if (!filePath || !uid) throw new Error("缺少 filePath 或 uid");
+    const safe: Record<string, string> = {};
+    for (const [k, v] of Object.entries(patch ?? {})) {
+      const kk = String(k ?? "").trim();
+      if (!kk) continue;
+      const sv = String(v ?? "").trim().replace(/[;\s]+/g, "_");
+      if (!sv) continue;
+      safe[kk] = sv;
+    }
+    if (Object.keys(safe).length === 0) return;
+    const idx = Number((it as any).lineNo ?? -1);
+    const r = await writeBackMetaIdByUid(this.host.app, filePath, uid, safe, idx >= 0 ? idx : undefined);
+    if (!r.ok) throw new Error(r.reason ?? "meta 写入失败");
+  }
+
+  /**
+   * 更新已有日程行与下一行 meta（与 createScheduleMemo 格式一致）。
+   * 若修改了 schedule_date，则从原日记文件删除该条目并追加到新日期对应日记（与新增日程相同的 H1/H2 规则）。
+   */
+  public async updateScheduleBasicInfo(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw">,
+    patch: {
+      text: string;
+      scheduleDate: string;
+      startTime: string;
+      durationMin: number;
+      category: string;
+      repeatRule: string;
+    },
+    opts?: { skipWorkEvent?: boolean }
+  ): Promise<void> {
+    const filePath = normalizePath(String(it.filePath ?? "").trim());
+    const uid = String((it as any).uid ?? "").trim();
+    if (!filePath || !uid) throw new Error("缺少 filePath 或 uid");
+
+    const text = String(patch.text ?? "").trim();
+    const scheduleDate = String(patch.scheduleDate ?? "").trim();
+    const startTime = String(patch.startTime ?? "").trim();
+    const durationMin = Math.max(5, Math.min(24 * 60, Math.floor(Number(patch.durationMin ?? 60))));
+    if (!text) throw new Error("日程描述不能为空");
+    if (!this.isYmd(scheduleDate)) throw new Error("日期须为 YYYY-MM-DD");
+    if (!/^\d{2}:\d{2}$/.test(startTime)) throw new Error("开始时间须为 HH:mm");
+
+    const sm = (this.host.settingsRef() as any)?.scheduleModule;
+    const category =
+      sanitizeScheduleCategoryIdForMeta(String(patch.category ?? "").trim()) || getDefaultScheduleCategoryId(sm);
+
+    const repeat = String(patch.repeatRule ?? "none").trim().toLowerCase();
+    const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
+    const rr = allowed.has(repeat) ? repeat : "none";
+
+    const start = momentFn(`${scheduleDate} ${startTime}`, "YYYY-MM-DD HH:mm");
+    if (!start?.isValid?.()) throw new Error("开始时间无效");
+    const end = start.clone().add(durationMin, "minutes");
+    const endTime = end.format("HH:mm");
+    const timePrefix = `${startTime}-${endTime}`;
+    const lineText = `${timePrefix} ${text}`.trim();
+    const repToken = rr !== "none" ? ` 🔁 ${rr}` : "";
+
+    const af = this.host.app.vault.getAbstractFileByPath(filePath);
+    if (!af || !(af instanceof TFile)) throw new Error("file not found");
+
+    const content = await this.host.app.vault.read(af);
+    const lines = (content ?? "").split(/\r?\n/);
+
+    const findLineIdxByUid = (): number | null => {
+      if (!uid) return null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!metaLineHasUid(lines[i], uid)) continue;
+        const idx = i - 1;
+        if (idx >= 0 && lines[idx] && /^\s*-\s*\[.\]\s+/.test(lines[idx])) return idx;
+      }
+      const ln = Number((it as any).lineNo ?? -1);
+      if (ln >= 0 && ln < lines.length) return ln;
+      return null;
+    };
+
+    const parseMetaKv = (metaLine: string): Record<string, string> => {
+      const m = metaLine.match(/^\s*<!--\s*rslatte:([^>]*)-->\s*$/i);
+      if (!m) return {};
+      const raw = String(m[1] ?? "").trim();
+      const parts = raw.split(/[;\s]+/).map((x) => x.trim()).filter(Boolean);
+      const kv: Record<string, string> = {};
+      for (const p of parts) {
+        const mm = p.match(/^([A-Za-z0-9_\-:]+)=(.+)$/);
+        if (!mm) continue;
+        kv[mm[1].trim()] = mm[2].trim();
+      }
+      return kv;
+    };
+
+    const idx = findLineIdxByUid();
+    if (idx == null) throw new Error("未找到日程行");
+    const metaIdx = idx + 1;
+    if (metaIdx >= lines.length || !/^\s*<!--\s*rslatte:/i.test(lines[metaIdx] ?? "")) {
+      throw new Error("未找到日程 meta 行");
+    }
+    const oldKv = parseMetaKv(lines[metaIdx]);
+    const typeOk = String(oldKv.type ?? "").trim().toLowerCase() === "schedule";
+    const catOk = String(oldKv.cat ?? "").trim().toLowerCase() === "schedule";
+    const sd0 = String(oldKv.schedule_date ?? "").trim();
+    const st0 = String(oldKv.start_time ?? "").trim();
+    /** 与 createScheduleMemo 一致的日程 meta 形态（兼容曾误写 cat=generalReminder 等混合行） */
+    const metaLooksLikeSchedule =
+      /^\d{4}-\d{2}-\d{2}$/.test(sd0) && /^\d{1,2}:\d{2}$/.test(st0);
+    const exIt = ((it as any)?.extra ?? {}) as Record<string, string>;
+    const indexLooksLikeSchedule =
+      String(exIt.type ?? "").trim().toLowerCase() === "schedule" ||
+      String(exIt.cat ?? "").trim().toLowerCase() === "schedule" ||
+      (/^\d{4}-\d{2}-\d{2}$/.test(String(exIt.schedule_date ?? "").trim()) &&
+        /^\d{1,2}:\d{2}$/.test(String(exIt.start_time ?? "").trim()));
+    if (!typeOk && !catOk && !metaLooksLikeSchedule && !indexLooksLikeSchedule) {
+      throw new Error("该条目不是日程（meta 需含 type=schedule，或旧版 cat=schedule，或 schedule_date+start_time）");
+    }
+
+    const oldScheduleDate = String(oldKv.schedule_date ?? (it as any).memoDate ?? "").trim();
+    const linkedTaskRaw = String(oldKv.linked_task_uid ?? "").trim();
+    const linkedMeta = linkedTaskRaw ? `;linked_task_uid=${linkedTaskRaw.replace(/[;\s]+/g, "_")}` : "";
+    const followSegs: string[] = [];
+    const fuTk = String(oldKv.followup_task_uid ?? "").trim();
+    const fuMk = String(oldKv.followup_memo_uid ?? "").trim();
+    const fuTid = String(oldKv.followup_task_tid ?? "").trim();
+    const fuMid = String(oldKv.followup_memo_mid ?? "").trim();
+    const fuSch = String(oldKv.followup_schedule_uid ?? "").trim();
+    const fuSchTid = String(oldKv.followup_schedule_tid ?? "").trim();
+    const san = (s: string) => s.replace(/[;\s]+/g, "_");
+    if (fuTk) followSegs.push(`followup_task_uid=${san(fuTk)}`);
+    if (fuMk) followSegs.push(`followup_memo_uid=${san(fuMk)}`);
+    if (fuTid) followSegs.push(`followup_task_tid=${san(fuTid)}`);
+    if (fuMid) followSegs.push(`followup_memo_mid=${san(fuMid)}`);
+    if (fuSch) followSegs.push(`followup_schedule_uid=${san(fuSch)}`);
+    if (fuSchTid) followSegs.push(`followup_schedule_tid=${san(fuSchTid)}`);
+    const followMeta = followSegs.length ? `;${followSegs.join(";")}` : "";
+
+    const oldLine = lines[idx] ?? "";
+    const lmm = oldLine.match(/^\s*(-\s*)\[(.)\]\s*(.*)$/);
+    if (!lmm) throw new Error("invalid schedule line");
+    const dashPart = lmm[1] ?? "- ";
+    const mark = lmm[2] ?? "/";
+
+    const plusM = /\s➕\s*(\d{4}-\d{2}-\d{2})/.exec(String(oldLine));
+    const createdYmd = (plusM && plusM[1]) ? plusM[1] : todayYmd();
+
+    const newLine = `${dashPart}[${mark}] ${lineText} 📅 ${scheduleDate}${repToken} ➕ ${createdYmd}`.replace(/\s{2,}/g, " ").trimEnd();
+    const tsIso = nowIso();
+    const meta = `  <!-- rslatte:uid=${uid};type=schedule;ts=${tsIso};schedule_category=${category};schedule_date=${scheduleDate};start_time=${startTime};end_time=${endTime};duration_min=${durationMin};updated_time=${tsIso}${linkedMeta}${followMeta} -->`;
+
+    const rules = (this.host.settingsRef().journalAppendRules ?? []) as any[];
+    const r = (rules.find((x) => x.module === "schedule") ?? { h1: "# 任务追踪", h2: "## 新增日程" }) as any;
+
+    const currentSpaceId = (this.host as any).getCurrentSpaceId?.() || "";
+    const spaces = (this.host.settingsRef() as any).spaces || {};
+    const currentSpace = spaces[currentSpaceId];
+    const spaceSnapshot = currentSpace?.settingsSnapshot || {};
+    const spaceDiaryPath = spaceSnapshot.diaryPath;
+    const spaceDiaryNameFormat = spaceSnapshot.diaryNameFormat;
+    const spaceDiaryTemplate = spaceSnapshot.diaryTemplate;
+
+    const originalPathOverride = (this.host.journalSvc as any)._diaryPathOverride;
+    const originalFormatOverride = (this.host.journalSvc as any)._diaryNameFormatOverride;
+    const originalTemplateOverride = (this.host.journalSvc as any)._diaryTemplateOverride;
+
+    try {
+      this.host.journalSvc.setDiaryPathOverride(spaceDiaryPath || null, spaceDiaryNameFormat || null, spaceDiaryTemplate || null);
+
+      if (oldScheduleDate && scheduleDate !== oldScheduleDate) {
+        lines.splice(idx, 2);
+        await this.host.app.vault.modify(af, lines.join("\n"));
+        await this.host.journalSvc.upsertLinesToDiaryH1H2(scheduleDate, r.h1, r.h2, [newLine, meta], { mode: "append" });
+      } else {
+        lines[idx] = newLine;
+        lines[metaIdx] = meta;
+        await this.host.app.vault.modify(af, lines.join("\n"));
+      }
+    } finally {
+      this.host.journalSvc.setDiaryPathOverride(originalPathOverride, originalFormatOverride, originalTemplateOverride);
+    }
+
+    if (!opts?.skipWorkEvent) {
+      try {
+        void this.host.workEventSvc?.append({
+          ts: tsIso,
+          kind: "schedule",
+          action: "update",
+          source: "ui",
+          ref: { uid, file_path: filePath, line_no: idx, category: "schedule" },
+          summary: `✏️ 修改日程 ${text.length > 80 ? text.slice(0, 80) + "…" : text}`,
+          metrics: { scheduleDate, repeatRule: rr, category: "schedule" },
+        } as any);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  public async queryScheduleBuckets(opts?: {
+    upcomingDays?: number;
+    recentClosedDays?: number;
+  }): Promise<{
+    todayFocus: RSLatteIndexItem[];
+    upcoming: RSLatteIndexItem[];
+    overdue: RSLatteIndexItem[];
+    activeOther: RSLatteIndexItem[];
+    recentClosed: RSLatteIndexItem[];
+  }> {
+    await this.ensureReady();
+    const schedIdx = await this.store.readIndex("schedule");
+    const items = (schedIdx.items ?? []) as RSLatteIndexItem[];
+    const upcomingDays = Math.max(1, Math.min(30, Number(opts?.upcomingDays ?? 5) || 5));
+    const recentClosedDays = Math.max(7, Math.min(100, Number(opts?.recentClosedDays ?? 30) || 30));
+    const today = todayYmd();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const toUtcDay = (ymd: string): number | null => {
+      const m = String(ymd ?? "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) return null;
+      return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    };
+    const getScheduleDate = (it: RSLatteIndexItem): string => {
+      const extra = ((it as any)?.extra ?? {}) as Record<string, string>;
+      const fromExtra = String(extra.schedule_date ?? "").trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fromExtra)) return fromExtra;
+      return String((it as any)?.memoDate ?? "").trim();
+    };
+    const diffDays = (targetYmd: string): number | null => {
+      const a = toUtcDay(today);
+      const b = toUtcDay(targetYmd);
+      if (a == null || b == null) return null;
+      return Math.floor((b - a) / dayMs);
+    };
+    const getStartTime = (it: RSLatteIndexItem): string => {
+      const t = String(((it as any)?.extra ?? {})?.start_time ?? "").trim();
+      return /^\d{2}:\d{2}$/.test(t) ? t : "99:99";
+    };
+    const dueStartSort = (a: RSLatteIndexItem, b: RSLatteIndexItem): number => {
+      const da = getScheduleDate(a);
+      const db = getScheduleDate(b);
+      const cmpDate = da.localeCompare(db);
+      if (cmpDate !== 0) return cmpDate;
+      return getStartTime(a).localeCompare(getStartTime(b));
+    };
+    const closeTime = (it: RSLatteIndexItem): number => {
+      const extra = ((it as any)?.extra ?? {}) as Record<string, string>;
+      const done = String((it as any)?.done_date ?? "").trim();
+      const cancelled = String((it as any)?.cancelled_date ?? "").trim();
+      const invalidated = String(extra.invalidated_date ?? "").trim();
+      const c = done || cancelled || invalidated;
+      const u = toUtcDay(c);
+      return u == null ? 0 : u;
+    };
+
+    const todayFocus: RSLatteIndexItem[] = [];
+    const upcoming: RSLatteIndexItem[] = [];
+    const overdue: RSLatteIndexItem[] = [];
+    const activeOther: RSLatteIndexItem[] = [];
+    const recentClosed: RSLatteIndexItem[] = [];
+    for (const it of items) {
+      if (it.archived) continue;
+      const itemType = String((it as any)?.itemType ?? "").trim();
+      if (itemType !== "memo" && itemType !== "schedule") continue;
+      const extra = ((it as any)?.extra ?? {}) as Record<string, string>;
+      if (!isScheduleMemoLine(it as any)) continue;
+      const status = String((it as any)?.status ?? "").trim().toUpperCase();
+      const invalidated = String(extra.invalidated ?? "").trim() === "1";
+      const dateYmd = getScheduleDate(it);
+      const dd = diffDays(dateYmd);
+      const closedYmd = String((it as any)?.done_date ?? "").trim()
+        || String((it as any)?.cancelled_date ?? "").trim()
+        || String(extra.invalidated_date ?? "").trim()
+        || (invalidated ? String((it as any)?.updated_date ?? "").trim() : "");
+      const closedDiff = diffDays(closedYmd);
+      if ((status === "DONE" || status === "CANCELLED" || invalidated) && closedDiff != null && closedDiff <= 0 && Math.abs(closedDiff) <= recentClosedDays) {
+        recentClosed.push(it);
+        continue;
+      }
+      if (status === "DONE" || status === "CANCELLED" || invalidated) continue;
+      if (dd === 0) todayFocus.push(it);
+      else if (dd != null && dd > 0 && dd <= upcomingDays) upcoming.push(it);
+      else if (dd != null && dd < 0) overdue.push(it);
+      else activeOther.push(it);
+    }
+
+    todayFocus.sort(dueStartSort);
+    upcoming.sort(dueStartSort);
+    overdue.sort(dueStartSort);
+    activeOther.sort(dueStartSort);
+    recentClosed.sort((a, b) => closeTime(b) - closeTime(a));
+    return { todayFocus, upcoming, overdue, activeOther, recentClosed };
   }
 
   // =========================
@@ -2763,13 +4806,15 @@ public async createTodayTask(
     for (const it of items) {
       if (it.archived) continue;
       if (it.status === "DONE" || it.status === "CANCELLED") continue;
+      if (isScheduleMemoLine(it)) continue;
 
       const extra: Record<string, string> = (it as any).extra ?? {};
+      if (String(extra["invalidated"] ?? "").trim() === "1") continue;
 
       // memo scheduling
       let rule = String(it.repeatRule || "").trim().toLowerCase();
       if (!rule) rule = (it.memoMmdd ? "yearly" : "none");
-      const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+      const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
       const rr = allowed.has(rule) ? rule : "none";
 
       const metaNext = String(extra["next"] ?? "").trim();
@@ -2811,7 +4856,7 @@ public async createTodayTask(
   }
 
   /**
-   * v28：全量备忘清单（用于侧边栏管理）
+   * v28：全量提醒清单（用于侧边栏管理）
    * - 返回过滤后的总数 total
    * - items 为最多 maxItems 条（按 memoDate/next 升序）
    */
@@ -2842,6 +4887,8 @@ public async createTodayTask(
 
     for (const it of items) {
       if ((it as any).archived) continue;
+      if (String((it as any)?.extra?.invalidated ?? "").trim() === "1") continue;
+      if (isScheduleMemoLine(it)) continue;
       const st = String((it as any).status ?? "").trim().toUpperCase();
       if (!stSet.has(st as any)) continue;
 
@@ -2852,8 +4899,8 @@ public async createTodayTask(
       const extra: Record<string, string> = (anyIt.extra ?? {}) as any;
 
       let pick = "";
-      if (st === "DONE") pick = String(anyIt.doneDate ?? "");
-      else if (st === "CANCELLED") pick = String(anyIt.cancelledDate ?? "");
+      if (st === "DONE") pick = String(anyIt.done_date ?? "");
+      else if (st === "CANCELLED") pick = String(anyIt.cancelled_date ?? "");
 
       // open / fallback
       if (!this.isYmd(pick)) {
@@ -2867,7 +4914,7 @@ public async createTodayTask(
           const mmdd = String(anyIt.memoMmdd).trim();
           let rr = String(anyIt.repeatRule ?? "").trim().toLowerCase();
           if (!rr) rr = "yearly";
-          const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+          const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
           rr = allowed.has(rr) ? rr : "none";
           pick = this.computeNextByRepeat(`${today.slice(0, 4)}-${mmdd}`, rr, today, mmdd);
         }
@@ -2881,6 +4928,183 @@ public async createTodayTask(
     const total = mapped.length;
     const out = mapped.slice(0, maxItems).map((x) => x.it);
     return { items: out, total };
+  }
+
+  public async queryReminderBuckets(opts?: {
+    upcomingDays?: number;
+    recentClosedDays?: number;
+  }): Promise<{
+    todayFocus: RSLatteIndexItem[];
+    overdue: RSLatteIndexItem[];
+    activeOther: RSLatteIndexItem[];
+    recentClosed: RSLatteIndexItem[];
+  }> {
+    await this.ensureReady();
+    let idx = await this.store.readIndex("memo");
+    if (!(idx.items ?? []).length) {
+      await this.refreshIndexAndSync({ sync: false });
+      idx = await this.store.readIndex("memo");
+    }
+    const items = (idx.items ?? []) as RSLatteIndexItem[];
+    const upcomingDays = Math.max(1, Math.min(30, Number(opts?.upcomingDays ?? 5) || 5));
+    const recentClosedDays = Math.max(7, Math.min(100, Number(opts?.recentClosedDays ?? 30) || 30));
+    const today = todayYmd();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const toUtcDay = (ymd: string): number | null => {
+      const m = String(ymd ?? "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) return null;
+      return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    };
+    const diffDays = (targetYmd: string): number | null => {
+      const a = toUtcDay(today);
+      const b = toUtcDay(targetYmd);
+      if (a == null || b == null) return null;
+      return Math.floor((b - a) / dayMs);
+    };
+    const createdTime = (it: RSLatteIndexItem): number => {
+      const c = String((it as any)?.created_date ?? "").trim();
+      const u = toUtcDay(c);
+      return u == null ? Number.MAX_SAFE_INTEGER : u;
+    };
+    const dueTime = (it: RSLatteIndexItem): number => {
+      const d = String((it as any)?.memoDate ?? "").trim();
+      const u = toUtcDay(d);
+      return u == null ? Number.MAX_SAFE_INTEGER : u;
+    };
+    const closeTime = (it: RSLatteIndexItem): number => {
+      const extra = ((it as any)?.extra ?? {}) as Record<string, string>;
+      const done = String((it as any)?.done_date ?? "").trim();
+      const cancelled = String((it as any)?.cancelled_date ?? "").trim();
+      const invalidated = String(extra.invalidated_date ?? "").trim();
+      const c = done || cancelled || invalidated;
+      const u = toUtcDay(c);
+      return u == null ? 0 : u;
+    };
+
+    const todayFocus: RSLatteIndexItem[] = [];
+    const overdue: RSLatteIndexItem[] = [];
+    const activeOther: RSLatteIndexItem[] = [];
+    const recentClosed: RSLatteIndexItem[] = [];
+
+    for (const it of items) {
+      if (it.archived || it.itemType !== "memo") continue;
+      if (isScheduleMemoLine(it)) continue;
+      const extra = ((it as any)?.extra ?? {}) as Record<string, string>;
+      const status = String((it as any)?.status ?? "").trim().toUpperCase();
+      const invalidated = String(extra.invalidated ?? "").trim() === "1";
+      const dateYmd = String((it as any)?.memoDate ?? "").trim();
+      const dd = diffDays(dateYmd);
+
+      // 近期完成/取消/失效
+      const closedYmd = String((it as any)?.done_date ?? "").trim()
+        || String((it as any)?.cancelled_date ?? "").trim()
+        || String(extra.invalidated_date ?? "").trim()
+        || (invalidated ? String((it as any)?.updated_date ?? "").trim() : "")
+        || (invalidated ? String((it as any)?.created_date ?? "").trim() : "");
+      const closedDiff = diffDays(closedYmd);
+      if ((status === "DONE" || status === "CANCELLED" || invalidated) && closedDiff != null && closedDiff <= 0 && Math.abs(closedDiff) <= recentClosedDays) {
+        recentClosed.push(it);
+        continue;
+      }
+
+      // 仅活跃提醒参与以下三组
+      if (status === "DONE" || status === "CANCELLED" || invalidated) continue;
+
+      if (dd != null && dd < 0) {
+        overdue.push(it);
+      } else if (dd != null && dd >= 0 && dd <= upcomingDays) {
+        todayFocus.push(it);
+      } else {
+        activeOther.push(it);
+      }
+    }
+
+    // 今日关注：先今日，再即将到期；同组按创建时间升序
+    const todayItems = todayFocus.filter((x) => diffDays(String((x as any)?.memoDate ?? "").trim()) === 0).sort((a, b) => createdTime(a) - createdTime(b));
+    const upcomingItems = todayFocus.filter((x) => {
+      const d = diffDays(String((x as any)?.memoDate ?? "").trim());
+      return d != null && d > 0 && d <= upcomingDays;
+    }).sort((a, b) => createdTime(a) - createdTime(b));
+
+    overdue.sort((a, b) => dueTime(a) - dueTime(b));
+    activeOther.sort((a, b) => dueTime(a) - dueTime(b));
+    recentClosed.sort((a, b) => closeTime(b) - closeTime(a));
+
+    return {
+      todayFocus: [...todayItems, ...upcomingItems],
+      overdue,
+      activeOther,
+      recentClosed,
+    };
+  }
+
+  public async setMemoInvalidated(
+    it: Pick<RSLatteIndexItem, "filePath" | "lineNo" | "uid" | "text" | "raw">,
+    invalidated: boolean
+  ): Promise<void> {
+    const filePath = String(it.filePath ?? "");
+    const uid = String((it as any).uid ?? "").trim();
+    if (!filePath || !uid) throw new Error("missing filePath/uid");
+
+    const af = this.host.app.vault.getAbstractFileByPath(filePath);
+    if (!af || !(af instanceof TFile)) throw new Error("file not found");
+
+    const content = await this.host.app.vault.read(af);
+    const lines = (content ?? "").split(/\r?\n/);
+    const findLineByUid = (): number | null => {
+      if (!uid) return null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!metaLineHasUid(lines[i], uid)) continue;
+        const idx = i - 1;
+        if (idx >= 0 && lines[idx] && /^\s*-\s*\[.\]\s+/.test(lines[idx])) return idx;
+      }
+      return null;
+    };
+    let idx = findLineByUid();
+    if (idx == null) {
+      const ln = Number((it as any).lineNo ?? -1);
+      if (ln >= 0 && ln < lines.length) idx = ln;
+    }
+    if (idx == null) throw new Error("line not found");
+
+    const oldLine = lines[idx] ?? "";
+    const mm = oldLine.match(/^\s*(\-\s*)\[(.)\]\s*(.*)$/);
+    if (!mm) throw new Error("invalid memo line");
+    const prefix = mm[1] ?? "- ";
+    const body = String(mm[3] ?? "");
+    const tokenRe = /\s(📅|➕|⏳|🛫|✅|❌|🔁)\s/u;
+    const mt = body.match(tokenRe);
+    let descPart = body;
+    let tokenPart = "";
+    if (mt && typeof (mt as any).index === "number") {
+      const cut = (mt as any).index as number;
+      descPart = body.slice(0, cut).trimEnd();
+      tokenPart = body.slice(cut).trimStart();
+    }
+    let desc = String(descPart ?? "").trim();
+    desc = desc.replace(/^🚫\s*/u, "").trim();
+    if (invalidated) {
+      desc = desc ? `🚫 ${desc}` : "🚫";
+    }
+    const mergedBody = `${desc}${tokenPart ? ` ${tokenPart}` : ""}`.replace(/\s{2,}/g, " ").trimEnd();
+    const newLine = `${prefix}[${invalidated ? "-" : "/"}] ${mergedBody}`.replace(/\s{2,}/g, " ").trimEnd();
+    if (newLine !== oldLine) {
+      lines[idx] = newLine;
+      await this.host.app.vault.modify(af, lines.join("\n"));
+    }
+
+    const tsIso = nowIso();
+    await writeBackMetaIdByUid(
+      this.host.app,
+      filePath,
+      uid,
+      {
+        invalidated: invalidated ? "1" : "0",
+        invalidated_date: invalidated ? todayYmd() : "",
+        invalidated_time: invalidated ? tsIso : "",
+      },
+      idx
+    );
   }
 
   // =========================
@@ -2903,9 +5127,13 @@ public async createTodayTask(
 
     const thresholdDaysRaw = this.tp.archiveThresholdDays;
     const keepMonthsRaw = this.tp.archiveKeepMonths;
-    const thresholdDays = Number.isFinite(thresholdDaysRaw)
-      ? Math.max(1, Math.min(3650, Math.floor(Number(thresholdDaysRaw))))
-      : (Number.isFinite(keepMonthsRaw) ? Math.max(0, Math.floor(Number(keepMonthsRaw))) * 30 : 90);
+    const thresholdDays = normalizeArchiveThresholdDays(
+      Number.isFinite(thresholdDaysRaw)
+        ? Number(thresholdDaysRaw)
+        : Number.isFinite(keepMonthsRaw)
+          ? Math.max(0, Math.floor(Number(keepMonthsRaw))) * 30
+          : 90,
+    );
 
     const emptyRes: ArchiveResult = { archivedCount: 0, byMonth: {}, cutoffDate: todayYmd() };
     const taskRes = mods.task ? await archiveIndexByMonths(this.store, "task", thresholdDays) : emptyRes;

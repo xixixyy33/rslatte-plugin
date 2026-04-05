@@ -19,7 +19,7 @@ export function getUiHeaderButtonsVisibility(
 export function ensureUiHeaderButtonsConfig(settings: RSLattePluginSettings): void {
   const s: any = settings as any;
   if (!s.uiHeaderButtons) s.uiHeaderButtons = {};
-  const mk = ["checkin", "finance", "memo", "task", "project", "output", "contacts"] as const;
+  const mk = ["checkin", "finance", "health", "memo", "task", "project", "output", "contacts"] as const;
   for (const k of mk) {
     if (!s.uiHeaderButtons[k]) s.uiHeaderButtons[k] = { rebuild: true, archive: true, refresh: true };
     if (s.uiHeaderButtons[k].rebuild === undefined) s.uiHeaderButtons[k].rebuild = true;

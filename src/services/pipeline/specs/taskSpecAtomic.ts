@@ -129,6 +129,13 @@ export function createTaskSpecAtomic(plugin: any): ModuleSpecAtomic {
     async scanIncremental(ctx) {
       try {
         await plugin?.taskRSLatte?.ensureReady?.();
+        // 侧栏「刷新」manual_refresh：先清扫描缓存再增量扫
+        if (
+          ctx.mode === "manual_refresh" &&
+          typeof plugin?.taskRSLatte?.clearScanCache === "function"
+        ) {
+          await plugin.taskRSLatte.clearScanCache();
+        }
         const fixUidAndMeta = ctx.mode !== "auto_refresh";
         const scan: any = await plugin?.taskRSLatte?.e2ScanIncremental?.(TASK_MODULES, { fixUidAndMeta });
 
@@ -172,7 +179,7 @@ export function createTaskSpecAtomic(plugin: any): ModuleSpecAtomic {
         await plugin?.taskRSLatte?.ensureReady?.();
         const applied: any = await plugin?.taskRSLatte?.e2ApplyScanToIndex?.(scan);
 
-        // Step3: update contacts-interactions index for *task* source, incrementally (best-effort).
+        // Step3: update contacts-interactions index for *task* source（applyFileUpdates 内会重写联系人 md 动态块）
         try {
           const store = plugin?.contactsIndex?.getInteractionsStore?.();
           if (store && typeof store.applyFileUpdates === "function") {
@@ -240,7 +247,7 @@ export function createTaskSpecAtomic(plugin: any): ModuleSpecAtomic {
         await plugin?.taskRSLatte?.ensureReady?.();
         const applied: any = await plugin?.taskRSLatte?.e2ApplyScanToIndex?.(scan);
 
-        // Step3: full rebuild cleanup for *task* source. Remove stale entries for files no longer included.
+        // Step3: full rebuild cleanup for task/memo source（applyFileUpdates / cleanup 内会重写联系人 md 动态块）
         try {
           const store = plugin?.contactsIndex?.getInteractionsStore?.();
           if (store) {

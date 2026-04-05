@@ -4,17 +4,20 @@
  */
 import { Notice } from "obsidian";
 import type RSLattePlugin from "../main";
-import { VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_PUBLISH, VIEW_TYPE_FINANCE, VIEW_TYPE_CHECKIN, VIEW_TYPE_CONTACTS, VIEW_TYPE_HUB, VIEW_TYPE_DASHBOARD } from "../constants/viewTypes";
+import { VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_FINANCE, VIEW_TYPE_HEALTH, VIEW_TYPE_CHECKIN, VIEW_TYPE_CONTACTS, VIEW_TYPE_HUB, VIEW_TYPE_CAPTURE, VIEW_TYPE_TODAY, VIEW_TYPE_KNOWLEDGE, VIEW_TYPE_REVIEW } from "../constants/viewTypes";
 import { RSLatteSidePanelView } from "../ui/views/RSLatteSidePanelView";
 import { TaskSidePanelView } from "../ui/views/TaskSidePanelView";
 import { ProjectSidePanelView } from "../ui/views/ProjectSidePanelView";
 import { OutputSidePanelView } from "../ui/views/OutputSidePanelView";
-import { PublishSidePanelView } from "../ui/views/PublishSidePanelView";
 import { FinanceSidePanelView } from "../ui/views/FinanceSidePanelView";
+import { HealthSidePanelView } from "../ui/views/HealthSidePanelView";
 import { CheckinSidePanelView } from "../ui/views/CheckinSidePanelView";
 import { ContactsSidePanelView } from "../ui/views/ContactsSidePanelView";
 import { SpaceHubView } from "../ui/views/SpaceHubView";
-import { DashboardView } from "../ui/views/DashboardView";
+import { CaptureView } from "../ui/views/CaptureView";
+import { TodayView } from "../ui/views/TodayView";
+import { KnowledgeView } from "../ui/views/KnowledgeView";
+import { ReviewView } from "../ui/views/ReviewView";
 import { DEFAULT_SETTINGS } from "../constants/defaults";
 
 export function createCore(plugin: RSLattePlugin) {
@@ -66,10 +69,6 @@ export function createCore(plugin: RSLattePlugin) {
         const view = leaf.view;
         if (view instanceof OutputSidePanelView) view.refresh();
       }
-      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_PUBLISH)) {
-        const view = leaf.view;
-        if (view instanceof PublishSidePanelView) view.refresh();
-      }
       for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_CONTACTS)) {
         const view = leaf.view;
         if (view instanceof ContactsSidePanelView) view.refresh();
@@ -78,20 +77,36 @@ export function createCore(plugin: RSLattePlugin) {
         const view = leaf.view;
         if (view instanceof FinanceSidePanelView) view.refresh();
       }
+      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_HEALTH)) {
+        const view = leaf.view;
+        if (view instanceof HealthSidePanelView) view.refresh();
+      }
       for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_CHECKIN)) {
         const view = leaf.view;
         if (view instanceof CheckinSidePanelView && typeof view.refresh === "function") {
           view.refresh();
         }
       }
-      // 空间切换后项目数据依赖 projectMgr 刷新并触发 refreshSidePanel，此处一并刷新工作台与 Hub
+      // 空间切换后项目数据依赖 projectMgr 刷新并触发 refreshSidePanel，此处一并刷新 Hub
       for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_HUB)) {
         const view = leaf.view;
         if (view instanceof SpaceHubView && typeof view.refresh === "function") view.refresh();
       }
-      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_DASHBOARD)) {
+      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_CAPTURE)) {
         const view = leaf.view;
-        if (view instanceof DashboardView && typeof view.refresh === "function") view.refresh();
+        if (view instanceof CaptureView && typeof view.refresh === "function") view.refresh();
+      }
+      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_TODAY)) {
+        const view = leaf.view;
+        if (view instanceof TodayView && typeof view.refresh === "function") view.refresh();
+      }
+      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_KNOWLEDGE)) {
+        const view = leaf.view;
+        if (view instanceof KnowledgeView && typeof view.refresh === "function") view.refresh();
+      }
+      for (const leaf of plugin.app.workspace.getLeavesOfType(VIEW_TYPE_REVIEW)) {
+        const view = leaf.view;
+        if (view instanceof ReviewView && typeof view.refresh === "function") view.refresh();
       }
     },
 

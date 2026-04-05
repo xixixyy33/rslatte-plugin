@@ -7,7 +7,7 @@ import type RSLattePlugin from "../main";
 export function createModuleEnablers(plugin: RSLattePlugin) {
   const self = {
     // ==========================
-    // v6-5.1：任务/备忘"拆分配置"的运行时 getter
+    // v6-5.1：任务/提醒"拆分配置"的运行时 getter
     // ==========================
 
     /** v6-5.1：任务模块是否启用 */
@@ -20,7 +20,7 @@ export function createModuleEnablers(plugin: RSLattePlugin) {
       return true;
     },
 
-    /** v6-5.1：备忘模块是否启用 */
+    /** v6-5.1：提醒模块是否启用 */
     isMemoModuleEnabledV2(): boolean {
       const s: any = plugin.settings as any;
       const v2 = s?.moduleEnabledV2;
@@ -50,7 +50,7 @@ export function createModuleEnablers(plugin: RSLattePlugin) {
       return self.isTaskDbSyncEnabled();
     },
 
-    /** v6-5.1：备忘模块 DB sync 是否启用 */
+    /** v6-5.1：提醒模块 DB sync 是否启用 */
     isMemoDbSyncEnabledV2(): boolean {
       if (!plugin.isMemoModuleEnabledV2()) return false;
 

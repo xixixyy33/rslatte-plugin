@@ -2,7 +2,7 @@
  * PipelineEngine skeleton (A3) + reconcile safety gate (C1)
  *
  * 目标：
- * - 统一入口：engine.run(moduleKey, mode)
+ * - 主路径：**runE2(ctx, moduleKey, mode)**（侧栏 / coordinator）；**engine.run** 为 legacy 兼容，自动 tick 不调用
  * - per-module 互斥锁（inFlight 拒绝重入）
  * - 统一日志前缀：[RSLatte][moduleKey][mode]
  * - 模块 enabled 判断（disabled => skipped + reason）
@@ -1003,7 +1003,7 @@ export class PipelineEngine {
       return { opName: "archive", fn: (ctx) => spec.archive(ctx) };
     }
 
-    // auto_refresh / auto / manual / manual_refresh：增量刷新
+    // auto_refresh / auto / manual_refresh：增量刷新
     return { opName: "incrementalRefresh", fn: (ctx) => spec.incrementalRefresh(ctx) };
   }
 }

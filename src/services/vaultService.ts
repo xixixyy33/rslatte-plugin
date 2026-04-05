@@ -9,6 +9,8 @@ export type VaultServiceHost = {
   api: RSLatteApiClient;
   /** 用于显示 Notice/刷新 UI 的回调 */
   refreshSidePanel: () => void;
+  /** 未完成初始化环境检查前，不按模块开关触达后端 */
+  isPluginEnvInitModuleGateOpen?: () => boolean;
   /** 数据库连接 OK 且有模块开启 DB 同步时，ensure 后用于同步 vault 名称与空间列表 */
   getVaultSyncPayload?: () => VaultSyncReq;
   /** 用于侧边栏状态灯：DB sync 开启但后端不可用时标红 */
@@ -63,6 +65,10 @@ export class VaultService {
       return { ok: false, reason: "URL 格式不合法", baseUrl };
     }
 
+    if (this.host.isPluginEnvInitModuleGateOpen && !this.host.isPluginEnvInitModuleGateOpen()) {
+      return { ok: false, reason: "需先完成插件初始化环境检查", baseUrl };
+    }
+
     // 至少一个模块开启 DB sync
     const enabledV2: any = s.moduleEnabledV2 ?? {};
     const moduleOn = (k: string): boolean => {
@@ -90,6 +96,12 @@ export class VaultService {
 
       // legacy record flag
       !!s.rslattePanelEnableDbSync,
+      // 与设置页 `anyDbSyncEnabled` 对齐：缺下列任一项会导致「只开 WorkEvent/知识/健康」时被误判为全关，进而 checkDbReady 恒 false、URL 误标红
+      !!s.taskPanel?.enableDbSync,
+      !!s.workEventDbSyncEnabled,
+      !!s.knowledgePanel?.enableDbSync,
+      !!s.healthPanel?.enableDbSync,
+      !!s.scheduleModule?.enableDbSync,
     ].some(Boolean);
 
     if (!anyDbSync) return { ok: false, reason: "DB 同步已全部关闭", baseUrl };
@@ -122,7 +134,8 @@ export class VaultService {
     const code = e?.data?.detail?.code ?? e?.data?.code;
 
     if (status === 401 || status === 403) {
-      return { kind: "auth", reason: `鉴权失败（HTTP ${status}）`, initRequired: false };
+      const authMsg = msg.length > 0 ? msg : `鉴权失败（HTTP ${status}）`;
+      return { kind: "auth", reason: authMsg, initRequired: false };
     }
 
     if (code === "DB_NOT_INITIALIZED" || msg.includes("DB_NOT_INITIALIZED") || msg.includes("未初始化") || msg.toLowerCase().includes("not initialized")) {

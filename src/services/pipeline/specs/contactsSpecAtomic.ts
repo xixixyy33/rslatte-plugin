@@ -1,13 +1,20 @@
 /**
  * Contacts atomic spec (Step X3)
  *
- * Goal (MVP):
- * - Make engine.runE2("contacts", "rebuild") work so unified logs appear.
- * - Keep local md as the source-of-truth: scanFull uses existing full rebuild logic.
- * - DB sync is best-effort (方案1 full upsert of contactsDir + archiveDir) and must NOT block local usage.
+ * ## §8.1 语义标签
  *
- * NOTE:
- * - Incremental (manual/auto refresh) uses full-scan fallback (MVP) to keep behavior correct; later we can optimize with file-change delta.
+ * - **`rebuildActiveOnly`**：`scanFull` / `applyDelta` → **`rebuildActiveOnlyIndexes`**（`rebuildAndWrite`）：只扫 **`contactsDir`**，不扫 **`archiveDir`**。
+ * - **`rebuildAfterPhysicalArchive`**：`archiveOutOfRange` → `archiveContactsNow` 成功后 **`rebuildContactsAllIndexes`**（主索引 + `contacts-archive-index`）。
+ *
+ * 登记：`PIPELINE_ATOMIC_REBUILD_SCOPE_REGISTRY.contacts`（`rebuildScopeSemantics.ts`）。
+ *
+ * ## §8.5 DB `flushQueue` 与本地索引扫描范围（显式约定，《代码结构优化方案》）
+ *
+ * - **本地 JSON 索引**：`rebuildActiveOnlyIndexes` → `contactsIndex.rebuildAndWrite` **只扫 `contactsDir`**（`rebuildActiveOnly`），**不**扫 `archiveDir`，降低日常重建 I/O。
+ * - **DB 同步**：`buildOps` 在 rebuild / manual_refresh / auto_refresh 等模式下通过 **`listAllContactMdPathsForDbSync`** 列举 **主目录 + 归档目录** 下全部联系人 md；`flushQueue` 再 **`tryContactsDbSyncByPaths`** 做全量 upsert，使后端 `contacts` 与 Vault **全量对齐**。归档且带 `movedPaths` 时可仅同步搬迁路径（`allowFallbackFull: false`）。
+ * - **结论**：索引扫描集 ⊂ DB 路径集 是**有意设计**（索引成本优化 vs DB 契约全量），**不是漏扫归档**。若未来改为「DB 也只 upsert active」，须产品/接口契约确认后再改。
+ *
+ * - Incremental（manual/auto refresh）当前为全量回退（MVP）；后续可做文件级增量。
  */
 
 import { Notice } from "obsidian";
@@ -72,46 +79,36 @@ export function createContactsSpecAtomic(plugin: any): ModuleSpecAtomic {
   // runId-scoped state (buildOps -> flushQueue)
   const buildOpsByRunId = new Map<string, BuildOpsState>();
 
+  /** §8.5：供 `buildOps`/`flushQueue` fallback — **`main.listAllContactMdPathsForDbSync`**（主+归档），与 `rebuildActiveOnlyIndexes` 不同。 */
   const listAllPaths = async (): Promise<string[]> => {
-    // private helper in main.ts (Step X2)
     const fn = (plugin as any).listAllContactMdPathsForDbSync;
     if (typeof fn === "function") return await fn.call(plugin);
     return [];
   };
 
 
-  const rebuildLocalIndexes = async (ctx: RSLatteAtomicOpContext): Promise<any> => {
-    // Source-of-truth: rebuild local contacts indexes (main + archive)
-    
-    // ✅ DEBUG: 打印扫描前的提示
+  /**
+   * §8.1 **`rebuildActiveOnly`**：仅主目录 `rebuildAndWrite`，不扫归档树。
+   * §8.5 与 `buildOps`/`flushQueue` 的全量 DB 路径列举 **分工不同**（见文件头）；勿将「索引未扫归档」与「DB listAll」混为一谈。
+   */
+  const rebuildActiveOnlyIndexes = async (ctx: RSLatteAtomicOpContext): Promise<any> => {
     const debugLogEnabled = (plugin?.settings as any)?.debugLogEnabled === true;
     if (debugLogEnabled) {
-      console.log(`[RSLatte][contacts][manual_refresh] rebuildLocalIndexes: Starting full rebuild of contacts indexes...`);
+      console.log(`[RSLatte][contacts][manual_refresh] rebuildActiveOnlyIndexes [rebuildActiveOnly]: Starting...`);
     }
-    
-    const r = await (plugin as any).contactsIndex?.rebuildAllAndWrite?.();
-    
-    // ✅ DEBUG: 打印扫描结果（如果 rebuildAllAndWrite 返回了文件信息）
+
+    const r = await (plugin as any).contactsIndex?.rebuildAndWrite?.();
+
     if (debugLogEnabled && r) {
-      const mainFiles = Array.isArray((r as any)?.main?.scannedFiles) ? (r as any).main.scannedFiles : [];
-      const archiveFiles = Array.isArray((r as any)?.archive?.scannedFiles) ? (r as any).archive.scannedFiles : [];
-      const allFiles = [...mainFiles, ...archiveFiles].sort();
-      console.log(`[RSLatte][contacts][manual_refresh] rebuildLocalIndexes: Completed`, {
-        main: {
-          count: (r as any)?.main?.count ?? 0,
-          scannedFiles: mainFiles.sort(),
-          parseErrorFiles: Array.isArray((r as any)?.main?.parseErrorFiles) ? (r as any).main.parseErrorFiles.sort() : [],
-        },
-        archive: {
-          count: (r as any)?.archive?.count ?? 0,
-          scannedFiles: archiveFiles.sort(),
-          parseErrorFiles: Array.isArray((r as any)?.archive?.parseErrorFiles) ? (r as any).archive.parseErrorFiles.sort() : [],
-        },
-        totalScannedFiles: allFiles.length,
-        scannedFiles: allFiles.slice(0, 20), // 只显示前20个
+      const scannedFiles = Array.isArray((r as any)?.scannedFiles) ? (r as any).scannedFiles : [];
+      console.log(`[RSLatte][contacts][manual_refresh] rebuildActiveOnlyIndexes: Completed`, {
+        count: (r as any)?.count ?? 0,
+        scannedFiles: scannedFiles.sort(),
+        parseErrorFiles: Array.isArray((r as any)?.parseErrorFiles) ? (r as any).parseErrorFiles.sort() : [],
+        sample: scannedFiles.slice(0, 20),
       });
     }
-    
+
     return { rebuild: r, requestedAt: ctx.requestedAt };
   };
 
@@ -191,9 +188,9 @@ export function createContactsSpecAtomic(plugin: any): ModuleSpecAtomic {
     },
 
     async applyDelta(ctx: RSLatteAtomicOpContext, scan: RSLatteScanResult): Promise<RSLatteResult<any>> {
-      // MVP: applyDelta rebuilds full indexes (contactsDir + archiveDir)
+      // MVP: applyDelta 与 scanFull 一致，仅重建主索引（不扫归档目录）
       try {
-        const r = await rebuildLocalIndexes(ctx);
+        const r = await rebuildActiveOnlyIndexes(ctx);
         return ok({ applied: "full_fallback", rebuild: r, scan });
       } catch (e: any) {
         return fail("CONTACTS_APPLYDELTA_FAILED", "Contacts applyDelta failed", { message: e?.message ?? String(e) });
@@ -203,7 +200,7 @@ export function createContactsSpecAtomic(plugin: any): ModuleSpecAtomic {
     // -------- rebuild --------
     async scanFull(ctx: RSLatteAtomicOpContext): Promise<RSLatteResult<any>> {
       try {
-        return ok(await rebuildLocalIndexes(ctx));
+        return ok(await rebuildActiveOnlyIndexes(ctx));
       } catch (e: any) {
         return fail("CONTACTS_SCANFULL_FAILED", "Contacts scanFull failed", { message: e?.message ?? String(e) });
       }
@@ -237,6 +234,9 @@ export function createContactsSpecAtomic(plugin: any): ModuleSpecAtomic {
     },
 
     // -------- db ops (MVP) --------
+    /**
+     * §8.5：rebuild / refresh 等模式下此处 **`listAllPaths` → 主+归档全路径**，供后端全量 upsert；本地 `contacts-index.json` 仍仅反映 active 扫描结果（`rebuildActiveOnlyIndexes`）。
+     */
     async buildOps(ctx: RSLatteAtomicOpContext, _input: any): Promise<RSLatteResult<any>> {
       try {
         // Only rebuild builds ops for DB sync in X3.
@@ -271,7 +271,7 @@ export function createContactsSpecAtomic(plugin: any): ModuleSpecAtomic {
           return ok({ ops: full.map((p) => ({ path: p })) });
         }
 
-        // rebuild/manual_refresh/auto_refresh: always full (contactsDir + archiveDir)
+        // §8.5：rebuild/manual_refresh/auto_refresh — DB 方案 1 全量（主+归档），非索引扫描范围
         const full = await listAllPaths();
         if (ctx.runId) {
           buildOpsByRunId.set(ctx.runId, { paths: full, allowFallbackFull: true });
@@ -287,6 +287,9 @@ export function createContactsSpecAtomic(plugin: any): ModuleSpecAtomic {
       }
     },
 
+    /**
+     * §8.5：按 `buildOps` 缓存路径 `tryContactsDbSyncByPaths`；若路径为空且允许 fallback，再次 **`listAllPaths`（主+归档）** — 与上游仅 active 的索引 JSON 仍可并存。
+     */
     async flushQueue(ctx: RSLatteAtomicOpContext, _opts: RSLatteFlushQueueOptions): Promise<RSLatteResult<any>> {
       try {
         const runId = ctx.runId;

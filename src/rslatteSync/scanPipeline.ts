@@ -192,10 +192,10 @@ export async function scanAllCachedWithStore(
     // created 缺失时 fallback：用文件创建时间
     const createdFallback = momentFn((f as any).stat?.ctime ?? Date.now()).format("YYYY-MM-DD");
     for (const parsed of [...parsedFile.tasks, ...parsedFile.memos]) {
-      if (!parsed.createdDate) parsed.createdDate = createdFallback;
+      if (!parsed.created_date) parsed.created_date = createdFallback;
       // DONE/CANCELLED 但缺少日期：用今天补齐（便于归档/统计）
-      if (parsed.status === "DONE" && !parsed.doneDate) parsed.doneDate = today;
-      if (parsed.status === "CANCELLED" && !parsed.cancelledDate) parsed.cancelledDate = today;
+      if (parsed.status === "DONE" && !parsed.done_date) parsed.done_date = today;
+      if (parsed.status === "CANCELLED" && !parsed.cancelled_date) parsed.cancelled_date = today;
     }
 
     tasks.push(...parsedFile.tasks);

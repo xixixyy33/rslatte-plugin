@@ -41,6 +41,11 @@ export type RSLatteModuleOpContext = {
 export type RSLatteReconcileGate = {
   /** 本模块本次运行时 DB sync 是否启用（未启用则 reconcile 直接跳过） */
   dbSyncEnabled?: boolean;
+  /**
+   * 为 true 时：manual_refresh / rebuild 下即使未启用 DB sync 也允许执行 reconcile。
+   * 用于仅做本地索引校准、无后端入库的模块（如 health）。
+   */
+  allowReconcileWithoutDbSync?: boolean;
   /** 同步队列/未入库项的 pending 数（>0 视为队列未清空） */
   pendingCount?: number;
   /** 同步队列/未入库项的 failed 数（>0 视为队列未清空） */

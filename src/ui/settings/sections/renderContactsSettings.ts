@@ -2,7 +2,7 @@
 import { ButtonComponent, Notice, Setting, ToggleComponent, TextComponent, normalizePath, moment } from "obsidian";
 import { DEFAULT_SETTINGS } from "../../../constants/defaults";
 
-export type ModuleWrapFactory = (moduleKey: any, title: string) => HTMLElement;
+export type ModuleWrapFactory = (moduleKey: any, title: string, scopeTag?: "global" | "space") => HTMLElement;
 export type HeaderButtonsVisibilityAdder = (wrap: HTMLElement, moduleKey: any, defaultShow: boolean) => void;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -132,64 +132,28 @@ export function renderContactsSettings(opts: {
       () => String(cm.contactsDir ?? "90-Contacts")
     );
 
-    // 辅助函数：检查模板文件是否存在
-    const checkTemplateExists = async (templatePath: string): Promise<boolean> => {
-      if (!templatePath || !templatePath.trim()) return false;
-      try {
-        const normalized = normalizePath(templatePath.trim());
-        return await plugin.app.vault.adapter.exists(normalized);
-      } catch {
-        return false;
-      }
-    };
-
-    // 辅助函数：为模板配置添加存在性检查
-    const addTemplateCheck = (setting: Setting, templatePathGetter: () => string) => {
-      const controlEl = setting.controlEl;
-      const statusEl = controlEl.createDiv({ cls: "rslatte-template-status" });
-      statusEl.style.marginTop = "4px";
-      statusEl.style.fontSize = "12px";
-      
-      const updateStatus = async () => {
-        const templatePath = templatePathGetter();
-        if (!templatePath || !templatePath.trim()) {
-          statusEl.empty();
-          return;
-        }
-        const exists = await checkTemplateExists(templatePath);
-        statusEl.empty();
-        if (!exists) {
-          const warn = statusEl.createSpan({ cls: "rslatte-template-warning" });
-          warn.style.color = "var(--text-error)";
-          warn.textContent = "模板文件不存在";
-        }
-      };
-      
-      void updateStatus();
-      return updateStatus;
-    };
-
-    const contactsTemplateUpdate = addTemplateCheck(
-      new Setting(contactsWrap)
-        .setName("模板路径（t_contact.md）")
-        .setDesc("用于新增联系人时渲染生成 md（C4 实现）。")
-        .addText((t) => {
-          t.setPlaceholder("91-Templates/t_contact.md");
-          t.setValue(String(cm.templatePath ?? "91-Templates/t_contact.md"));
-          t.onChange(async (v) => {
-            cm.templatePath = normalizePath(String(v ?? "").trim()) || "91-Templates/t_contact.md";
-            await tab.saveAndRefreshSidePanelDebounced();
-            await contactsTemplateUpdate();
-          });
-        }),
-      () => String(cm.templatePath ?? "91-Templates/t_contact.md")
-    );
+    new Setting(contactsWrap)
+      .setName("分组目录黑名单（groupDirBlacklist）")
+      .setDesc("用于分组建议与创建校验。逗号分隔，默认：templates, _archived")
+      .addText((t) => {
+        const cur = Array.isArray(cm.groupDirBlacklist) ? cm.groupDirBlacklist : ["templates", "_archived"];
+        t.setPlaceholder("templates, _archived");
+        t.setValue(cur.join(", "));
+        t.onChange(async (v) => {
+          const next = String(v ?? "")
+            .split(/[,\n，]+/g)
+            .map((x) => x.trim())
+            .filter(Boolean);
+          cm.groupDirBlacklist = next.length > 0 ? next : ["templates", "_archived"];
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
 
     const defArc = normalizePath(`${String(cm.contactsDir ?? "90-Contacts")}/_archived`);
     const contactsArchiveDirUpdate = addDirCheckButton(
       new Setting(contactsWrap)
-        .setName("联系人归档目录（archiveDir）")
-        .setDesc("归档后的联系人会移动到该目录下，并保持 {group_name}/C_<uid>.md 的相对结构。留空则默认：{contactsDir}/_archived")
+        .setName("联系人笔记归档目录（archiveDir）")
+        .setDesc("「笔记归档」：已取消且过阈值的联系人 md 移动到该目录下，保持 {group_name}/C_<uid>.md 相对结构。留空默认 {contactsDir}/_archived。互动索引溢出分片属「索引归档」，见下方 §6.9。")
         .addText((t) => {
           const cur = normalizePath(String(cm.archiveDir ?? defArc));
           t.setPlaceholder(defArc);
@@ -235,12 +199,95 @@ export function renderContactsSettings(opts: {
 
     new Setting(contactsWrap)
       .setName("动态互动子标题")
-      .setDesc("动态引用聚合摘要写入的子标题；留空则直接写在章节下。默认：### 动态互动")
+      .setDesc("动态引用聚合摘要写入该子标题下；留空则直接写在章节下。默认：### 动态互动（与侧栏「互动记录」页签展示分离）")
       .addText((t) => {
         t.setPlaceholder("### 动态互动");
         t.setValue(String(cm.dynamicEventSubHeader ?? "### 动态互动"));
         t.onChange(async (v) => {
           cm.dynamicEventSubHeader = String(v ?? "").trim();
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(contactsWrap)
+      .setName("超期未联系（自然日）")
+      .setDesc("距「最后互动」日期超过该天数则名片区第三行显示超期。默认 30。")
+      .addText((t) => {
+        t.setPlaceholder("30");
+        t.setValue(String(cm.contactFollowupOverdueDays ?? 30));
+        t.onChange(async (v) => {
+          const n = Math.floor(Number(String(v ?? "").trim()) || 30);
+          cm.contactFollowupOverdueDays = Math.max(1, Math.min(3650, n));
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(contactsWrap)
+      .setName("主索引每联系人互动事件上限（全局）")
+      .setDesc("第六章索引裁剪用；当前侧栏仍以主索引为准。默认 100。")
+      .addText((t) => {
+        t.setPlaceholder("100");
+        t.setValue(String(cm.interactionEventsMaxPerContactInIndex ?? 100));
+        t.onChange(async (v) => {
+          const n = Math.floor(Number(String(v ?? "").trim()) || 100);
+          cm.interactionEventsMaxPerContactInIndex = Math.max(10, Math.min(5000, n));
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(contactsWrap)
+      .setName("主索引每 source 上限（每联系人）")
+      .setDesc("第六章索引裁剪用。默认 10。")
+      .addText((t) => {
+        t.setPlaceholder("10");
+        t.setValue(String(cm.interactionEventsMaxPerSourcePerContact ?? 10));
+        t.onChange(async (v) => {
+          const n = Math.floor(Number(String(v ?? "").trim()) || 10);
+          cm.interactionEventsMaxPerSourcePerContact = Math.max(1, Math.min(500, n));
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(contactsWrap)
+      .setName("互动索引归档 · 溢出分片最大字节（§6.9）")
+      .setDesc("「索引归档」：主索引裁出窗口的事件写入 `.contacts/<uid>_NNN.json`；单文件达上限则写入下一片。与「笔记归档」移动联系人 md 不同。默认 1048576（1MB）。")
+      .addText((t) => {
+        t.setPlaceholder("1048576");
+        t.setValue(String(cm.contactInteractionArchiveShardMaxBytes ?? 1048576));
+        t.onChange(async (v) => {
+          const n = Math.floor(Number(String(v ?? "").trim()) || 1048576);
+          cm.contactInteractionArchiveShardMaxBytes = Math.max(4096, Math.min(20 * 1024 * 1024, n));
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(contactsWrap)
+      .setName("动态条目下展示最近几条互动时间")
+      .setDesc("title 与 meta 之间预览 interaction_events。默认 3。")
+      .addText((t) => {
+        t.setPlaceholder("3");
+        t.setValue(String(cm.interactionTimelinePreviewCount ?? 3));
+        t.onChange(async (v) => {
+          const n = Math.floor(Number(String(v ?? "").trim()) || 3);
+          cm.interactionTimelinePreviewCount = Math.max(0, Math.min(20, n));
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(contactsWrap)
+      .setName("详细信息页签：frontmatter 黑名单（键名）")
+      .setDesc("逗号分隔，不展示的 YAML 键名；用于隐藏敏感或冗余项。")
+      .addTextArea((t) => {
+        const cur = Array.isArray(cm.contactDetailsFieldBlacklist) ? cm.contactDetailsFieldBlacklist : [];
+        t.setPlaceholder("phone, email");
+        t.setValue(cur.join(", "));
+        t.inputEl.rows = 2;
+        t.onChange(async (v) => {
+          const next = String(v ?? "")
+            .split(/[,\n，]+/g)
+            .map((x) => x.trim())
+            .filter(Boolean);
+          cm.contactDetailsFieldBlacklist = next;
           await tab.saveAndRefreshSidePanelDebounced();
         });
       });

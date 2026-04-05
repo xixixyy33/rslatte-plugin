@@ -7,6 +7,7 @@
     "build": "node build.js",
     "sync": "node sync-release.js",
     "build:release": "npm run build && npm run sync",
+    "merge:v2-outcomes": "node scripts/merge-v2-outcomes.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

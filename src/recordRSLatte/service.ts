@@ -7,6 +7,8 @@ import type {
   CheckinRecordIndexItem,
   FinanceRecordIndexFile,
   FinanceRecordIndexItem,
+  HealthRecordIndexFile,
+  HealthRecordIndexItem,
   RSLatteListsIndexFile,
   CheckinItemIndexItem,
   FinanceCatIndexItem,
@@ -20,9 +22,29 @@ import type {
 import { RecordIndexStore } from "./indexStore";
 import { RSLatteIndexStore } from "../taskRSLatte/indexStore";
 import { fnv1a32 } from "../utils/hash";
-import { extractFinanceSubcategory, normalizeFinanceSubcategory } from "../services/finance/financeSubcategory";
-import { resolveSpaceIndexDir } from "../services/spaceContext";
+import { extractFinanceMeta, extractFinanceSubcategory, normalizeFinanceSubcategory } from "../services/finance/financeSubcategory";
+import {
+  buildFinanceMainNoteParts,
+  FINANCE_DIARY_MAIN_LINE_RE,
+  peekFinanceMetaAfterMain,
+} from "../services/finance/financeJournalMeta";
+import {
+  HEALTH_DIARY_MAIN_LINE_RE,
+  normalizeHealthCreatedAtMs,
+  peekHealthMetaAfterMain,
+} from "../services/health/healthJournalMeta";
+import { healthMetricKeyFromMainLineLabel } from "../types/healthTypes";
+import { normalizeFinanceCycleType } from "../types/rslatteTypes";
+import { resolveSpaceIndexDir } from "../services/space/spaceContext";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
 import type { RSLatteIndexItem } from "../taskRSLatte/types";
+import type {
+  FinanceAnomalyCycleIdMissingItem,
+  FinanceAnomalyDuplicateCrossFileItem,
+  FinanceAnomalyDuplicateItem,
+  FinanceAnomalyLegacyItem,
+  FinanceAnomalyScanResult,
+} from "../types/financeAnomalyTypes";
 
 function nowIso() {
   return new Date().toISOString();
@@ -46,21 +68,35 @@ function normalizeDateKey(v: any): string | null {
 }
 
 function cutoffDateKey(todayKey: string, thresholdDays: number): string {
-  const n = Math.max(1, Math.floor(Number(thresholdDays || 90)));
+  const n = normalizeArchiveThresholdDays(thresholdDays);
   return momentFn(todayKey, "YYYY-MM-DD").subtract(n, "days").format("YYYY-MM-DD");
 }
 
-/** Which record sub-modules to operate on. (Step6-3 split checkin/finance) */
+/** Which record sub-modules to operate on. (Step6-3 split checkin/finance；health 仅显式 true 时扫描) */
 export type RecordModules = {
   checkin?: boolean;
   finance?: boolean;
+  health?: boolean;
 };
 
 function normalizeModules(mods?: RecordModules): Required<RecordModules> {
-  const checkin = mods?.checkin !== false; // default true
-  const finance = mods?.finance !== false; // default true
-  return { checkin, finance };
+  if (!mods) return { checkin: true, finance: true, health: false };
+  const hasAnyExplicit =
+    mods.checkin !== undefined || mods.finance !== undefined || mods.health !== undefined;
+  if (!hasAnyExplicit) return { checkin: true, finance: true, health: false };
+  return {
+    checkin: mods.checkin !== false,
+    finance: mods.finance !== false,
+    health: mods.health === true,
+  };
 }
+
+/** 单日解析结果（打卡 / 财务 / 健康） */
+export type RecordDayParsedMaps = {
+  checkins: Map<string, CheckinRecordIndexItem>;
+  finances: Map<string, FinanceRecordIndexItem>;
+  healths: Map<string, HealthRecordIndexItem>;
+};
 
 export type RecordIncrementalScan = {
   kind: "incremental";
@@ -69,10 +105,7 @@ export type RecordIncrementalScan = {
   sinceMs: number;
   maxMtime: number;
   dayKeysScanned: Set<string>;
-  parsedByDay: Map<
-    string,
-    { checkins: Map<string, CheckinRecordIndexItem>; finances: Map<string, FinanceRecordIndexItem> }
-  >;
+  parsedByDay: Map<string, RecordDayParsedMaps>;
   discoveredCheckins: Map<string, string>;
   discoveredFinanceCats: Map<string, { name?: string; type: "income" | "expense" }>;
 };
@@ -86,10 +119,7 @@ export type RecordFullScan = {
   maxMtime: number;
   dayKeysScanned: Set<string>;
   dayKeysToReplace: Set<string>;
-  parsedByDay: Map<
-    string,
-    { checkins: Map<string, CheckinRecordIndexItem>; finances: Map<string, FinanceRecordIndexItem> }
-  >;
+  parsedByDay: Map<string, RecordDayParsedMaps>;
   discoveredCheckins: Map<string, string>;
   discoveredFinanceCats: Map<string, { name?: string; type: "income" | "expense" }>;
 };
@@ -113,10 +143,58 @@ function computeCheckinSourceHash(it: Pick<CheckinRecordIndexItem, "recordDate" 
 }
 
 function computeFinanceSourceHash(
-  it: Pick<FinanceRecordIndexItem, "recordDate" | "categoryId" | "type" | "amount" | "note" | "isDelete">
+  it: Pick<
+    FinanceRecordIndexItem,
+    | "recordDate"
+    | "categoryId"
+    | "entryId"
+    | "type"
+    | "amount"
+    | "note"
+    | "subcategory"
+    | "institutionName"
+    | "cycleType"
+    | "cycleId"
+    | "sceneTags"
+    | "isDelete"
+  >
 ): string {
   const amt = Number(it.amount ?? 0);
-  const base = [normStr(it.recordDate), normStr(it.categoryId), normStr(it.type), String(amt), normStr(it.note), it.isDelete ? "1" : "0"].join("|");
+  const tags = Array.isArray(it.sceneTags) ? it.sceneTags.map((x) => normStr(x)).filter(Boolean).join(",") : "";
+  const base = [
+    normStr(it.recordDate),
+    normStr(it.categoryId),
+    normStr(it.entryId),
+    normStr(it.type),
+    String(amt),
+    normStr(it.note),
+    normStr(it.subcategory),
+    normStr(it.institutionName),
+    normStr(it.cycleType),
+    normStr(it.cycleId),
+    tags,
+    it.isDelete ? "1" : "0",
+  ].join("|");
+  return fnv1a32(base);
+}
+
+function computeHealthSourceHash(
+  it: Pick<
+    HealthRecordIndexItem,
+    "recordDate" | "entryId" | "metricKey" | "period" | "cardRef" | "valueStr" | "note" | "sleepStartHm" | "isDelete"
+  >
+): string {
+  const base = [
+    normStr(it.recordDate),
+    normStr(it.entryId),
+    normStr(it.metricKey),
+    normStr(it.period),
+    normStr(it.cardRef),
+    normStr(it.valueStr),
+    normStr(it.note),
+    normStr(it.sleepStartHm),
+    it.isDelete ? "1" : "0",
+  ].join("|");
   return fnv1a32(base);
 }
 
@@ -162,8 +240,10 @@ export class RecordRSLatteService {
   private store: RecordIndexStore | null = null;
   private checkinSnap: CheckinRecordIndexFile | null = null;
   private financeSnap: FinanceRecordIndexFile | null = null;
+  private healthSnap: HealthRecordIndexFile | null = null;
   private checkinArchiveSnap: CheckinRecordIndexFile | null = null;
   private financeArchiveSnap: FinanceRecordIndexFile | null = null;
+  private healthArchiveSnap: HealthRecordIndexFile | null = null;
 
   // ✅ 清单索引（打卡项/财务分类）
   private listsSnap: RSLatteListsIndexFile | null = null;
@@ -172,8 +252,10 @@ export class RecordRSLatteService {
   // ✅ 内存优化：快照访问时间戳（用于过期清理）
   private checkinSnapLastAccess = 0;
   private financeSnapLastAccess = 0;
+  private healthSnapLastAccess = 0;
   private checkinArchiveSnapLastAccess = 0;
   private financeArchiveSnapLastAccess = 0;
+  private healthArchiveSnapLastAccess = 0;
   private listsSnapLastAccess = 0;
   private listsArchiveSnapLastAccess = 0;
   
@@ -220,6 +302,48 @@ export class RecordRSLatteService {
       if (!v || seen.has(v)) continue;
       seen.add(v);
       out.push(v);
+    }
+    return out;
+  }
+
+  /** 获取某财务分类的机构名列表（优先 settings） */
+  public async getFinanceInstitutions(categoryId: string): Promise<string[]> {
+    const id = String(categoryId ?? "").trim();
+    if (!id) return [];
+    const cat = this.settings.financeCategories?.find((c) => String((c as any)?.id ?? "") === id);
+    const direct = Array.isArray((cat as any)?.institutionNames) ? (cat as any).institutionNames : [];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const it of direct) {
+      const v = String(it ?? "").trim().replace(/\s+/g, " ");
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+    }
+    return out;
+  }
+
+  /** 从历史财务记录中提取场景标签（去重，最多 200 个） */
+  public async getFinanceSceneTagsHistory(): Promise<string[]> {
+    await this.ensureReady();
+    const active = await this.getFinanceSnapshot(false);
+    const arch = await this.getFinanceSnapshot(true);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const pushTag = (tag: string) => {
+      const v = String(tag ?? "").trim().replace(/\s+/g, " ");
+      if (!v) return;
+      const key = v.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(v);
+    };
+    for (const it of [...(active.items ?? []), ...(arch.items ?? [])]) {
+      const note = String((it as any)?.note ?? "");
+      if (!note) continue;
+      const meta = extractFinanceMeta(note);
+      for (const t of meta.sceneTags ?? []) pushTag(t);
+      if (out.length >= 200) break;
     }
     return out;
   }
@@ -280,14 +404,14 @@ export class RecordRSLatteService {
   public getArchiveThresholdDays(): number {
     const s = this.settings;
     const v = Number(s.rslattePanelArchiveThresholdDays ?? 90);
-    return Number.isFinite(v) ? Math.max(1, Math.floor(v)) : 90;
+    return normalizeArchiveThresholdDays(v);
   }
 
   /** v6-3：checkin archive threshold（优先使用拆分后的配置） */
   private getCheckinArchiveThresholdDays(): number {
     const s: any = this.settings as any;
     const v = Number(s?.checkinPanel?.archiveThresholdDays);
-    if (Number.isFinite(v)) return Math.max(1, Math.floor(v));
+    if (Number.isFinite(v)) return normalizeArchiveThresholdDays(v);
     return this.getArchiveThresholdDays();
   }
 
@@ -295,8 +419,32 @@ export class RecordRSLatteService {
   private getFinanceArchiveThresholdDays(): number {
     const s: any = this.settings as any;
     const v = Number(s?.financePanel?.archiveThresholdDays);
-    if (Number.isFinite(v)) return Math.max(1, Math.floor(v));
+    if (Number.isFinite(v)) return normalizeArchiveThresholdDays(v);
     return this.getArchiveThresholdDays();
+  }
+
+  private getHealthArchiveThresholdDays(): number {
+    const s: any = this.settings as any;
+    const v = Number(s?.healthPanel?.archiveThresholdDays);
+    if (Number.isFinite(v)) return normalizeArchiveThresholdDays(v);
+    return this.getArchiveThresholdDays();
+  }
+
+  private isHealthAutoArchiveEnabled(): boolean {
+    const s: any = this.settings as any;
+    const v = s?.healthPanel?.autoArchiveEnabled;
+    if (typeof v === "boolean") return v;
+    return this.isAutoArchiveEnabled();
+  }
+
+  /** 本次扫描涉及的模块中取最大归档窗口（天） */
+  private getScanCutoffDateKeyForModules(todayKey: string, mods: Required<RecordModules>): string {
+    const parts: number[] = [];
+    if (mods.checkin) parts.push(this.getCheckinArchiveThresholdDays());
+    if (mods.finance) parts.push(this.getFinanceArchiveThresholdDays());
+    if (mods.health) parts.push(this.getHealthArchiveThresholdDays());
+    const days = parts.length ? Math.max(...parts) : this.getArchiveThresholdDays();
+    return cutoffDateKey(todayKey, days);
   }
 
   // 未使用的方法，保留以备将来使用
@@ -326,7 +474,12 @@ export class RecordRSLatteService {
     // 仅在索引为空时，尝试从日记构建一次基础索引（避免每次启动都全量扫描）
     const checkinSnap = await this.store.readCheckinIndex(false);
     const financeSnap = await this.store.readFinanceIndex(false);
-    if ((checkinSnap.items?.length ?? 0) === 0 && (financeSnap.items?.length ?? 0) === 0) {
+    const healthSnap0 = await this.store.readHealthIndex(false);
+    if (
+      (checkinSnap.items?.length ?? 0) === 0 &&
+      (financeSnap.items?.length ?? 0) === 0 &&
+      (healthSnap0.items?.length ?? 0) === 0
+    ) {
       try {
         await this.refreshIndexFromDiaryScan();
       } catch (e) {
@@ -353,6 +506,12 @@ export class RecordRSLatteService {
     if (this.financeArchiveSnap && now - this.financeArchiveSnapLastAccess > this.SNAPSHOT_EXPIRE_MS) {
       this.financeArchiveSnap = null;
     }
+    if (this.healthSnap && now - this.healthSnapLastAccess > this.SNAPSHOT_EXPIRE_MS) {
+      this.healthSnap = null;
+    }
+    if (this.healthArchiveSnap && now - this.healthArchiveSnapLastAccess > this.SNAPSHOT_EXPIRE_MS) {
+      this.healthArchiveSnap = null;
+    }
     if (this.listsSnap && now - this.listsSnapLastAccess > this.SNAPSHOT_EXPIRE_MS) {
       this.listsSnap = null;
     }
@@ -367,16 +526,20 @@ export class RecordRSLatteService {
   public clearAllSnapshots(): void {
     this.checkinSnap = null;
     this.financeSnap = null;
+    this.healthSnap = null;
     this.checkinArchiveSnap = null;
     this.financeArchiveSnap = null;
+    this.healthArchiveSnap = null;
     this.listsSnap = null;
     this.listsArchiveSnap = null;
     
     // 重置访问时间戳
     this.checkinSnapLastAccess = 0;
     this.financeSnapLastAccess = 0;
+    this.healthSnapLastAccess = 0;
     this.checkinArchiveSnapLastAccess = 0;
     this.financeArchiveSnapLastAccess = 0;
+    this.healthArchiveSnapLastAccess = 0;
     this.listsSnapLastAccess = 0;
     this.listsArchiveSnapLastAccess = 0;
   }
@@ -429,6 +592,23 @@ export class RecordRSLatteService {
     return this.financeSnap;
   }
 
+  public async getHealthSnapshot(archived: boolean = false): Promise<HealthRecordIndexFile> {
+    await this.ensureReady();
+    this.cleanupExpiredSnapshots();
+    if (archived) {
+      if (!this.healthArchiveSnap) {
+        this.healthArchiveSnap = await this.store!.readHealthIndex(true);
+      }
+      this.healthArchiveSnapLastAccess = Date.now();
+      return this.healthArchiveSnap;
+    }
+    if (!this.healthSnap) {
+      this.healthSnap = await this.store!.readHealthIndex(false);
+    }
+    this.healthSnapLastAccess = Date.now();
+    return this.healthSnap;
+  }
+
   /**
    * 同步更新财务统计缓存：从主索引和归档索引合并全量数据
    * - 统计缓存不受归档影响，始终保持全量数据
@@ -470,10 +650,11 @@ export class RecordRSLatteService {
       const tsMap = new Map<string, number>(); // 用于存储每个 key 对应的最新 tsMs
       
       for (const it of allItems) {
-        // 从 note 中提取子分类
-        const { subcategory } = extractFinanceSubcategory(it.note ?? "");
-        // 使用 recordDate + categoryId + subcategory 作为唯一键（因为同一天同一分类可能有多个子分类的记录）
-        const key = `${it.recordDate}::${String(it.categoryId)}::${subcategory}`;
+        const subFromNote = extractFinanceSubcategory(it.note ?? "").subcategory;
+        const subcategory = normStr(it.subcategory) || subFromNote;
+        const key = normStr(it.entryId)
+          ? `${it.recordDate}::${String(it.categoryId)}::${normStr(it.entryId)}`
+          : `${it.recordDate}::${String(it.categoryId)}::legacy::${subcategory}::${Number(it.tsMs ?? 0)}`;
         const currentTs = it.tsMs ?? 0;
         const existingTs = tsMap.get(key) ?? 0;
         
@@ -638,10 +819,10 @@ export class RecordRSLatteService {
       
       if (spaceId) {
         // 为特定空间创建任务索引存储
-        taskIndexDir = resolveSpaceIndexDir(s, spaceId, [s.centralIndexDir || "95-Tasks/.rslatte"]);
+        taskIndexDir = resolveSpaceIndexDir(s, spaceId, [s.centralIndexDir || "00-System/.rslatte"]);
       } else {
         // 使用当前空间的索引（向后兼容）
-        taskIndexDir = s.centralIndexDir || "95-Tasks/.rslatte";
+        taskIndexDir = s.centralIndexDir || "00-System/.rslatte";
       }
 
       const taskStore = new RSLatteIndexStore(this.host.app, taskIndexDir);
@@ -688,10 +869,10 @@ export class RecordRSLatteService {
           cacheMap.set(uid, {
             uid: uid,
             status: status,
-            createdDate: it.createdDate || undefined,
-            doneDate: it.doneDate || undefined,
-            cancelledDate: it.cancelledDate || undefined,
-            dueDate: it.dueDate || undefined,
+            createdDate: it.created_date || undefined,
+            doneDate: it.done_date || undefined,
+            cancelledDate: it.cancelled_date || undefined,
+            dueDate: it.planned_end || undefined,
             isDelete: isDelete,
           });
           tsMap.set(uid, currentTs);
@@ -843,7 +1024,12 @@ export class RecordRSLatteService {
       if ((it as any)?.deletedAt) continue;
       const id = String((it as any)?.id ?? "").trim();
       if (!id || existC.has(id)) continue;
-      (sAny.checkinItems as any[]).push({ id, name: String((it as any)?.name ?? id), active: false });
+      (sAny.checkinItems as any[]).push({
+        id,
+        name: String((it as any)?.name ?? id),
+        active: false,
+        checkinDifficulty: "normal",
+      });
       existC.add(id);
       addedCheckins++;
     }
@@ -1044,6 +1230,7 @@ export class RecordRSLatteService {
       id: String(x.id ?? "").trim(),
       name: String(x.name ?? "").trim(),
       active: !!x.active,
+      continuousDays: typeof (x as any).continuousDays === "number" ? (x as any).continuousDays : undefined,
     })).filter((x) => !!x.id);
 
     const curFinance = (this.settings.financeCategories ?? []).map((x) => ({
@@ -1062,16 +1249,27 @@ export class RecordRSLatteService {
     for (const cur of curCheckins) {
       seenC.add(cur.id);
       const old = byIdC.get(cur.id);
+      const continuousDays = (cur as any).continuousDays;
       if (old) {
         // 若已删除（deletedAt 存在），说明用户尝试复用历史 id，此处不自动恢复，留给保存校验处理
         if (!old.deletedAt) {
           old.name = cur.name;
           old.active = cur.active;
+          if (continuousDays !== undefined) old.continuousDays = continuousDays;
+          else if (old.continuousDays === undefined) old.continuousDays = 0;
           old.updatedAt = now;
         }
         byIdC.set(cur.id, old);
       } else {
-        byIdC.set(cur.id, { id: cur.id, name: cur.name, active: cur.active, createdAt: now, updatedAt: now, deletedAt: null });
+        byIdC.set(cur.id, {
+          id: cur.id,
+          name: cur.name,
+          active: cur.active,
+          createdAt: now,
+          updatedAt: now,
+          deletedAt: null,
+          continuousDays: continuousDays ?? 0,
+        });
       }
     }
 
@@ -1197,16 +1395,56 @@ export class RecordRSLatteService {
     return null;
   }
 
+  /**
+   * 指定日期是否存在该打卡项的有效记录（未取消/未删除）。
+   * 用于连续打卡天数：昨日有记录则 +1，无则置 0 或 1。会查主索引 + 归档索引。
+   */
+  public async hasEffectiveCheckinRecordOnDate(checkinId: string, dateKey: string): Promise<boolean> {
+    const id = String(checkinId).trim();
+    const dk = normalizeDateKey(dateKey);
+    if (!dk) return false;
+    const active = await this.getCheckinSnapshot(false);
+    const arch = await this.getCheckinSnapshot(true);
+    const items = [...(active.items ?? []), ...(arch.items ?? [])];
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (it?.recordDate === dk && String(it.checkinId) === id) return !it.isDelete;
+    }
+    return false;
+  }
+
+  /**
+   * 返回该打卡项所有有效打卡日期（未删除），去重后按日期倒序（最新在前）。
+   * 用于重建索引后按完整历史重算连续打卡天数（含补打卡）。
+   */
+  public async getEffectiveCheckinRecordDates(checkinId: string): Promise<string[]> {
+    const id = String(checkinId).trim();
+    const active = await this.getCheckinSnapshot(false);
+    const arch = await this.getCheckinSnapshot(true);
+    const set = new Set<string>();
+    for (const it of [...(active.items ?? []), ...(arch.items ?? [])]) {
+      if (String(it?.checkinId) !== id || it?.isDelete) continue;
+      const dk = normalizeDateKey(it.recordDate);
+      if (dk) set.add(dk);
+    }
+    return Array.from(set).sort((a, b) => b.localeCompare(a));
+  }
+
   public async getTodayFinance(categoryId: string): Promise<FinanceRecordIndexItem | null> {
+    const list = await this.getTodayFinanceRecordsForCategory(categoryId);
+    if (list.length === 0) return null;
+    return list[list.length - 1];
+  }
+
+  /** 今日该分类下全部明细（未删除在前筛选由调用方决定；此处返回全部含已删除供对账） */
+  public async getTodayFinanceRecordsForCategory(categoryId: string, opts?: { activeOnly?: boolean }): Promise<FinanceRecordIndexItem[]> {
     const todayKey = this.host.getTodayKey();
     const snap = await this.getFinanceSnapshot(false);
     const id = String(categoryId);
-    const items = snap.items ?? [];
-    for (let i = items.length - 1; i >= 0; i--) {
-      const it = items[i];
-      if (it?.recordDate === todayKey && String(it.categoryId) === id) return it;
-    }
-    return null;
+    const items = (snap.items ?? []).filter((x) => x?.recordDate === todayKey && String(x.categoryId) === id);
+    const activeOnly = opts?.activeOnly === true;
+    const filtered = activeOnly ? items.filter((x) => !x.isDelete) : items;
+    return filtered.sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
   }
 
   public async upsertCheckin(item: CheckinRecordIndexItem): Promise<void> {
@@ -1251,19 +1489,41 @@ export class RecordRSLatteService {
     const snap = await this.getFinanceSnapshot(false);
     const rd = normalizeDateKey(item.recordDate) ?? this.host.getTodayKey();
     const id = String(item.categoryId);
+    const eid = normStr(item.entryId);
 
-    const old = (snap.items ?? []).find((x) => x.recordDate === rd && String(x.categoryId) === id);
-    const items = (snap.items ?? []).filter((x) => !(x.recordDate === rd && String(x.categoryId) === id));
+    const matchKey = (x: FinanceRecordIndexItem) => {
+      if (eid) return x.recordDate === rd && String(x.categoryId) === id && normStr(x.entryId) === eid;
+      return x.recordDate === rd && String(x.categoryId) === id && !normStr(x.entryId);
+    };
+
+    const old = (snap.items ?? []).find(matchKey);
+    const items = (snap.items ?? []).filter((x) => !matchKey(x));
 
     const newer: FinanceRecordIndexItem = {
       recordDate: rd,
+      entryId: eid || undefined,
       categoryId: id,
       categoryName: item.categoryName,
       type: item.type,
+      subcategory: normStr(item.subcategory) || undefined,
       amount: Number(item.amount ?? 0),
       note: (item.note ?? "").trim() || undefined,
+      institutionName: normStr((item as any).institutionName) || undefined,
+      cycleType: normStr((item as any).cycleType) || undefined,
+      cycleId: normStr((item as any).cycleId) || normStr((old as any)?.cycleId) || undefined,
+      sceneTags: Array.isArray((item as any).sceneTags)
+        ? Array.from(new Set(((item as any).sceneTags as any[]).map((x) => String(x ?? "").trim()).filter(Boolean)))
+        : undefined,
       isDelete: !!item.isDelete,
       tsMs: Number(item.tsMs ?? Date.now()),
+      sourceFilePath: normStr(item.sourceFilePath) || normStr(old?.sourceFilePath) || undefined,
+      sourceLineMain: (() => {
+        const fromItem = item.sourceLineMain;
+        if (fromItem !== undefined && fromItem !== null && Number.isFinite(Number(fromItem))) return Number(fromItem);
+        const fromOld = old?.sourceLineMain;
+        if (fromOld !== undefined && fromOld !== null && Number.isFinite(Number(fromOld))) return Number(fromOld);
+        return undefined;
+      })(),
     };
     (newer as any).dbSourceHash = computeFinanceSourceHash(newer);
     mergeDbSyncMeta(newer as any, old as any);
@@ -1285,8 +1545,8 @@ export class RecordRSLatteService {
 
     // ✅ Learn subcategory mapping for better UI (no DB). Best-effort.
     try {
-      const { subcategory } = extractFinanceSubcategory(newer.note ?? "");
-      if (subcategory) await this.rememberFinanceSubcategory(id, subcategory);
+      const sub = normStr(newer.subcategory) || extractFinanceSubcategory(newer.note ?? "").subcategory;
+      if (sub) await this.rememberFinanceSubcategory(id, sub);
     } catch {
       // ignore
     }
@@ -1302,6 +1562,64 @@ export class RecordRSLatteService {
     return this.upsertFinance(item);
   }
 
+  public async upsertHealth(item: HealthRecordIndexItem): Promise<void> {
+    await this.ensureReady();
+    const snap = await this.getHealthSnapshot(false);
+    const rd = normalizeDateKey(item.recordDate) ?? this.host.getTodayKey();
+    const eid = normStr(item.entryId);
+
+    const matchKey = (x: HealthRecordIndexItem) => {
+      if (eid) return x.recordDate === rd && normStr(x.entryId) === eid;
+      return x.recordDate === rd && normStr(x.metricKey) === normStr(item.metricKey) && !normStr(x.entryId);
+    };
+
+    const old = (snap.items ?? []).find(matchKey);
+    const items = (snap.items ?? []).filter((x) => !matchKey(x));
+
+    const fromItemCa = normalizeHealthCreatedAtMs((item as any).createdAtMs);
+    const fromOldCa = normalizeHealthCreatedAtMs((old as any)?.createdAtMs);
+    const mergedCreatedAt = fromItemCa ?? fromOldCa;
+
+    const newer: HealthRecordIndexItem = {
+      recordDate: rd,
+      entryId: eid || undefined,
+      metricKey: String(item.metricKey ?? "").trim(),
+      period: String(item.period ?? "day").trim() || "day",
+      cardRef: normStr(item.cardRef) || undefined,
+      valueStr: String(item.valueStr ?? "").trim(),
+      note: normStr(item.note) || undefined,
+      sleepStartHm: normStr(item.sleepStartHm) || undefined,
+      isDelete: !!item.isDelete,
+      tsMs: Number(item.tsMs ?? Date.now()),
+      ...(mergedCreatedAt != null ? { createdAtMs: mergedCreatedAt } : {}),
+      sourceFilePath: normStr(item.sourceFilePath) || normStr(old?.sourceFilePath) || undefined,
+      sourceLineMain: (() => {
+        const fromItem = item.sourceLineMain;
+        if (fromItem !== undefined && fromItem !== null && Number.isFinite(Number(fromItem))) return Number(fromItem);
+        const fromOld = old?.sourceLineMain;
+        if (fromOld !== undefined && fromOld !== null && Number.isFinite(Number(fromOld))) return Number(fromOld);
+        return undefined;
+      })(),
+    };
+    (newer as any).dbSourceHash = computeHealthSourceHash(newer);
+    mergeDbSyncMeta(newer as any, old as any);
+
+    items.push(newer);
+    items.sort((a, b) => (a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)));
+    this.healthSnap = { version: 1, updatedAt: nowIso(), items };
+    await this.store!.writeHealthIndex(false, this.healthSnap);
+
+    try {
+      this.host.app.workspace.trigger("rslatte:recordIndexChanged", { module: "health" });
+    } catch {
+      // ignore
+    }
+  }
+
+  public async upsertHealthRecord(item: HealthRecordIndexItem): Promise<void> {
+    return this.upsertHealth(item);
+  }
+
   /**
    * Flush current active record indexes (checkin/finance) to disk.
    * Used when we only update per-item DB sync meta and want a single write.
@@ -1310,10 +1628,13 @@ export class RecordRSLatteService {
     await this.ensureReady();
     const c = await this.getCheckinSnapshot(false);
     const f = await this.getFinanceSnapshot(false);
+    const h = await this.getHealthSnapshot(false);
     this.checkinSnap = { version: 1, updatedAt: nowIso(), items: c.items ?? [] };
     this.financeSnap = { version: 1, updatedAt: nowIso(), items: f.items ?? [] };
+    this.healthSnap = { version: 1, updatedAt: nowIso(), items: h.items ?? [] };
     await this.store!.writeCheckinIndex(false, this.checkinSnap);
     await this.store!.writeFinanceIndex(false, this.financeSnap);
+    await this.store!.writeHealthIndex(false, this.healthSnap);
     
     // ✅ 同步更新统计缓存
     await this.syncCheckinStatsCache();
@@ -1325,31 +1646,47 @@ export class RecordRSLatteService {
     const s: any = this.settings as any;
     const todayKey = this.host.getTodayKey();
 
-    const runOne = async (k: "checkin" | "finance") => {
-      const enabled = (k === "checkin")
-        ? (this.host as any).isCheckinModuleEnabled?.() ?? true
-        : (this.host as any).isFinanceModuleEnabled?.() ?? true;
+    const runOne = async (k: "checkin" | "finance" | "health") => {
+      const enabled =
+        k === "checkin"
+          ? (this.host as any).isCheckinModuleEnabled?.() ?? true
+          : k === "finance"
+            ? (this.host as any).isFinanceModuleEnabled?.() ?? false
+            : (this.host as any).isHealthModuleEnabled?.() === true;
       if (!enabled) return;
 
-      const autoEnabled = (k === "checkin") ? this.isCheckinAutoArchiveEnabled() : this.isFinanceAutoArchiveEnabled();
+      const autoEnabled =
+        k === "checkin"
+          ? this.isCheckinAutoArchiveEnabled()
+          : k === "finance"
+            ? this.isFinanceAutoArchiveEnabled()
+            : this.isHealthAutoArchiveEnabled();
       if (!autoEnabled) return;
 
-      const last = String((k === "checkin"
-        ? s?.checkinPanel?.archiveLastRunKey
-        : s?.financePanel?.archiveLastRunKey
-      ) ?? s.rslattePanelArchiveLastRunKey ?? "").trim();
+      const last = String(
+        (k === "checkin"
+          ? s?.checkinPanel?.archiveLastRunKey
+          : k === "finance"
+            ? s?.financePanel?.archiveLastRunKey
+            : s?.healthPanel?.archiveLastRunKey) ?? s.rslattePanelArchiveLastRunKey ?? ""
+      ).trim();
       if (last === todayKey) return;
 
-      const mods: RecordModules = (k === "checkin")
-        ? { checkin: true, finance: false }
-        : { checkin: false, finance: true };
+      const mods: RecordModules =
+        k === "checkin"
+          ? { checkin: true, finance: false, health: false }
+          : k === "finance"
+            ? { checkin: false, finance: true, health: false }
+            : { checkin: false, finance: false, health: true };
 
       await this.archiveNow(mods);
 
       if (!s.checkinPanel) s.checkinPanel = {};
       if (!s.financePanel) s.financePanel = {};
+      if (!s.healthPanel) s.healthPanel = {};
       if (k === "checkin") s.checkinPanel.archiveLastRunKey = todayKey;
-      else s.financePanel.archiveLastRunKey = todayKey;
+      else if (k === "finance") s.financePanel.archiveLastRunKey = todayKey;
+      else s.healthPanel.archiveLastRunKey = todayKey;
 
       // legacy：保留写入，便于旧版本识别
       s.rslattePanelArchiveLastRunKey = todayKey;
@@ -1358,12 +1695,14 @@ export class RecordRSLatteService {
 
     await runOne("checkin");
     await runOne("finance");
+    await runOne("health");
   }
 
   public async archiveNow(modules?: RecordModules): Promise<{
     cutoffDate: string;
     checkinArchived: number;
     financeArchived: number;
+    healthArchived: number;
     listsArchivedCheckin: number;
     listsArchivedFinance: number;
   }> {
@@ -1373,16 +1712,22 @@ export class RecordRSLatteService {
 
     const cutoffC = cutoffDateKey(todayKey, this.getCheckinArchiveThresholdDays());
     const cutoffF = cutoffDateKey(todayKey, this.getFinanceArchiveThresholdDays());
-    const cutoff = (mods.checkin && !mods.finance)
-      ? cutoffC
-      : (mods.finance && !mods.checkin)
-        ? cutoffF
-        : (cutoffC < cutoffF ? cutoffC : cutoffF);
+    const cutoffH = cutoffDateKey(todayKey, this.getHealthArchiveThresholdDays());
+    const cutoffParts: string[] = [];
+    if (mods.checkin) cutoffParts.push(cutoffC);
+    if (mods.finance) cutoffParts.push(cutoffF);
+    if (mods.health) cutoffParts.push(cutoffH);
+    const cutoff =
+      cutoffParts.length === 0
+        ? cutoffDateKey(todayKey, this.getArchiveThresholdDays())
+        : cutoffParts.sort()[0];
 
     const activeC = await this.getCheckinSnapshot(false);
     const archC = await this.getCheckinSnapshot(true);
     const activeF = await this.getFinanceSnapshot(false);
     const archF = await this.getFinanceSnapshot(true);
+    const activeH = await this.getHealthSnapshot(false);
+    const archH = await this.getHealthSnapshot(true);
 
     const moveCheckin = mods.checkin ? (activeC.items ?? []).filter((x) => x.recordDate < cutoffC) : [];
     const keepCheckin = mods.checkin ? (activeC.items ?? []).filter((x) => !(x.recordDate < cutoffC)) : (activeC.items ?? []);
@@ -1390,27 +1735,47 @@ export class RecordRSLatteService {
     const moveFinance = mods.finance ? (activeF.items ?? []).filter((x) => x.recordDate < cutoffF) : [];
     const keepFinance = mods.finance ? (activeF.items ?? []).filter((x) => !(x.recordDate < cutoffF)) : (activeF.items ?? []);
 
+    const moveHealth = mods.health ? (activeH.items ?? []).filter((x) => x.recordDate < cutoffH) : [];
+    const keepHealth = mods.health ? (activeH.items ?? []).filter((x) => !(x.recordDate < cutoffH)) : (activeH.items ?? []);
+
     // merge into archive without duplicates (recordDate + id)
     const mergeC = new Map<string, CheckinRecordIndexItem>();
     for (const it of (archC.items ?? [])) mergeC.set(`${it.recordDate}::${String(it.checkinId)}`, it);
     for (const it of moveCheckin) mergeC.set(`${it.recordDate}::${String(it.checkinId)}`, it);
 
+    const finMergeKey = (it: FinanceRecordIndexItem) =>
+      normStr(it.entryId)
+        ? `${it.recordDate}::${String(it.categoryId)}::${normStr(it.entryId)}`
+        : `${it.recordDate}::${String(it.categoryId)}::legacy`;
     const mergeF = new Map<string, FinanceRecordIndexItem>();
-    for (const it of (archF.items ?? [])) mergeF.set(`${it.recordDate}::${String(it.categoryId)}`, it);
-    for (const it of moveFinance) mergeF.set(`${it.recordDate}::${String(it.categoryId)}`, it);
+    for (const it of (archF.items ?? [])) mergeF.set(finMergeKey(it), it);
+    for (const it of moveFinance) mergeF.set(finMergeKey(it), it);
+
+    const healthMergeKey = (it: HealthRecordIndexItem) =>
+      normStr(it.entryId)
+        ? `${it.recordDate}::${normStr(it.entryId)}`
+        : `${it.recordDate}::m::${normStr(it.metricKey)}`;
+    const mergeH = new Map<string, HealthRecordIndexItem>();
+    for (const it of (archH.items ?? [])) mergeH.set(healthMergeKey(it), it);
+    for (const it of moveHealth) mergeH.set(healthMergeKey(it), it);
 
     const newArchC = Array.from(mergeC.values()).sort((a, b) => (a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)));
     const newArchF = Array.from(mergeF.values()).sort((a, b) => (a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)));
+    const newArchH = Array.from(mergeH.values()).sort((a, b) => (a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)));
 
     this.checkinSnap = { version: 1, updatedAt: nowIso(), items: keepCheckin };
     this.financeSnap = { version: 1, updatedAt: nowIso(), items: keepFinance };
+    this.healthSnap = { version: 1, updatedAt: nowIso(), items: keepHealth };
     this.checkinArchiveSnap = { version: 1, updatedAt: nowIso(), items: newArchC };
     this.financeArchiveSnap = { version: 1, updatedAt: nowIso(), items: newArchF };
+    this.healthArchiveSnap = { version: 1, updatedAt: nowIso(), items: newArchH };
 
     await this.store!.writeCheckinIndex(false, this.checkinSnap);
     await this.store!.writeFinanceIndex(false, this.financeSnap);
+    await this.store!.writeHealthIndex(false, this.healthSnap);
     await this.store!.writeCheckinIndex(true, this.checkinArchiveSnap);
     await this.store!.writeFinanceIndex(true, this.financeArchiveSnap);
+    await this.store!.writeHealthIndex(true, this.healthArchiveSnap);
     
     // ✅ 同步更新统计缓存
     await this.syncCheckinStatsCache();
@@ -1423,6 +1788,7 @@ export class RecordRSLatteService {
       cutoffDate: cutoff,
       checkinArchived: moveCheckin.length,
       financeArchived: moveFinance.length,
+      healthArchived: moveHealth.length,
       listsArchivedCheckin: listsRes.checkinArchived,
       listsArchivedFinance: listsRes.financeArchived,
     };
@@ -1433,8 +1799,8 @@ export class RecordRSLatteService {
    * 从“## 打卡记录 / ## 账单信息”里提取可解析的行，写入中央索引。
    */
   public async refreshIndexFromDiaryScan(): Promise<void> {
-    // 为了保证“扫描重建索引”可用：旧入口直接走 rebuild
-    await this.rebuildIndexFromDiaryRange(true);
+    // 为了保证“扫描重建索引”可用：旧入口直接走 rebuild；reconcileMissingDays 清理已删日记对应日期
+    await this.rebuildIndexFromDiaryRange(true, true, undefined, true);
   }
 
   private getLastDiaryScanMs(): number {
@@ -1454,9 +1820,10 @@ export class RecordRSLatteService {
     return m.format("YYYY-MM-DD");
   }
 
-  private parseDiaryForDay(raw: string, dayKey: string, fileMtimeMs: number): {
+  private parseDiaryForDay(raw: string, dayKey: string, fileMtimeMs: number, sourceFilePath: string): {
     checkins: Map<string, CheckinRecordIndexItem>;
     finances: Map<string, FinanceRecordIndexItem>;
+    healths: Map<string, HealthRecordIndexItem>;
     discoveredCheckins: Map<string, string>; // id->name
     discoveredFinanceCats: Map<string, { name?: string; type: "income" | "expense" }>;
   } {
@@ -1464,6 +1831,7 @@ export class RecordRSLatteService {
 
     const checkins = new Map<string, CheckinRecordIndexItem>();
     const finances = new Map<string, FinanceRecordIndexItem>();
+    const healths = new Map<string, HealthRecordIndexItem>();
     const discoveredCheckins = new Map<string, string>();
     const discoveredFinanceCats = new Map<string, { name?: string; type: "income" | "expense" }>();
 
@@ -1473,13 +1841,17 @@ export class RecordRSLatteService {
     // finance: record / cancel
     // 记录：- 2026-01-02 expense CW_FOOD note -12.00
     // 取消：- ❌ 2026-01-02 12:30 expense CW_FOOD 餐饮 note 12.00
-    const finLineRe = /^\s*[-*]\s+(?:(❌|✅)\s+)?(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?\s+(income|expense)\s+([A-Za-z0-9_]+)\s+(.*)$/;
+    const finLineRe = FINANCE_DIARY_MAIN_LINE_RE;
 
     // 按“最后一行 wins”决定同一条目最终状态（约定：同一条目多次出现取最后一行）
     // 注意：不要用 tsMs 判定新旧，否则会因 fileMtime/时间字段不一致导致取消状态被覆盖。
     const lastCheckinLine = new Map<string, number>();
     const lastFinanceLine = new Map<string, number>();
+    const lastHealthLine = new Map<string, number>();
+    /** legacy：无 meta 时按分类单日一条；有 entryId 时按 entryId 多条 */
     const lastFinanceItem = new Map<string, FinanceRecordIndexItem>();
+    const lastActiveFinanceByEntryId = new Map<string, FinanceRecordIndexItem>();
+    const lastActiveHealthByEntryId = new Map<string, HealthRecordIndexItem>();
 
     const pickLastLine = (id: string, lineNo: number, map: Map<string, number>) => {
       const old = map.get(id);
@@ -1575,15 +1947,99 @@ export class RecordRSLatteService {
           note = beforeAmt || undefined;
         }
 
+        const parsedMeta = extractFinanceMeta(note ?? "");
         discoveredFinanceCats.set(catId, { name: catName, type });
 
-        // 同一 finance uid 在同一天可能出现多条（记录/取消/恢复），取最后一行。
+        const metaPeek = peekFinanceMetaAfterMain(lines, i);
+        if (metaPeek) {
+          const eid = metaPeek.meta.entry_id;
+          const key = `id:${eid}`;
+          if (!pickLastLine(key, i, lastFinanceLine)) continue;
+          lastFinanceLine.set(key, i);
+
+          const parsedBody = extractFinanceMeta(note ?? "");
+          const cycleT = normalizeFinanceCycleType(String(metaPeek.meta.cycle_type ?? "none"));
+          const indexNote =
+            buildFinanceMainNoteParts({
+              subcategory: metaPeek.meta.subcategory,
+              institutionName: metaPeek.meta.institution_name ?? "",
+              cycleType: cycleT,
+              bodyNote: parsedBody.body,
+            }) || undefined;
+          const sceneTags =
+            metaPeek.meta.scene_tags && metaPeek.meta.scene_tags.length > 0
+              ? metaPeek.meta.scene_tags
+              : parsedBody.sceneTags?.length
+                ? parsedBody.sceneTags
+                : undefined;
+          const instName = metaPeek.meta.institution_name || parsedMeta.institutionName || undefined;
+          const metaCycleId = normStr(metaPeek.meta.cycle_id);
+          const cycleIdField = metaCycleId || undefined;
+
+          const isDel = mark === "❌" || metaPeek.meta.is_delete === true;
+          if (isDel) {
+            const prev = lastActiveFinanceByEntryId.get(eid);
+            const amountBase = prev?.amount ?? (hasAmt ? amtRaw : 0);
+            const amtSigned =
+              (prev?.type ?? type) === "expense" ? -Math.abs(Number(amountBase)) : Math.abs(Number(amountBase));
+            const it: FinanceRecordIndexItem = {
+              recordDate: rd,
+              entryId: eid,
+              categoryId: catId,
+              categoryName: catName || prev?.categoryName,
+              type: prev?.type ?? type,
+              subcategory: metaPeek.meta.subcategory,
+              amount: Number.isFinite(amtSigned) ? amtSigned : 0,
+              note: indexNote ?? prev?.note,
+              institutionName: instName || prev?.institutionName,
+              cycleType: cycleT,
+              cycleId: cycleIdField,
+              sceneTags: sceneTags ?? prev?.sceneTags,
+              isDelete: true,
+              tsMs,
+              sourceFilePath,
+              sourceLineMain: i,
+            };
+            (it as any).dbSourceHash = computeFinanceSourceHash(it);
+            finances.set(key, it);
+            continue;
+          }
+
+          if (!hasAmt) continue;
+          let amount = amtRaw;
+          if (type === "expense" && amount > 0) amount = -Math.abs(amount);
+          if (type === "income" && amount < 0) amount = Math.abs(amount);
+
+          const rec: FinanceRecordIndexItem = {
+            recordDate: rd,
+            entryId: eid,
+            categoryId: catId,
+            categoryName: catName,
+            type,
+            subcategory: metaPeek.meta.subcategory,
+            amount,
+            note: indexNote,
+            institutionName: instName,
+            cycleType: cycleT,
+            cycleId: cycleIdField,
+            sceneTags,
+            isDelete: false,
+            tsMs,
+            sourceFilePath,
+            sourceLineMain: i,
+          };
+          (rec as any).dbSourceHash = computeFinanceSourceHash(rec);
+          finances.set(key, rec);
+          lastActiveFinanceByEntryId.set(eid, rec);
+          continue;
+        }
+
+        // —— 无合法 meta：legacy（同日同分类仅保留最后一行）——
         const key = catId;
         const prevNonDel = lastFinanceItem.get(key);
         if (!pickLastLine(key, i, lastFinanceLine)) continue;
         lastFinanceLine.set(key, i);
 
-        // If cancel: keep in index (方案B) with isDelete=true; carry last known amount if possible.
         if (mark === "❌") {
           const prev = prevNonDel;
           const amount = prev?.amount ?? (hasAmt ? Math.abs(amtRaw) : 0);
@@ -1594,8 +2050,13 @@ export class RecordRSLatteService {
             type: prev?.type ?? type,
             amount: prev?.amount ?? (type === "expense" ? -Math.abs(amount) : Math.abs(amount)),
             note: note ?? prev?.note,
+            institutionName: parsedMeta.institutionName || prev?.institutionName,
+            cycleType: parsedMeta.cycleType || prev?.cycleType,
+            sceneTags: (parsedMeta.sceneTags?.length ?? 0) > 0 ? parsedMeta.sceneTags : prev?.sceneTags,
             isDelete: true,
             tsMs,
+            sourceFilePath,
+            sourceLineMain: i,
           };
           (it as any).dbSourceHash = computeFinanceSourceHash(it);
           finances.set(key, it);
@@ -1614,17 +2075,170 @@ export class RecordRSLatteService {
           type,
           amount,
           note: note || undefined,
+          institutionName: parsedMeta.institutionName || undefined,
+          cycleType: parsedMeta.cycleType || undefined,
+          sceneTags: parsedMeta.sceneTags?.length ? parsedMeta.sceneTags : undefined,
           isDelete: false,
           tsMs,
+          sourceFilePath,
+          sourceLineMain: i,
         };
         (rec as any).dbSourceHash = computeFinanceSourceHash(rec);
         finances.set(key, rec);
         lastFinanceItem.set(key, rec);
         continue;
       }
+
+      // ---- health ----
+      const mh = ln.match(HEALTH_DIARY_MAIN_LINE_RE);
+      if (mh) {
+        const mark = (mh[1] ?? "") as string;
+        const rd = mh[2];
+        if (rd !== dayKey) continue;
+        const time = mh[3] ?? "";
+        const metricToken = String(mh[4] ?? "").trim();
+        let valueStr = String(mh[5] ?? "").trim();
+        const noteTail = String(mh[6] ?? "").trim();
+        const waterMlPer = Math.max(50, Math.min(2000, Number(this.settings.healthPanel?.waterCupVolumeMl) || 500));
+
+        const resolveWaterCupsValueStr = (mk: string, rawMainVal: string, cupsFromMeta?: number): string => {
+          if (String(mk ?? "").trim() !== "water_cups") return rawMainVal;
+          if (typeof cupsFromMeta === "number" && Number.isFinite(cupsFromMeta)) {
+            return String(Math.max(0, Math.min(30, Math.floor(cupsFromMeta))));
+          }
+          const mMl = rawMainVal.match(/^(\d+)\s*ml$/i);
+          if (mMl) {
+            const ml = parseInt(mMl[1], 10);
+            if (Number.isFinite(ml) && ml >= 0) {
+              return String(Math.max(0, Math.round(ml / waterMlPer)));
+            }
+          }
+          return rawMainVal;
+        };
+
+        let tsMs = fileMtimeMs + i;
+        if (time) {
+          const ts = momentFn(`${rd} ${time}`, "YYYY-MM-DD HH:mm", true);
+          if (ts.isValid()) tsMs = ts.valueOf();
+        }
+
+        const metaPeek = peekHealthMetaAfterMain(lines, i);
+        if (metaPeek) {
+          const eid = String(metaPeek.meta.entry_id ?? "").trim();
+          const key = `id:${eid}`;
+          if (!pickLastLine(key, i, lastHealthLine)) continue;
+          lastHealthLine.set(key, i);
+
+          const period = String(metaPeek.meta.period ?? "day").trim() || "day";
+          const cardRef = String(metaPeek.meta.card_ref ?? "").trim() || undefined;
+          const isDel = mark === "❌" || metaPeek.meta.is_delete === true;
+          const mkResolvedBase =
+            String(metaPeek.meta.metric_key ?? "").trim() || healthMetricKeyFromMainLineLabel(metricToken);
+          valueStr = resolveWaterCupsValueStr(mkResolvedBase, valueStr, metaPeek.meta.cups);
+          const cam = normalizeHealthCreatedAtMs(metaPeek.meta.created_at_ms);
+
+          if (isDel) {
+            const prev = lastActiveHealthByEntryId.get(eid);
+            const prevCa = normalizeHealthCreatedAtMs(prev?.createdAtMs);
+            const mergedCa = cam ?? prevCa;
+            const tsMsForItem = mergedCa ?? tsMs;
+            const mkDel = mkResolvedBase;
+            const metaDietDel = String(metaPeek.meta.diet_note ?? "").trim();
+            const noteDel =
+              mkDel === "diet" && metaDietDel ? metaDietDel : noteTail || prev?.note;
+            const sleepHmDel =
+              mkDel === "sleep_hours"
+                ? metaPeek.meta.sleep_start_hm || prev?.sleepStartHm
+                : undefined;
+            const it: HealthRecordIndexItem = {
+              recordDate: rd,
+              entryId: eid,
+              metricKey: mkDel,
+              period,
+              cardRef: cardRef || prev?.cardRef,
+              valueStr: valueStr || prev?.valueStr || "",
+              note: noteDel,
+              sleepStartHm: sleepHmDel,
+              isDelete: true,
+              tsMs: tsMsForItem,
+              ...(mergedCa != null ? { createdAtMs: mergedCa } : {}),
+              sourceFilePath,
+              sourceLineMain: i,
+            };
+            (it as any).dbSourceHash = computeHealthSourceHash(it);
+            healths.set(key, it);
+            continue;
+          }
+
+          const mkResolved = mkResolvedBase;
+          const metaDietNote = String(metaPeek.meta.diet_note ?? "").trim();
+          const noteForIndex =
+            mkResolved === "diet" && metaDietNote ? metaDietNote : noteTail || undefined;
+          const tsMsForRec = cam ?? tsMs;
+          const rec: HealthRecordIndexItem = {
+            recordDate: rd,
+            entryId: eid,
+            metricKey: mkResolved,
+            period,
+            cardRef,
+            valueStr,
+            note: noteForIndex,
+            sleepStartHm: mkResolved === "sleep_hours" ? metaPeek.meta.sleep_start_hm : undefined,
+            isDelete: false,
+            tsMs: tsMsForRec,
+            ...(cam != null ? { createdAtMs: cam } : {}),
+            sourceFilePath,
+            sourceLineMain: i,
+          };
+          (rec as any).dbSourceHash = computeHealthSourceHash(rec);
+          healths.set(key, rec);
+          lastActiveHealthByEntryId.set(eid, rec);
+          continue;
+        }
+
+        const metricKey = healthMetricKeyFromMainLineLabel(metricToken);
+        valueStr = resolveWaterCupsValueStr(metricKey, valueStr, undefined);
+
+        const key = `m:${metricKey}`;
+        if (!pickLastLine(key, i, lastHealthLine)) continue;
+        lastHealthLine.set(key, i);
+
+        if (mark === "❌") {
+          const prev = healths.get(key);
+          const it: HealthRecordIndexItem = {
+            recordDate: rd,
+            metricKey,
+            period: "day",
+            valueStr: valueStr || prev?.valueStr || "",
+            note: noteTail || prev?.note,
+            isDelete: true,
+            tsMs,
+            sourceFilePath,
+            sourceLineMain: i,
+          };
+          (it as any).dbSourceHash = computeHealthSourceHash(it);
+          healths.set(key, it);
+          continue;
+        }
+
+        const rec: HealthRecordIndexItem = {
+          recordDate: rd,
+          metricKey,
+          period: "day",
+          valueStr,
+          note: noteTail || undefined,
+          isDelete: false,
+          tsMs,
+          sourceFilePath,
+          sourceLineMain: i,
+        };
+        (rec as any).dbSourceHash = computeHealthSourceHash(rec);
+        healths.set(key, rec);
+        continue;
+      }
     }
 
-    return { checkins, finances, discoveredCheckins, discoveredFinanceCats };
+    return { checkins, finances, healths, discoveredCheckins, discoveredFinanceCats };
   }
 
   /**
@@ -1870,7 +2484,7 @@ export class RecordRSLatteService {
   public async scanIncrementalFromDiary(opts?: { modules?: RecordModules; forceIncludeEqualMtime?: boolean }): Promise<RecordIncrementalScan | null> {
     await this.ensureReady();
     const mods = normalizeModules(opts?.modules);
-    if (!mods.checkin && !mods.finance) return null;
+    if (!mods.checkin && !mods.finance && !mods.health) return null;
     const forceIncludeEqualMtime = opts?.forceIncludeEqualMtime === true;
 
     const s = this.settings;
@@ -1892,7 +2506,7 @@ export class RecordRSLatteService {
     if (!rootAf) return null;
 
     const todayKey = this.host.getTodayKey();
-    const cutoff = cutoffDateKey(todayKey, this.getArchiveThresholdDays());
+    const cutoff = this.getScanCutoffDateKeyForModules(todayKey, mods);
     const sinceMs = this.getLastDiaryScanMs();
     
     // ✅ DEBUG: 记录增量扫描的起始参数
@@ -1903,7 +2517,7 @@ export class RecordRSLatteService {
     const dayKeysScanned = new Set<string>();
     const discoveredCheckins = new Map<string, string>();
     const discoveredFinanceCats = new Map<string, { name?: string; type: 'income' | 'expense' }>();
-    const parsedByDay = new Map<string, { checkins: Map<string, CheckinRecordIndexItem>; finances: Map<string, FinanceRecordIndexItem> }>();
+    const parsedByDay = new Map<string, RecordDayParsedMaps>();
     let maxMtime = sinceMs;
     
     // ✅ 收集扫描到的文件清单（用于 DEBUG 日志）
@@ -1947,11 +2561,12 @@ export class RecordRSLatteService {
       const raw = await this.host.app.vault.read(f);
       maxMtime = Math.max(maxMtime, mtime);
 
-      const parsed = this.parseDiaryForDay(raw, dayKey, mtime || Date.now());
+      const parsed = this.parseDiaryForDay(raw, dayKey, mtime || Date.now(), f.path);
       dayKeysScanned.add(dayKey);
       parsedByDay.set(dayKey, {
         checkins: mods.checkin ? parsed.checkins : new Map<string, CheckinRecordIndexItem>(),
         finances: mods.finance ? parsed.finances : new Map<string, FinanceRecordIndexItem>(),
+        healths: mods.health ? parsed.healths : new Map<string, HealthRecordIndexItem>(),
       });
       if (mods.checkin) {
         for (const [id, name] of parsed.discoveredCheckins.entries()) discoveredCheckins.set(id, name);
@@ -2062,11 +2677,20 @@ export class RecordRSLatteService {
     const archC = mods.checkin ? ((await this.getCheckinSnapshot(true)).items ?? []) : [];
     const activeF = mods.finance ? ((await this.getFinanceSnapshot(false)).items ?? []) : [];
     const archF = mods.finance ? ((await this.getFinanceSnapshot(true)).items ?? []) : [];
+    const activeH = mods.health ? ((await this.getHealthSnapshot(false)).items ?? []) : [];
+    const archH = mods.health ? ((await this.getHealthSnapshot(true)).items ?? []) : [];
 
     const keyC = (rd: string, cid: string) => `${rd}::${cid}`;
     const keyF = (rd: string, fid: string) => `${rd}::${fid}`;
+    const keyH = (it: HealthRecordIndexItem) => {
+      const rd = String(it.recordDate);
+      const eid = normStr(it.entryId);
+      if (eid) return `${rd}::${eid}`;
+      return `${rd}::m::${normStr(it.metricKey)}`;
+    };
     const oldCMap = new Map<string, CheckinRecordIndexItem>();
     const oldFMap = new Map<string, FinanceRecordIndexItem>();
+    const oldHMap = new Map<string, HealthRecordIndexItem>();
     if (mods.checkin) {
       for (const it of [...activeC, ...archC]) {
         if (!it?.recordDate) continue;
@@ -2081,14 +2705,24 @@ export class RecordRSLatteService {
         oldFMap.set(keyF(String(it.recordDate), String(it.categoryId)), it);
       }
     }
+    if (mods.health) {
+      for (const it of [...activeH, ...archH]) {
+        if (!it?.recordDate) continue;
+        if (!daySet.has(String(it.recordDate))) continue;
+        oldHMap.set(keyH(it), it);
+      }
+    }
 
     const keepCActive = mods.checkin ? activeC.filter((x) => !daySet.has(x.recordDate)) : [];
     const keepCArch = mods.checkin ? archC.filter((x) => !daySet.has(x.recordDate)) : [];
     const keepFActive = mods.finance ? activeF.filter((x) => !daySet.has(x.recordDate)) : [];
     const keepFArch = mods.finance ? archF.filter((x) => !daySet.has(x.recordDate)) : [];
+    const keepHActive = mods.health ? activeH.filter((x) => !daySet.has(x.recordDate)) : [];
+    const keepHArch = mods.health ? archH.filter((x) => !daySet.has(x.recordDate)) : [];
 
     const addC: CheckinRecordIndexItem[] = [];
     const addF: FinanceRecordIndexItem[] = [];
+    const addH: HealthRecordIndexItem[] = [];
     for (const parsed of (scan?.parsedByDay ?? new Map()).values()) {
       if (mods.checkin) {
         for (const it of parsed.checkins.values()) {
@@ -2106,6 +2740,15 @@ export class RecordRSLatteService {
           (it as any).dbSourceHash = normStr((it as any).dbSourceHash) || computeFinanceSourceHash(it);
           mergeDbSyncMeta(it as any, old as any);
           addF.push(it);
+        }
+      }
+      if (mods.health) {
+        for (const it of parsed.healths.values()) {
+          const k = keyH(it);
+          const old = oldHMap.get(k);
+          (it as any).dbSourceHash = normStr((it as any).dbSourceHash) || computeHealthSourceHash(it);
+          mergeDbSyncMeta(it as any, old as any);
+          addH.push(it);
         }
       }
     }
@@ -2136,6 +2779,16 @@ export class RecordRSLatteService {
       await this.syncFinanceStatsCache();
     }
 
+    if (mods.health) {
+      const outHActive = [...keepHActive, ...addH].sort((a, b) =>
+        a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)
+      );
+      this.healthSnap = { version: 1, updatedAt: nowIso(), items: outHActive };
+      this.healthArchiveSnap = { version: 1, updatedAt: nowIso(), items: keepHArch };
+      await this.store!.writeHealthIndex(false, this.healthSnap);
+      await this.store!.writeHealthIndex(true, this.healthArchiveSnap);
+    }
+
     if (updateLists) {
       await this.addMissingListsFromDiary({
         checkins: mods.checkin ? (scan?.discoveredCheckins ?? new Map()) : new Map<string, string>(),
@@ -2153,13 +2806,21 @@ export class RecordRSLatteService {
   }
 
   /**
-   * ✅ E2-05：原子化 Step A（record 全量扫描）：扫描 cutoff 范围内全部日记，必要时补充“缺失日记天”用于清理。
-   * - 不写入索引、不改水位，只返回扫描结果。
+   * ✅ E2-05：原子化 Step A（record 全量扫描）：扫描日记树，必要时补充“缺失日记天”用于清理。
+   * - **scanAllDiaryDates**（Pipeline `rebuild` / 显式全量重建）：不按归档阈值跳过旧日期的日记文件，读遍 `diaryPath` 下可解析日期的 `.md`（含 `YYYYMM/`），再由 **`archiveOutOfRange`** 做索引归档瘦身。
+   * - 默认（未开）：仍用 **归档阈值** 推导 **scanCutoffKey**，早于该日期的文件整份跳过（与增量/刷新性能一致）。
+   * - 不写入索引、不改水位，只返回扫描结果；返回的 **cutoffDate** 仍为归档阈值日（供 `applyFullReplace` 等语义），不因 scanAll 而改变。
    */
-  public async scanFullFromDiaryRange(opts?: { reconcileMissingDays?: boolean; modules?: RecordModules }): Promise<RecordFullScan> {
+  public async scanFullFromDiaryRange(opts?: {
+    reconcileMissingDays?: boolean;
+    modules?: RecordModules;
+    /** true：重建索引时扫全库日记日期，再依赖 archiveNow 迁出旧条目 */
+    scanAllDiaryDates?: boolean;
+  }): Promise<RecordFullScan> {
     await this.ensureReady();
     const mods = normalizeModules(opts?.modules);
     const reconcileMissingDays = !!opts?.reconcileMissingDays;
+    const scanAllDiaryDates = opts?.scanAllDiaryDates === true;
 
     const s = this.settings;
     // 获取当前空间ID，然后从空间的 settingsSnapshot 中获取 diaryPath
@@ -2175,12 +2836,14 @@ export class RecordRSLatteService {
     }
     
     const todayKey = this.host.getTodayKey();
-    const cutoff = cutoffDateKey(todayKey, this.getArchiveThresholdDays());
+    const thresholdCutoff = this.getScanCutoffDateKeyForModules(todayKey, mods);
+    /** 单文件是否跳过：全量重建时不按日龄跳过 */
+    const scanCutoffKey = scanAllDiaryDates ? "0000-01-01" : thresholdCutoff;
 
     const dayKeysScanned = new Set<string>();
     const discoveredCheckins = new Map<string, string>();
     const discoveredFinanceCats = new Map<string, { name?: string; type: 'income' | 'expense' }>();
-    const parsedByDay = new Map<string, { checkins: Map<string, CheckinRecordIndexItem>; finances: Map<string, FinanceRecordIndexItem> }>();
+    const parsedByDay = new Map<string, RecordDayParsedMaps>();
     let maxMtime = 0;
     
     // ✅ 收集扫描到的文件清单（用于 DEBUG 日志）
@@ -2192,13 +2855,13 @@ export class RecordRSLatteService {
       if (f.extension.toLowerCase() !== 'md') return;
       const dayKey = this.parseDiaryDateFromFile(f);
       if (!dayKey) return;
-      if (dayKey < cutoff) return;
+      if (dayKey < scanCutoffKey) return;
       
       const raw = await this.host.app.vault.read(f);
       const mtime = Number(f.stat?.mtime ?? 0);
       if (Number.isFinite(mtime)) maxMtime = Math.max(maxMtime, mtime);
 
-      const parsed = this.parseDiaryForDay(raw, dayKey, mtime || Date.now());
+      const parsed = this.parseDiaryForDay(raw, dayKey, mtime || Date.now(), f.path);
       const checkinCount = parsed.checkins.size;
       const financeCount = parsed.finances.size;
       
@@ -2213,6 +2876,7 @@ export class RecordRSLatteService {
       parsedByDay.set(dayKey, {
         checkins: mods.checkin ? parsed.checkins : new Map<string, CheckinRecordIndexItem>(),
         finances: mods.finance ? parsed.finances : new Map<string, FinanceRecordIndexItem>(),
+        healths: mods.health ? parsed.healths : new Map<string, HealthRecordIndexItem>(),
       });
       if (mods.checkin) {
         for (const [id, name] of parsed.discoveredCheckins.entries()) discoveredCheckins.set(id, name);
@@ -2266,16 +2930,19 @@ export class RecordRSLatteService {
       const archC = mods.checkin ? ((await this.getCheckinSnapshot(true)).items ?? []) : [];
       const activeF = mods.finance ? ((await this.getFinanceSnapshot(false)).items ?? []) : [];
       const archF = mods.finance ? ((await this.getFinanceSnapshot(true)).items ?? []) : [];
+      const activeH = mods.health ? ((await this.getHealthSnapshot(false)).items ?? []) : [];
+      const archH = mods.health ? ((await this.getHealthSnapshot(true)).items ?? []) : [];
       
       const existingDays = new Set<string>();
       const addDay = (d: any) => {
         const dk = String(d ?? '');
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) return;
-        if (dk < cutoff) return;
+        if (dk < scanCutoffKey) return;
         existingDays.add(dk);
       };
       if (mods.checkin) for (const it of [...activeC, ...archC]) addDay((it as any)?.recordDate);
       if (mods.finance) for (const it of [...activeF, ...archF]) addDay((it as any)?.recordDate);
+      if (mods.health) for (const it of [...activeH, ...archH]) addDay((it as any)?.recordDate);
       
       // 将所有现有日期加入到 dayKeysToReplace，这样会被清空
       for (const d of existingDays.values()) {
@@ -2293,16 +2960,19 @@ export class RecordRSLatteService {
       const archC = mods.checkin ? ((await this.getCheckinSnapshot(true)).items ?? []) : [];
       const activeF = mods.finance ? ((await this.getFinanceSnapshot(false)).items ?? []) : [];
       const archF = mods.finance ? ((await this.getFinanceSnapshot(true)).items ?? []) : [];
+      const activeH = mods.health ? ((await this.getHealthSnapshot(false)).items ?? []) : [];
+      const archH = mods.health ? ((await this.getHealthSnapshot(true)).items ?? []) : [];
 
       const existingDays = new Set<string>();
       const addDay = (d: any) => {
         const dk = String(d ?? '');
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) return;
-        if (dk < cutoff) return;
+        if (dk < scanCutoffKey) return;
         existingDays.add(dk);
       };
       if (mods.checkin) for (const it of [...activeC, ...archC]) addDay((it as any)?.recordDate);
       if (mods.finance) for (const it of [...activeF, ...archF]) addDay((it as any)?.recordDate);
+      if (mods.health) for (const it of [...activeH, ...archH]) addDay((it as any)?.recordDate);
 
       for (const d of existingDays.values()) {
         if (!dayKeysToReplace.has(d)) {
@@ -2315,7 +2985,7 @@ export class RecordRSLatteService {
     return {
       kind: 'full',
       modules: mods,
-      cutoffDate: cutoff,
+      cutoffDate: thresholdCutoff,
       scannedDays,
       clearedDays,
       maxMtime,
@@ -2347,11 +3017,16 @@ export class RecordRSLatteService {
       // 获取所有现有记录的日期，加入到 daySet 中以清空它们
       const activeC = mods.checkin ? ((await this.getCheckinSnapshot(false)).items ?? []) : [];
       const activeF = mods.finance ? ((await this.getFinanceSnapshot(false)).items ?? []) : [];
+      const activeH = mods.health ? ((await this.getHealthSnapshot(false)).items ?? []) : [];
       for (const it of activeC) {
         const d = String(it?.recordDate ?? "");
         if (d && d >= scan.cutoffDate) daySet.add(d);
       }
       for (const it of activeF) {
+        const d = String(it?.recordDate ?? "");
+        if (d && d >= scan.cutoffDate) daySet.add(d);
+      }
+      for (const it of activeH) {
         const d = String(it?.recordDate ?? "");
         if (d && d >= scan.cutoffDate) daySet.add(d);
       }
@@ -2362,11 +3037,20 @@ export class RecordRSLatteService {
     const archC = mods.checkin ? ((await this.getCheckinSnapshot(true)).items ?? []) : [];
     const activeF = mods.finance ? ((await this.getFinanceSnapshot(false)).items ?? []) : [];
     const archF = mods.finance ? ((await this.getFinanceSnapshot(true)).items ?? []) : [];
+    const activeH = mods.health ? ((await this.getHealthSnapshot(false)).items ?? []) : [];
+    const archH = mods.health ? ((await this.getHealthSnapshot(true)).items ?? []) : [];
 
     const keyC = (rd: string, cid: string) => `${rd}::${cid}`;
     const keyF = (rd: string, fid: string) => `${rd}::${fid}`;
+    const keyHfull = (it: HealthRecordIndexItem) => {
+      const rd = String(it.recordDate);
+      const eid = normStr(it.entryId);
+      if (eid) return `${rd}::${eid}`;
+      return `${rd}::m::${normStr(it.metricKey)}`;
+    };
     const oldCMap = new Map<string, CheckinRecordIndexItem>();
     const oldFMap = new Map<string, FinanceRecordIndexItem>();
+    const oldHMap = new Map<string, HealthRecordIndexItem>();
 
     if (mods.checkin) {
       for (const it of [...activeC, ...archC]) {
@@ -2382,14 +3066,24 @@ export class RecordRSLatteService {
         oldFMap.set(keyF(String(it.recordDate), String(it.categoryId)), it);
       }
     }
+    if (mods.health) {
+      for (const it of [...activeH, ...archH]) {
+        if (!it?.recordDate) continue;
+        if (!daySet.has(String(it.recordDate))) continue;
+        oldHMap.set(keyHfull(it), it);
+      }
+    }
 
     const keepCActive = mods.checkin ? activeC.filter((x) => !daySet.has(x.recordDate)) : [];
     const keepCArch = mods.checkin ? archC.filter((x) => !daySet.has(x.recordDate)) : [];
     const keepFActive = mods.finance ? activeF.filter((x) => !daySet.has(x.recordDate)) : [];
     const keepFArch = mods.finance ? archF.filter((x) => !daySet.has(x.recordDate)) : [];
+    const keepHActive = mods.health ? activeH.filter((x) => !daySet.has(x.recordDate)) : [];
+    const keepHArch = mods.health ? archH.filter((x) => !daySet.has(x.recordDate)) : [];
 
     const addC: CheckinRecordIndexItem[] = [];
     const addF: FinanceRecordIndexItem[] = [];
+    const addH: HealthRecordIndexItem[] = [];
 
     for (const [dayKey, parsed] of (scan?.parsedByDay ?? new Map()).entries()) {
       if (mods.checkin) {
@@ -2406,6 +3100,14 @@ export class RecordRSLatteService {
           (it as any).dbSourceHash = normStr((it as any).dbSourceHash) || computeFinanceSourceHash(it);
           mergeDbSyncMeta(it as any, old as any);
           addF.push(it);
+        }
+      }
+      if (mods.health) {
+        for (const it of parsed.healths.values()) {
+          const old = oldHMap.get(keyHfull(it));
+          (it as any).dbSourceHash = normStr((it as any).dbSourceHash) || computeHealthSourceHash(it);
+          mergeDbSyncMeta(it as any, old as any);
+          addH.push(it);
         }
       }
     }
@@ -2439,6 +3141,22 @@ export class RecordRSLatteService {
       await this.store!.writeFinanceIndex(true, this.financeArchiveSnap);
       // ✅ 同步更新财务统计缓存
       await this.syncFinanceStatsCache();
+
+      await this.reconcileFinanceCyclePlanReferencesAfterFullRebuild([...outFActive, ...outFArch]);
+      await this.writeFinanceManagementSettingsSnapshotBestEffort();
+    }
+
+    if (mods.health) {
+      const outHActive = [...keepHActive, ...addH].sort((a, b) =>
+        a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)
+      );
+      const outHArch = keepHArch.sort((a, b) =>
+        a.recordDate === b.recordDate ? (a.tsMs ?? 0) - (b.tsMs ?? 0) : a.recordDate.localeCompare(b.recordDate)
+      );
+      this.healthSnap = { version: 1, updatedAt: nowIso(), items: outHActive };
+      this.healthArchiveSnap = { version: 1, updatedAt: nowIso(), items: outHArch };
+      await this.store!.writeHealthIndex(false, this.healthSnap);
+      await this.store!.writeHealthIndex(true, this.healthArchiveSnap);
     }
 
     if (updateLists) {
@@ -2484,15 +3202,21 @@ export class RecordRSLatteService {
   /**
    * ✅ Step2（与任务管理一致）：手动刷新 = reconcile（阈值范围内全量扫描重建）。
    * - updateLists=true：扫描过程中发现的新清单（打卡项/财务分类）会写入 lists index，并合并回 settings（默认 active=false）。
-   * - reconcileMissingDays=true：若阈值范围内某天曾存在索引记录，但对应日记文件已不存在，则在本次重建中清理该天索引记录。
+   * - reconcileMissingDays=true（默认）：若阈值范围内某天曾存在索引记录，但本次全量扫描未再发现该日日记文件，则在 replace 阶段移除该日索引项（含已删文件场景）。
+   * - scanAllDiaryDates=true：读遍日记树下全部可解析日期（含 `YYYYMM/`），再依赖 Pipeline **archiveOutOfRange** 做索引归档；与 Pipeline **`rebuild`** 对齐。
    */
   public async rebuildIndexFromDiaryRange(
     updateLists: boolean = true,
-    reconcileMissingDays: boolean = false,
-    modules?: RecordModules
+    reconcileMissingDays: boolean = true,
+    modules?: RecordModules,
+    scanAllDiaryDates?: boolean
   ): Promise<{ cutoffDate: string; scannedDays: number; clearedDays: number; dayKeysScanned?: Set<string>; dayKeysToReplace?: Set<string> }> {
     await this.ensureReady();
-    const scan = await this.scanFullFromDiaryRange({ reconcileMissingDays, modules });
+    const scan = await this.scanFullFromDiaryRange({
+      reconcileMissingDays,
+      modules,
+      scanAllDiaryDates: scanAllDiaryDates === true,
+    });
     const applied = await this.applyFullReplace(scan, { updateLists });
     return {
       cutoffDate: applied.cutoffDate,
@@ -2503,6 +3227,178 @@ export class RecordRSLatteService {
     };
   }
 
+
+  /**
+   * 扫描当前空间日记目录下**全部**符合日记文件名格式的 `.md`：
+   * - legacy：财务主行后无合法 `rslatte:finance:meta`（或 JSON 无效 / 缺 entry_id / 缺子分类）
+   * - duplicate：同一文件内同一 `entry_id` 出现多组主行+meta
+   * - duplicateCrossFiles：同一 `entry_id` 出现在**至少两个不同文件**中（复制日记未换新 id）
+   * 不修改索引与文件；供「异常记录清单」UI 使用。
+   */
+  public async scanFinanceAnomalies(): Promise<FinanceAnomalyScanResult> {
+    await this.ensureReady();
+    const legacy: FinanceAnomalyLegacyItem[] = [];
+    const duplicates: FinanceAnomalyDuplicateItem[] = [];
+    const cycleIdMissing: FinanceAnomalyCycleIdMissingItem[] = [];
+
+    const s = this.settings;
+    const currentSpaceId = String((s as any).currentSpaceId ?? "");
+    const spaces = (s as any).spaces || {};
+    const currentSpace = spaces[currentSpaceId];
+    const spaceDiaryPath = currentSpace?.settingsSnapshot?.diaryPath;
+    const diaryRoot = normalizePath(String(spaceDiaryPath ?? s.diaryPath ?? "").trim());
+
+    const finLineRe = FINANCE_DIARY_MAIN_LINE_RE;
+
+    /** 跨文件统计：每个 entry_id 在哪些文件、哪一行出现 */
+    const globalByEntryId = new Map<
+      string,
+      Array<{ filePath: string; dayKey: string; lineNumber: number; preview: string }>
+    >();
+
+    let scannedFileCount = 0;
+
+    const scanOneFile = async (f: TFile) => {
+      if (f.extension.toLowerCase() !== "md") return;
+      const dayKey = this.parseDiaryDateFromFile(f);
+      if (!dayKey) return;
+      scannedFileCount++;
+      const raw = await this.host.app.vault.read(f);
+      const lines = raw.split(/\r?\n/);
+      const byEntry = new Map<string, number[]>();
+
+      for (let i = 0; i < lines.length; i++) {
+        const ln = lines[i] ?? "";
+        if (!finLineRe.test(ln)) continue;
+        const mc = ln.match(finLineRe);
+        const catId = mc ? String(mc[5] ?? "").trim() : undefined;
+        const peek = peekFinanceMetaAfterMain(lines, i);
+        if (!peek) {
+          legacy.push({
+            kind: "legacy_no_meta",
+            filePath: f.path,
+            dayKey,
+            lineNumber: i + 1,
+            preview: ln.trim().slice(0, 200),
+            categoryId: catId || undefined,
+          });
+          continue;
+        }
+        const eid = String(peek.meta.entry_id ?? "").trim();
+        if (!eid) continue;
+
+        const ctScan = normalizeFinanceCycleType(String(peek.meta.cycle_type ?? "none"));
+        if (ctScan !== "none" && !normStr(peek.meta.cycle_id)) {
+          cycleIdMissing.push({
+            kind: "cycle_id_missing",
+            filePath: f.path,
+            dayKey,
+            lineNumber: i + 1,
+            preview: ln.trim().slice(0, 200),
+            entryId: eid,
+            categoryId: catId || undefined,
+            subcategory: peek.meta.subcategory,
+            institutionName: peek.meta.institution_name,
+            cycleType: ctScan,
+          });
+        }
+
+        const arr = byEntry.get(eid) ?? [];
+        arr.push(i + 1);
+        byEntry.set(eid, arr);
+
+        const pv = ln.trim().slice(0, 140);
+        const g = globalByEntryId.get(eid) ?? [];
+        g.push({ filePath: f.path, dayKey, lineNumber: i + 1, preview: pv });
+        globalByEntryId.set(eid, g);
+      }
+
+      for (const [entryId, lineNums] of byEntry.entries()) {
+        if (lineNums.length <= 1) continue;
+        duplicates.push({
+          kind: "duplicate_entry_id",
+          filePath: f.path,
+          dayKey,
+          entryId,
+          mainLineNumbers: [...lineNums],
+          previews: lineNums.map((ln) => String(lines[ln - 1] ?? "").trim().slice(0, 140)),
+        });
+      }
+    };
+
+    const rootAf = diaryRoot ? this.host.app.vault.getAbstractFileByPath(diaryRoot) : null;
+    const walk = async (folder: TFolder) => {
+      for (const ch of folder.children) {
+        if (ch instanceof TFolder) await walk(ch);
+        else if (ch instanceof TFile) await scanOneFile(ch);
+      }
+    };
+    if (rootAf instanceof TFolder) await walk(rootAf);
+    else if (rootAf instanceof TFile) await scanOneFile(rootAf);
+
+    const duplicateCrossFiles: FinanceAnomalyDuplicateCrossFileItem[] = [];
+    for (const [entryId, occ] of globalByEntryId.entries()) {
+      const distinctFiles = new Set(occ.map((o) => o.filePath));
+      if (distinctFiles.size < 2) continue;
+      const sorted = [...occ].sort(
+        (a, b) => a.filePath.localeCompare(b.filePath) || a.lineNumber - b.lineNumber
+      );
+      duplicateCrossFiles.push({
+        kind: "duplicate_entry_id_cross_file",
+        entryId,
+        occurrences: sorted,
+      });
+    }
+    duplicateCrossFiles.sort((a, b) => a.entryId.localeCompare(b.entryId));
+
+    return { legacy, duplicates, duplicateCrossFiles, cycleIdMissing, scannedFileCount };
+  }
+
+  /**
+   * 全量重建财务索引后：根据索引中的 cycleId 刷新周期表 referenced（仅此处重算 true/false）。
+   */
+  private async reconcileFinanceCyclePlanReferencesAfterFullRebuild(allItems: FinanceRecordIndexItem[]): Promise<void> {
+    try {
+      const used = new Set<string>();
+      for (const it of allItems) {
+        const ct = normalizeFinanceCycleType((it as any).cycleType ?? "none");
+        if (ct === "none") continue;
+        const cid = normStr((it as any).cycleId);
+        if (!cid || cid === "none") continue;
+        used.add(cid);
+      }
+      const s = this.host.settingsRef();
+      const plans = s.financeCyclePlans ?? [];
+      let touched = false;
+      for (const p of plans) {
+        if (String((p as any)?.deletedAt ?? "").trim()) continue;
+        const nextRef = used.has(String((p as any).id));
+        if ((p as any).referenced !== nextRef) {
+          (p as any).referenced = nextRef;
+          touched = true;
+        }
+      }
+      if (touched) await this.host.saveSettings();
+    } catch (e) {
+      console.warn("[RSLatte] reconcileFinanceCyclePlanReferencesAfterFullRebuild failed", e);
+    }
+  }
+
+  private async writeFinanceManagementSettingsSnapshotBestEffort(): Promise<void> {
+    try {
+      await this.ensureReady();
+      const s = this.host.settingsRef();
+      await this.store!.writeFinanceManagementSettingsSnapshot({
+        schemaVersion: 1,
+        financeManagementCurrency: s.financeManagementCurrency ?? "CNY",
+        financeCyclePlans: s.financeCyclePlans ?? [],
+        financeInstitutionSimilarIgnore: s.financeInstitutionSimilarIgnore ?? [],
+        financeCategories: s.financeCategories ?? [],
+      });
+    } catch (e) {
+      console.warn("[RSLatte] writeFinanceManagementSettingsSnapshotBestEffort failed", e);
+    }
+  }
 
   /** ✅ Step1：增量扫描（mtime>waterline），仅更新变更日记对应的当日索引 */
   public async refreshIndexIncrementalFromDiary(opts?: { updateLists?: boolean; modules?: RecordModules }): Promise<void> {

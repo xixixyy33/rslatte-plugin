@@ -1,8 +1,14 @@
 import { ItemView, WorkspaceLeaf } from "obsidian";
 import type RSLattePlugin from "../../../main";
-import { getModuleColor } from "../../../utils/stats/colors";
-import type { WorkEvent, WorkEventAction, WorkEventSource, WorkEventKind } from "../../../types/stats/workEvent";
+import {
+  normalizeWorkEventSource,
+  type WorkEvent,
+  type WorkEventAction,
+  type WorkEventSource,
+  type WorkEventKind,
+} from "../../../types/stats/workEvent";
 import type { WorkEventService } from "../../../services/workEventService";
+import { addDaysLocalYmd, todayLocalYmd } from "../../../utils/localCalendarYmd";
 
 export const VIEW_TYPE_TIMELINE = "rslatte-stats-timeline";
 
@@ -22,7 +28,9 @@ export class TimelineView extends ItemView {
   private moduleSectionCollapsed: boolean = false;
   private actionSectionCollapsed: boolean = false;
   private sourceSectionCollapsed: boolean = false;
-  
+  /** 曾出现在操作日志空间筛选中的空间 id：新进清单的空间默认勾选，已见过的不再自动勾回（避免覆盖用户全取消） */
+  private _timelineSpaceAutoSelectedIds = new Set<string>();
+
   constructor(leaf: WorkspaceLeaf, plugin: RSLattePlugin) {
     super(leaf);
     this.plugin = plugin;
@@ -33,19 +41,26 @@ export class TimelineView extends ItemView {
   }
 
   getDisplayText(): string {
-    return "事件时间轴";
+    return "操作日志";
   }
 
   getIcon(): string {
     return "clock";
   }
 
-  async onOpen() {
-    // 初始化时默认选择所有空间
-    const spaces = (this.plugin as any).workEventReader?.getSpaces() || [];
-    if (this.selectedSpaces.size === 0 && spaces.length > 0) {
-      spaces.forEach((s: any) => this.selectedSpaces.add(s.id));
+  /** 新进 stats 空间清单的空间默认纳入勾选 */
+  private ensureTimelineSpacesDefaultSelected(spaces: Array<{ id: string }>): void {
+    for (const s of spaces) {
+      const id = (s?.id && String(s.id).trim()) || "";
+      if (!id || this._timelineSpaceAutoSelectedIds.has(id)) continue;
+      this.selectedSpaces.add(id);
+      this._timelineSpaceAutoSelectedIds.add(id);
     }
+  }
+
+  async onOpen() {
+    const spaces = (this.plugin as any).workEventReader?.getSpaces() || [];
+    this.ensureTimelineSpacesDefaultSelected(spaces);
     // 初始化时默认选择所有启用的模块（从注册表获取）
     const allModules = this.getModulesFromRegistry();
     const statsSettings = (this.plugin.settings as any)?.statsSettings;
@@ -57,12 +72,11 @@ export class TimelineView extends ItemView {
     }
     // 初始化时默认选择所有操作类型（action）
     if (this.selectedActions.size === 0) {
-      const allActions: WorkEventAction[] = ["create", "update", "status", "delete", "archive", "cancelled","done","start","recover","paused","continued"];
+      const allActions: WorkEventAction[] = ["create", "update", "publish", "recall", "status", "delete", "archive", "cancelled","done","start","recover","paused","continued"];
       allActions.forEach((a) => this.selectedActions.add(a));
     }
-    // 初始化时默认选择所有事件来源（source），含「手机」以显示从手机同步的操作
     if (this.selectedSources.size === 0) {
-      const allSources: WorkEventSource[] = ["ui", "auto", "reconcile", "mobile"];
+      const allSources: WorkEventSource[] = ["ui", "auto", "reconcile"];
       allSources.forEach((s) => this.selectedSources.add(s));
     }
     await this.render();
@@ -104,9 +118,9 @@ export class TimelineView extends ItemView {
     // 整体筛选器折叠标签和刷新按钮容器
     const filtersToggleRow = header.createDiv({ cls: "rslatte-stats-filters-toggle-row" });
     const filtersToggleLabel = filtersToggleRow.createDiv({ cls: "rslatte-stats-filters-toggle-label" });
-    const filtersToggleIcon = filtersToggleLabel.createSpan({ 
-      cls: "rslatte-stats-collapse-icon", 
-      text: this.filtersCollapsed ? "▶" : "▼" 
+    filtersToggleLabel.createSpan({
+      cls: "rslatte-stats-collapse-icon",
+      text: this.filtersCollapsed ? "▶" : "▼",
     });
     filtersToggleLabel.createSpan({ text: "筛选选项", cls: "rslatte-stats-filters-toggle-text" });
     filtersToggleLabel.onclick = () => {
@@ -128,7 +142,7 @@ export class TimelineView extends ItemView {
     // 日期筛选区域
     const dateSection = filtersContainer.createDiv({ cls: "rslatte-stats-filter-section" });
     const dateLabel = dateSection.createDiv({ cls: "rslatte-stats-filter-label rslatte-stats-collapsible-label" });
-    const dateToggle = dateLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.dateSectionCollapsed ? "▶" : "▼" });
+    dateLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.dateSectionCollapsed ? "▶" : "▼" });
     dateLabel.createSpan({ text: "日期范围" });
     dateLabel.onclick = () => {
       this.dateSectionCollapsed = !this.dateSectionCollapsed;
@@ -142,9 +156,7 @@ export class TimelineView extends ItemView {
     }
     const dateStartInput = dateInputs.createEl("input", { type: "date", cls: "rslatte-stats-date-input" });
     if (!this.selectedDateStart) {
-      const date = new Date();
-      date.setDate(date.getDate() - 7);
-      this.selectedDateStart = date.toISOString().split("T")[0];
+      this.selectedDateStart = addDaysLocalYmd(todayLocalYmd(), -7);
     }
     dateStartInput.value = this.selectedDateStart;
     dateStartInput.onchange = () => {
@@ -156,7 +168,7 @@ export class TimelineView extends ItemView {
 
     const dateEndInput = dateInputs.createEl("input", { type: "date", cls: "rslatte-stats-date-input" });
     if (!this.selectedDateEnd) {
-      this.selectedDateEnd = new Date().toISOString().split("T")[0];
+      this.selectedDateEnd = todayLocalYmd();
     }
     dateEndInput.value = this.selectedDateEnd;
     dateEndInput.onchange = () => {
@@ -168,7 +180,7 @@ export class TimelineView extends ItemView {
     const spaceSection = filtersContainer.createDiv({ cls: "rslatte-stats-filter-section" });
     const spaceLabelRow = spaceSection.createDiv({ cls: "rslatte-stats-filter-label-row" });
     const spaceLabel = spaceLabelRow.createDiv({ cls: "rslatte-stats-filter-label rslatte-stats-collapsible-label" });
-    const spaceToggle = spaceLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.spaceSectionCollapsed ? "▶" : "▼" });
+    spaceLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.spaceSectionCollapsed ? "▶" : "▼" });
     spaceLabel.createSpan({ text: "空间筛选" });
     spaceLabel.onclick = () => {
       this.spaceSectionCollapsed = !this.spaceSectionCollapsed;
@@ -177,6 +189,7 @@ export class TimelineView extends ItemView {
     spaceLabel.style.cursor = "pointer";
     
     const spaces = workEventReader.getSpaces();
+    this.ensureTimelineSpacesDefaultSelected(spaces);
 
     // 全选：[勾选项] 形式
     const spaceActions = spaceLabelRow.createDiv({ cls: "rslatte-stats-filter-actions" });
@@ -243,7 +256,7 @@ export class TimelineView extends ItemView {
     const moduleSection = filtersContainer.createDiv({ cls: "rslatte-stats-filter-section" });
     const moduleLabelRow = moduleSection.createDiv({ cls: "rslatte-stats-filter-label-row" });
     const moduleLabel = moduleLabelRow.createDiv({ cls: "rslatte-stats-filter-label rslatte-stats-collapsible-label" });
-    const moduleToggle = moduleLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.moduleSectionCollapsed ? "▶" : "▼" });
+    moduleLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.moduleSectionCollapsed ? "▶" : "▼" });
     moduleLabel.createSpan({ text: "模块筛选" });
     moduleLabel.onclick = () => {
       this.moduleSectionCollapsed = !this.moduleSectionCollapsed;
@@ -324,7 +337,7 @@ export class TimelineView extends ItemView {
     const actionSection = filtersContainer.createDiv({ cls: "rslatte-stats-filter-section" });
     const actionLabelRow = actionSection.createDiv({ cls: "rslatte-stats-filter-label-row" });
     const actionLabel = actionLabelRow.createDiv({ cls: "rslatte-stats-filter-label rslatte-stats-collapsible-label" });
-    const actionToggle = actionLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.actionSectionCollapsed ? "▶" : "▼" });
+    actionLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.actionSectionCollapsed ? "▶" : "▼" });
     actionLabel.createSpan({ text: "操作类型筛选" });
     actionLabel.onclick = () => {
       this.actionSectionCollapsed = !this.actionSectionCollapsed;
@@ -335,6 +348,8 @@ export class TimelineView extends ItemView {
     const actionLabels: Record<WorkEventAction, string> = {
       create: "创建",
       update: "更新",
+      publish: "发布",
+      recall: "打回",
       status: "状态变更",
       delete: "删除",
       archive: "归档",
@@ -346,7 +361,7 @@ export class TimelineView extends ItemView {
       continued: "继续",
     };
     
-    const allActions: WorkEventAction[] = ["create", "update", "status", "delete", "archive", "cancelled", "done", "start","recover","paused","continued"];
+    const allActions: WorkEventAction[] = ["create", "update", "publish", "recall", "status", "delete", "archive", "cancelled", "done", "start","recover","paused","continued"];
     
     // 全选：[勾选项] 形式
     const actionActions = actionLabelRow.createDiv({ cls: "rslatte-stats-filter-actions" });
@@ -390,7 +405,7 @@ export class TimelineView extends ItemView {
     const sourceSection = filtersContainer.createDiv({ cls: "rslatte-stats-filter-section" });
     const sourceLabelRow = sourceSection.createDiv({ cls: "rslatte-stats-filter-label-row" });
     const sourceLabel = sourceLabelRow.createDiv({ cls: "rslatte-stats-filter-label rslatte-stats-collapsible-label" });
-    const sourceToggle = sourceLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.sourceSectionCollapsed ? "▶" : "▼" });
+    sourceLabel.createSpan({ cls: "rslatte-stats-collapse-icon", text: this.sourceSectionCollapsed ? "▶" : "▼" });
     sourceLabel.createSpan({ text: "事件来源筛选" });
     sourceLabel.onclick = () => {
       this.sourceSectionCollapsed = !this.sourceSectionCollapsed;
@@ -402,10 +417,9 @@ export class TimelineView extends ItemView {
       ui: "用户操作",
       auto: "自动",
       reconcile: "数据同步",
-      mobile: "手机",
     };
     
-    const allSources: WorkEventSource[] = ["ui", "auto", "reconcile", "mobile"];
+    const allSources: WorkEventSource[] = ["ui", "auto", "reconcile"];
     
     // 全选：[勾选项] 形式
     const sourceActions = sourceLabelRow.createDiv({ cls: "rslatte-stats-filter-actions" });
@@ -540,7 +554,7 @@ export class TimelineView extends ItemView {
         }
         
         // 事件来源筛选（如果没有 source 字段，默认为 "ui"）
-        const eventSource: WorkEventSource = event.source || "ui";
+        const eventSource = normalizeWorkEventSource(event.source);
         if (!selectedSourceArray.includes(eventSource)) {
           return false;
         }
@@ -637,24 +651,19 @@ export class TimelineView extends ItemView {
     const moduleIcon = this.getModuleIcon(event);
     dot.setText(moduleIcon);
     
-    // 获取模块颜色（用于横线）
-    const moduleColor = getModuleColor(event.kind, this.plugin.settings);
-    
     // 连续的时间轴纵向线（隐藏，使用容器级别的线）
     gutter.createDiv({ cls: "rslatte-timeline-line rslatte-stats-timeline-line" });
 
-    // 右侧内容
-    const content = row.createDiv({ cls: "rslatte-timeline-content" });
-    content.style.backgroundColor = this.hexToRgba(spaceBgColor, 0.5);
-    content.style.borderColor = spaceBgColor;
+    // 右侧内容：空间用左侧色条（--rslatte-space-accent）区分，不用整卡铺色
+    const content = row.createDiv({ cls: "rslatte-timeline-content rslatte-stats-timeline-content" });
+    content.style.setProperty("--rslatte-space-accent", this.pickSpaceStripeColor(spaceBgColor));
+    if (spaceName) content.title = `空间：${spaceName}`;
 
     // 标题行
     const titleRow = content.createDiv({ cls: "rslatte-timeline-title-row rslatte-task-row" });
     
     // 事件标题容器（不再包含空间标签）
     const title = titleRow.createDiv({ cls: "rslatte-timeline-text rslatte-task-title" });
-    title.style.fontWeight="300";
-    title.style.fontSize="12px";
     // 提取并显示内容
     const displayText = this.extractDisplayText(event);
     title.appendText(displayText);
@@ -665,7 +674,7 @@ export class TimelineView extends ItemView {
     const timeStr = eventDate.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
     const kindLabel = this.getKindLabel(event.kind);
     const actionLabel = this.getActionLabel(event.action);
-    const sourceLabel = this.getSourceLabel(event.source || "ui");
+    const sourceLabel = this.getSourceLabel(normalizeWorkEventSource(event.source));
     meta.textContent = `${timeStr} · ${kindLabel} · ${actionLabel} · ${spaceName} · ${sourceLabel}`;
   }
 
@@ -675,7 +684,6 @@ export class TimelineView extends ItemView {
       ui: "用户操作",
       auto: "自动",
       reconcile: "数据同步",
-      mobile: "手机",
     };
     return labels[source] ?? source;
   }
@@ -689,6 +697,9 @@ export class TimelineView extends ItemView {
           break;
         case "finance":
           await this.plugin.activateFinanceView();
+          break;
+        case "health":
+          await this.plugin.activateHealthView();
           break;
         case "task":
           await this.plugin.activateTaskView();
@@ -705,8 +716,12 @@ export class TimelineView extends ItemView {
           await this.plugin.activateContactsView();
           break;
         case "memo":
-          // memo 可能显示在任务视图中，或者使用 RSLatte 视图
+        case "schedule":
+          // 提醒/日程在任务侧栏
           await this.plugin.activateTaskView();
+          break;
+        case "capture":
+          await this.plugin.activateCaptureView();
           break;
         default:
           // 其他类型（file, sync等）不跳转或跳转到 Hub
@@ -718,22 +733,30 @@ export class TimelineView extends ItemView {
     }
   }
 
-  /** 将十六进制颜色转换为rgba格式 */
-  private hexToRgba(hex: string, alpha: number): string {
-    // 移除 # 号
-    hex = hex.replace("#", "");
-    
-    // 如果是3位颜色，扩展为6位
-    if (hex.length === 3) {
-      hex = hex.split("").map(char => char + char).join("");
-    }
-    
-    // 转换为RGB
-    const r = parseInt(hex.substring(0, 2), 16);
-    const g = parseInt(hex.substring(2, 4), 16);
-    const b = parseInt(hex.substring(4, 6), 16);
-    
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  /** 解析 #RGB / #RRGGBB，失败返回 null */
+  private parseHexToRgb(hex: string): { r: number; g: number; b: number } | null {
+    let h = hex.replace(/^#/, "").trim();
+    if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+    if (h.length !== 6) return null;
+    const r = parseInt(h.slice(0, 2), 16);
+    const g = parseInt(h.slice(2, 4), 16);
+    const b = parseInt(h.slice(4, 6), 16);
+    if ([r, g, b].some((n) => Number.isNaN(n))) return null;
+    return { r, g, b };
+  }
+
+  /**
+   * 操作日志卡片左侧条颜色：过浅则改用主题强调色，避免与浅色背景糊成一片。
+   */
+  private pickSpaceStripeColor(hex: string): string {
+    const raw = (hex || "").trim();
+    if (!raw) return "var(--interactive-accent)";
+    const norm = raw.startsWith("#") ? raw : `#${raw}`;
+    const rgb = this.parseHexToRgb(norm);
+    if (!rgb) return "var(--interactive-accent)";
+    const lum = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
+    if (lum >= 0.88) return "var(--interactive-accent)";
+    return norm;
   }
 
   /** 从事件中提取显示文本 */
@@ -773,7 +796,11 @@ export class TimelineView extends ItemView {
           }
           return ref.task_id || "项目任务";
         case "memo":
-          return ref.text || ref.memo_id || "备忘";
+          return ref.text || ref.memo_id || "提醒";
+        case "schedule":
+          return ref.text || "日程";
+        case "capture":
+          return ref.text || ref.summary_hint || "快速记录";
         case "finance":
           const amount = ref.amount;
           const category = ref.category_name || ref.category_id;
@@ -855,9 +882,12 @@ export class TimelineView extends ItemView {
     const defaultNames: Record<WorkEventKind, string> = {
       checkin: "打卡",
       finance: "财务",
+      health: "健康",
       task: "任务",
       projecttask: "项目任务",
-      memo: "备忘",
+      memo: "提醒",
+      schedule: "日程",
+      capture: "快速记录",
       contact: "联系人",
       project: "项目",
       milestone: "里程碑",
@@ -877,9 +907,12 @@ export class TimelineView extends ItemView {
     const defaultLabels: Record<WorkEvent["kind"], string> = {
       checkin: "打卡",
       finance: "财务",
+      health: "健康",
       task: "任务",
       projecttask: "项目任务",
-      memo: "备忘",
+      memo: "提醒",
+      schedule: "日程",
+      capture: "快速记录",
       contact: "联系人",
       project: "项目",
       milestone: "里程碑",
@@ -896,6 +929,8 @@ export class TimelineView extends ItemView {
     const actionLabels: Record<WorkEventAction, string> = {
       create: "创建",
       update: "更新",
+      publish: "发布",
+      recall: "打回",
       status: "状态变更",
       delete: "删除",
       archive: "归档",
@@ -934,6 +969,10 @@ export class TimelineView extends ItemView {
         return "▶";
       case "memo":
         return "📝";
+      case "schedule":
+        return "📅";
+      case "capture":
+        return "✍";
       case "finance":
         return "💰";
       case "project":
@@ -941,6 +980,8 @@ export class TimelineView extends ItemView {
       case "milestone":
         return "🎯";
       case "output":
+        if (event.action === "publish") return "📚";
+        if (event.action === "recall") return "↩";
         return "📄";
       case "contact":
         return "👤";

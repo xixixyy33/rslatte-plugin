@@ -14,12 +14,14 @@
 export type RSLatteModuleKey =
   | "task"
   | "memo"
+  | "schedule"
   | "checkin"
   | "finance"
+  | "health"
   | "project"
   | "output"
   | "contacts"
-  | "publish";
+  | "knowledge";
 
 /**
  * 锁 key：最终用于 Map key 的字符串。
@@ -33,16 +35,15 @@ export type RSLatteLockKey = string;
 export type RSLatteLockGroup = RSLatteModuleKey | "record";
 
 /**
- * 刷新/构建模式
- * - auto   ：增量，不 reconcile
- * - manual ：增量 + reconcile（门控）
- * - rebuild：全量 + reconcile（门控）+ 归档范围外
+ * 刷新/构建模式（与 `gates.evaluateReconcileGate`、`pipelineEngine.runE2` 一致）
+ * - auto / auto_refresh：定时增量；不触发 reconcile（规则 0）
+ * - manual_refresh：侧栏/命令「手动刷新」；phase=incremental；门控通过时可 atomic reconcile 与 P6 archiveOutOfRange
+ * - rebuild：全量重建；门控通过时可 reconcile 与归档
  */
 export type RSLattePipelineMode =
   | "auto"
   | "auto_refresh"
   | "auto_archive"
-  | "manual"
   | "manual_refresh"
   | "manual_archive"
   | "rebuild";

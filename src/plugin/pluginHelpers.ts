@@ -3,7 +3,7 @@ import { moment } from "obsidian";
 const momentFn = moment as any;
 import type RSLattePlugin from "../main";
 import { DEFAULT_SETTINGS } from "../constants/defaults";
-import { resolveCentralRootDir, resolveSpaceBaseDir, resolveSpaceIndexDir, resolveSpaceQueueDir, resolveSpaceStatsDir, resolveSpaceEventsDir } from "../services/spaceContext";
+import { resolveCentralRootDir, resolveSpaceBaseDir, resolveSpaceIndexDir, resolveSpaceQueueDir, resolveSpaceStatsDir, resolveSpaceEventsDir } from "../services/space/spaceContext";
 import type { DailyState } from "../types/rslatteTypes";
 /**
  * 插件辅助工具方法
@@ -39,6 +39,10 @@ export function createPluginHelpers(plugin: RSLattePlugin) {
 
     getTodayKey(): string {
       return momentFn().format("YYYY-MM-DD");
+    },
+
+    getYesterdayKey(): string {
+      return momentFn().subtract(1, "day").format("YYYY-MM-DD");
     },
 
     getOrCreateTodayState(): DailyState {

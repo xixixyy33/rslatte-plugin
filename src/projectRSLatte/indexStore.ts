@@ -1,49 +1,14 @@
 import { App, normalizePath } from "obsidian";
 import type { ProjectRSLatteArchiveMap, ProjectRSLatteIndexFile, ProjectRSLatteIndexItem, ProjectSyncQueueFile } from "./types";
-import { safeJsonParse, toIsoNow } from "../taskRSLatte/utils";
+import { toIsoNow } from "../taskRSLatte/utils";
+import {
+  ensureFolderChain,
+  pathExistsVaultOrAdapter,
+  readJsonVaultFirst,
+  writeJsonRaceSafe,
+} from "../internal/indexJsonIo";
 
-async function ensureFolder(app: App, path: string): Promise<void> {
-  const p = normalizePath(path);
-  if (!p) return;
-  const exists = await app.vault.adapter.exists(p);
-  if (exists) return;
-  // create parent first
-  const parts = p.split("/");
-  let cur = "";
-  for (const part of parts) {
-    cur = cur ? `${cur}/${part}` : part;
-    const e = await app.vault.adapter.exists(cur);
-    if (!e) await app.vault.adapter.mkdir(cur);
-  }
-}
-
-async function readTextFile(app: App, path: string, fallback: string = ""): Promise<string> {
-  const p = normalizePath(path);
-  if (!p) return fallback;
-  try {
-    const ok = await app.vault.adapter.exists(p);
-    if (!ok) return fallback;
-    return await app.vault.adapter.read(p);
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeTextFile(app: App, path: string, content: string): Promise<void> {
-  const p = normalizePath(path);
-  await ensureFolder(app, p.split("/").slice(0, -1).join("/"));
-  await app.vault.adapter.write(p, content ?? "");
-}
-
-async function readJsonFile<T>(app: App, path: string, fallback: T): Promise<T> {
-  const txt = await readTextFile(app, path, "");
-  if (!txt) return fallback;
-  return safeJsonParse<T>(txt, fallback);
-}
-
-async function writeJsonFile(app: App, path: string, obj: any): Promise<void> {
-  await writeTextFile(app, path, JSON.stringify(obj ?? {}, null, 2));
-}
+const PROJECT_INDEX_IO_CTX = { label: "ProjectIndexStore" } as const;
 
 export class ProjectIndexStore {
   private app: App;
@@ -57,7 +22,7 @@ export class ProjectIndexStore {
   }
 
   public getBaseDir(): string {
-    return normalizePath((this.indexDir || "").trim() || "95-Tasks/.rslatte");
+    return normalizePath((this.indexDir || "").trim() || "00-System/.rslatte");
   }
 
   public getQueueDir(): string {
@@ -77,9 +42,9 @@ export class ProjectIndexStore {
 
   public async ensureLayout(): Promise<void> {
     const dir = this.getBaseDir();
-    await ensureFolder(this.app, dir);
-    await ensureFolder(this.app, `${dir}/archive`);
-    await ensureFolder(this.app, this.getQueueDir());
+    await ensureFolderChain(this.app, dir, PROJECT_INDEX_IO_CTX);
+    await ensureFolderChain(this.app, `${dir}/archive`, PROJECT_INDEX_IO_CTX);
+    await ensureFolderChain(this.app, this.getQueueDir(), PROJECT_INDEX_IO_CTX);
   }
 
   public indexPath(): string {
@@ -101,25 +66,26 @@ export class ProjectIndexStore {
   public async readIndex(): Promise<ProjectRSLatteIndexFile> {
     const p = this.indexPath();
     const fallback: ProjectRSLatteIndexFile = { version: 1, updatedAt: toIsoNow(), items: [] };
-    try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile<ProjectRSLatteIndexFile>(this.app, p, fallback);
-    } catch {
-      // ignore
+    if (await pathExistsVaultOrAdapter(this.app, p)) {
+      return readJsonVaultFirst<ProjectRSLatteIndexFile>(this.app, p, fallback);
     }
     const legacyRoot = this.getLegacyRootDir();
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/project-index.json`);
-      try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile<ProjectRSLatteIndexFile>(this.app, legacyPath, fallback);
-      } catch {
-        // ignore
+      if (await pathExistsVaultOrAdapter(this.app, legacyPath)) {
+        return readJsonVaultFirst<ProjectRSLatteIndexFile>(this.app, legacyPath, fallback);
       }
     }
     return fallback;
   }
 
   public async writeIndex(items: ProjectRSLatteIndexItem[]): Promise<void> {
-    await writeJsonFile(this.app, this.indexPath(), { version: 1, updatedAt: toIsoNow(), items: items ?? [] });
+    await writeJsonRaceSafe(
+      this.app,
+      this.indexPath(),
+      { version: 1, updatedAt: toIsoNow(), items: items ?? [] },
+      PROJECT_INDEX_IO_CTX
+    );
   }
 
   /** Patch a single index item in-place (used to record DB sync status) */
@@ -138,30 +104,35 @@ export class ProjectIndexStore {
   public async readArchiveMap(): Promise<ProjectRSLatteArchiveMap> {
     const p = this.archiveMapPath();
     const fallback: ProjectRSLatteArchiveMap = { version: 1, updatedAt: toIsoNow(), map: {} };
-    try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile<ProjectRSLatteArchiveMap>(this.app, p, fallback);
-    } catch {
-      // ignore
+    if (await pathExistsVaultOrAdapter(this.app, p)) {
+      return readJsonVaultFirst<ProjectRSLatteArchiveMap>(this.app, p, fallback);
     }
     const legacyRoot = this.getLegacyRootDir();
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/project-archive-map.json`);
-      try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile<ProjectRSLatteArchiveMap>(this.app, legacyPath, fallback);
-      } catch {
-        // ignore
+      if (await pathExistsVaultOrAdapter(this.app, legacyPath)) {
+        return readJsonVaultFirst<ProjectRSLatteArchiveMap>(this.app, legacyPath, fallback);
       }
     }
     return fallback;
   }
 
   public async writeArchiveMap(map: Record<string, string>): Promise<void> {
-    await writeJsonFile(this.app, this.archiveMapPath(), { version: 1, updatedAt: toIsoNow(), map: map ?? {} });
+    await writeJsonRaceSafe(
+      this.app,
+      this.archiveMapPath(),
+      { version: 1, updatedAt: toIsoNow(), map: map ?? {} },
+      PROJECT_INDEX_IO_CTX
+    );
   }
 
   public async appendToArchive(monthKey: string, items: ProjectRSLatteIndexItem[]): Promise<number> {
     const p = this.archivePath(monthKey);
-    const existed = await readJsonFile<ProjectRSLatteIndexFile>(this.app, p, { version: 1, updatedAt: toIsoNow(), items: [] });
+    const existed = await readJsonVaultFirst<ProjectRSLatteIndexFile>(this.app, p, {
+      version: 1,
+      updatedAt: toIsoNow(),
+      items: [],
+    });
     const seen = new Set<string>();
     for (const it of existed.items ?? []) {
       const id = String((it as any)?.project_id ?? "");
@@ -177,31 +148,32 @@ export class ProjectIndexStore {
     }
     if (!toAdd.length) return 0;
     const merged = [...(existed.items ?? []), ...toAdd];
-    await writeJsonFile(this.app, p, { version: 1, updatedAt: toIsoNow(), items: merged });
+    await writeJsonRaceSafe(this.app, p, { version: 1, updatedAt: toIsoNow(), items: merged }, PROJECT_INDEX_IO_CTX);
     return toAdd.length;
   }
 
   public async readQueue(): Promise<ProjectSyncQueueFile> {
     const p = this.queuePath();
     const fallback: ProjectSyncQueueFile = { version: 1, updatedAt: toIsoNow(), ops: [] };
-    try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile<ProjectSyncQueueFile>(this.app, p, fallback);
-    } catch {
-      // ignore
+    if (await pathExistsVaultOrAdapter(this.app, p)) {
+      return readJsonVaultFirst<ProjectSyncQueueFile>(this.app, p, fallback);
     }
     const legacyRoot = this.getLegacyRootDir();
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/project-sync-queue.json`);
-      try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile<ProjectSyncQueueFile>(this.app, legacyPath, fallback);
-      } catch {
-        // ignore
+      if (await pathExistsVaultOrAdapter(this.app, legacyPath)) {
+        return readJsonVaultFirst<ProjectSyncQueueFile>(this.app, legacyPath, fallback);
       }
     }
     return fallback;
   }
 
   public async writeQueue(ops: any[]): Promise<void> {
-    await writeJsonFile(this.app, this.queuePath(), { version: 1, updatedAt: toIsoNow(), ops: ops ?? [] });
+    await writeJsonRaceSafe(
+      this.app,
+      this.queuePath(),
+      { version: 1, updatedAt: toIsoNow(), ops: ops ?? [] },
+      PROJECT_INDEX_IO_CTX
+    );
   }
 }

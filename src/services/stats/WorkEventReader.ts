@@ -27,13 +27,13 @@ export class WorkEventReader {
   /** 获取中央索引目录 */
   private getCentralIndexDir(): string {
     const statsSettings = (this.settings as any)?.statsSettings;
-    return statsSettings?.centralIndexDir || this.settings.centralIndexDir || "95-Tasks/.rslatte";
+    return statsSettings?.centralIndexDir || this.settings.centralIndexDir || "00-System/.rslatte";
   }
 
   /** 解析 workevent 文件路径
    * 路径格式：{centralIndexDir}/{spaceId}/.events/work-events-{YYYYMM}.jsonl
    * 或：{centralIndexDir}/{spaceId}/events/work-events-{YYYYMM}.jsonl
-   * 例如：95-Tasks/.rslatte/00000000-0000-0000-0000-000000000000/.events/work-events-202601.jsonl
+   * 例如：00-System/.rslatte/00000000-0000-0000-0000-000000000000/.events/work-events-202601.jsonl
    */
   private getWorkEventPath(spaceId: string, monthKey: string): string {
     const centralDir = this.getCentralIndexDir();

@@ -245,6 +245,48 @@ export class NoteNavigator {
   }
 
   /**
+   * 打开笔记并滚动到指定行（1-based），不修改文件。
+   * 用于 Review 周报/月报子窗口等只读定位。
+   */
+  async openNoteAtLineViewOnly(path: string, lineNo1Based: number) {
+    const p = (path ?? "").trim();
+    if (!p) {
+      new Notice("未配置文件路径");
+      return;
+    }
+
+    const af = this.app.vault.getAbstractFileByPath(p);
+    if (!af || !(af instanceof TFile)) {
+      new Notice(`未找到文件：${p}`);
+      return;
+    }
+
+    const leaf = this.app.workspace.getLeaf(false);
+    await leaf.openFile(af, { active: true });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const view = leaf.view;
+    if (!(view instanceof MarkdownView)) {
+      new Notice("当前打开的不是 Markdown 文件，无法定位");
+      return;
+    }
+
+    const editor = view.editor;
+    const lines = editor.getValue().split("\n");
+    if (lines.length === 0) return;
+
+    let line0 = Math.max(0, Number(lineNo1Based ?? 1) - 1);
+    if (Number.isNaN(line0)) line0 = 0;
+    if (line0 >= lines.length) line0 = lines.length - 1;
+
+    editor.setCursor({ line: line0, ch: 0 });
+    editor.scrollIntoView(
+      { from: { line: Math.max(line0 - 2, 0), ch: 0 }, to: { line: line0 + 8, ch: 0 } },
+      true,
+    );
+  }
+
+  /**
    * 打开指定路径的 md 文件并定位到某一行附近；
    * 光标落点规则沿用你之前的要求：落在该段落内容的“末尾空行行首”（多空行取最后一个；没有则补一行空行）。
    *

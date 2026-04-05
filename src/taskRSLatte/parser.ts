@@ -1,5 +1,6 @@
 import type { RSLatteItemType, RSLatteParsedLine, RSLatteStatus } from "./types";
 import { fnv1a32 } from "../utils/hash";
+import { normalizeRepeatRuleToken, reconcileTaskDisplayPhase } from "./utils";
 
 const TASK_LINE_RE = /^\s*-\s*\[(.)\]\s+(.*)$/;
 
@@ -14,6 +15,10 @@ const TASK_LINE_RE = /^\s*-\s*\[(.)\]\s+(.*)$/;
 // before comparing icons.
 const DATE_TOKEN_RE = /(📅\uFE0F?|➕\uFE0F?|✅\uFE0F?|❌\uFE0F?|🛫\uFE0F?|⏳\uFE0F?)\s*(\d{4}-\d{2}-\d{2}|\d{2}-\d{2})/gu;
 const REPEAT_TOKEN_RE = /\s*🔁\uFE0F?\s*([A-Za-z_]+)\b/gu;
+
+// 描述首字符标记：⭐、延期 **↪**（旧库曾用 ⏳ 作延期前缀，仍参与 strip）、复杂度 🧠|🍃。计划开始日仍用行尾 ⏳ YYYY-MM-DD，勿与延期混淆。
+export const TASK_DESC_PREFIX_STRIP_RE = /^(\s*)(⭐\uFE0F?)?(\s*)(↪\uFE0F?|⏳\uFE0F?)?(\s*)(🧠\uFE0F?|🍃\uFE0F?)?\s*/u;
+const DESC_PREFIX_RE = TASK_DESC_PREFIX_STRIP_RE;
 
 const RSLATTE_COMMENT_RE = /<!--\s*rslatte:([^>]*)-->/i;
 
@@ -169,10 +174,33 @@ function stripTokens(text: string): string {
   return t;
 }
 
+/** 去掉描述首字符标记 ⭐↪🧠🍃（↪ 为延期；兼容旧 ⏳ 延期前缀），返回纯描述部分（不包含日期 token） */
+function stripDescPrefix(body: string): string {
+  return (body ?? "").replace(DESC_PREFIX_RE, "").trimStart();
+}
+
+/**
+ * 根据任务属性构建描述首字符标记（顺序：⭐ ↪ 🧠|🍃），写入任务行时使用；延期用 ↪，避免与计划开始 ⏳ 冲突
+ */
+export function buildDescPrefix(opts: {
+  starred?: boolean;
+  postpone_count?: number;
+  complexity?: string;
+}): string {
+  const parts: string[] = [];
+  if (opts.starred) parts.push("⭐");
+  if (opts.postpone_count != null && opts.postpone_count > 0) parts.push("↪");
+  if (opts.complexity === "high") parts.push("🧠");
+  else if (opts.complexity === "light") parts.push("🍃");
+  return parts.length ? parts.join("") + " " : "";
+}
+
 function normalizeItemType(s?: string): RSLatteItemType | null {
   const v = (s ?? "").trim().toLowerCase();
   if (v === "task") return "task";
   if (v === "memo") return "memo";
+  // 日程在存储上复用 memo 索引，但 meta.type 使用 schedule 以便语义区分。
+  if (v === "schedule") return "memo";
   return null;
 }
 
@@ -200,13 +228,14 @@ export function parseRSLatteLine(filePath: string, lineNo: number, rawLine: stri
 
   const uidStr = kv["uid"];
 
+  const bodyWithoutPrefix = stripDescPrefix(body);
   const parsed: RSLatteParsedLine = {
     itemType,
     uid: isValidUid(uidStr) ? String(uidStr) : undefined,
     filePath,
     lineNo,
     raw: rawLine,
-    text: stripTokens(body),
+    text: stripTokens(bodyWithoutPrefix),
     status: markToStatus(mark),
     sourceHash: "",
     rslatteComment: commentRaw || undefined,
@@ -220,18 +249,18 @@ export function parseRSLatteLine(filePath: string, lineNo: number, rawLine: stri
     const icon = String(dm[1] ?? "").replace(/\uFE0F/g, "");
     const val = dm[2];
 
-    if (icon === "➕" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.createdDate = val;
-    if (icon === "✅" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.doneDate = val;
-    if (icon === "❌" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.cancelledDate = val;
-    if (icon === "🛫" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.startDate = val;
-    if (icon === "⏳" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.scheduledDate = val;
+    if (icon === "➕" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.created_date = val;
+    if (icon === "✅" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.done_date = val;
+    if (icon === "❌" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.cancelled_date = val;
+    if (icon === "🛫" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.actual_start = val;
+    if (icon === "⏳" && /^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.planned_start = val;
 
     if (icon === "📅") {
       if (itemType === "memo") {
         if (/^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.memoDate = val;
         else if (/^\d{2}-\d{2}$/.test(val)) parsed.memoMmdd = val;
       } else {
-        if (/^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.dueDate = val;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(val)) parsed.planned_end = val;
       }
     }
   }
@@ -240,6 +269,9 @@ export function parseRSLatteLine(filePath: string, lineNo: number, rawLine: stri
   let rm: RegExpExecArray | null;
   while ((rm = REPEAT_TOKEN_RE.exec(bodyWithoutComment)) !== null) {
     parsed.repeatRule = (rm[1] ?? "").trim();
+  }
+  if (parsed.repeatRule) {
+    parsed.repeatRule = normalizeRepeatRuleToken(String(parsed.repeatRule).trim().toLowerCase());
   }
 
   // ✅ 解析额外的元数据（如 contact_file, contact_uid）存储到 extra 字段
@@ -296,17 +328,17 @@ export function parseRSLatteFile(
 
   /**
    * When v2 meta lines override itemType (task <-> memo), some fields parsed from the list line
-   * become inconsistent (e.g. 📅 parsed into dueDate when itemType was still "task").
+   * become inconsistent (e.g. 📅 parsed into planned_end when itemType was still "task").
    * Reconcile type-dependent fields after itemType is finalized.
    */
   const reconcileTypeDependentFields = (p: RSLatteParsedLine) => {
     const rr = String(p.repeatRule ?? "").trim().toLowerCase();
 
     if (p.itemType === "memo") {
-      // If the list line was initially treated as a task, 📅 would have been parsed into dueDate.
-      if (!p.memoDate && p.dueDate && /^\d{4}-\d{2}-\d{2}$/.test(p.dueDate)) {
-        p.memoDate = p.dueDate;
-        delete (p as any).dueDate;
+      // If the list line was initially treated as a task, 📅 would have been parsed into planned_end.
+      if (!p.memoDate && p.planned_end && /^\d{4}-\d{2}-\d{2}$/.test(p.planned_end)) {
+        p.memoDate = p.planned_end;
+        delete (p as any).planned_end;
       }
 
       // For yearly repeating memos, backend expects memo_mmdd (MM-DD). Derive it from memoDate.
@@ -316,9 +348,9 @@ export function parseRSLatteFile(
         }
       }
     } else {
-      // If meta line overrides back to task, ensure 📅 sits in dueDate.
-      if (!p.dueDate && p.memoDate && /^\d{4}-\d{2}-\d{2}$/.test(p.memoDate)) {
-        p.dueDate = p.memoDate;
+      // If meta line overrides back to task, ensure 📅 sits in planned_end.
+      if (!p.planned_end && p.memoDate && /^\d{4}-\d{2}-\d{2}$/.test(p.memoDate)) {
+        p.planned_end = p.memoDate;
       }
     }
   };
@@ -360,10 +392,61 @@ export function parseRSLatteFile(
 				if (!vv) continue;
 				parsed.extra[kk] = vv;
 			}
+			// meta type=schedule 在 core 中不落 extra，但 schedule-index 分桶依赖 extra.type
+			if (parsed.itemType === "memo") {
+				const rawT = String(kv["type"] ?? kv["rslatte:type"] ?? "").trim().toLowerCase();
+				if (rawT === "schedule") {
+					parsed.extra.type = "schedule";
+				}
+			}
+			// 通用扩展字段：任务/提醒都支持星标
+			const star = kv["starred"];
+			if (star === "1" || star === "true") parsed.starred = true;
+			else if (star === "0" || star === "false") parsed.starred = false;
+
+			// 任务扩展字段：从下一行 meta 写入顶层（第六节 snake_case）
+			if (parsed.itemType === "task") {
+				const phase = kv["task_phase"];
+				if (phase) parsed.task_phase = phase;
+				const note = kv["progress_note"];
+				if (note != null) parsed.progress_note = String(note).replace(/\u200B/g, " ");
+				const updated = kv["progress_updated"];
+				if (updated) parsed.progress_updated = updated;
+				const wait = kv["wait_until"];
+				if (wait) parsed.wait_until = wait;
+				const followUp = kv["follow_up"];
+				if (followUp && /^\d{4}-\d{2}-\d{2}$/.test(String(followUp))) parsed.follow_up = followUp;
+				const pc = kv["postpone_count"];
+				if (pc != null && /^\d+$/.test(String(pc))) parsed.postpone_count = Number(pc);
+				const origDue = kv["original_due"];
+				if (origDue) parsed.original_due = origDue;
+				const est = kv["estimate_h"];
+				if (est != null && /^[\d.]+$/.test(String(est))) parsed.estimate_h = Number(est);
+				const comp = kv["complexity"];
+				if (comp === "high" || comp === "normal" || comp === "light") parsed.complexity = comp;
+				const followUids = kv["follow_contact_uids"];
+				if (followUids && typeof followUids === "string") {
+					const arr = String(followUids).split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
+					if (arr.length) parsed.follow_contact_uids = arr;
+				}
+				const followNames = kv["follow_contact_name"];
+				if (followNames && typeof followNames === "string") {
+					const arr = String(followNames).split("|").map((s) => s.trim()).filter(Boolean);
+					if (arr.length) parsed.follow_contact_names = arr;
+				}
+				const imp = kv["importance_score"] ?? kv["importance"];
+				if (imp != null && /^\d+$/.test(String(imp))) parsed.importance_score = Number(imp);
+			}
 		}
 
     // After meta line merge, itemType may have changed (task <-> memo). Fix related fields.
     reconcileTypeDependentFields(parsed);
+    if (parsed.itemType === "task") {
+      parsed.task_phase = reconcileTaskDisplayPhase(parsed.status, parsed.task_phase, {
+        wait_until: parsed.wait_until,
+        follow_up: parsed.follow_up,
+      });
+    }
 
     // legacy inline comment kv (on task line)
     const inlineCommentMatch = raw.match(RSLATTE_COMMENT_RE);
@@ -415,7 +498,18 @@ export function parseRSLatteFile(
 
       // Fill meta kv
       metaKv["uid"] = uid;
-      metaKv["type"] = parsed.itemType;
+      const keepScheduleType = parsed.itemType === "memo"
+        && (
+          String(metaKv["type"] ?? "").trim().toLowerCase() === "schedule"
+          || String((parsed.extra ?? {})["cat"] ?? "").trim() === "schedule"
+          || String((parsed.extra ?? {})["type"] ?? "").trim().toLowerCase() === "schedule"
+        );
+      metaKv["type"] = keepScheduleType ? "schedule" : parsed.itemType;
+      if (parsed.itemType === "memo" && String(metaKv["type"] ?? "").trim().toLowerCase() === "schedule") {
+        parsed.extra = parsed.extra ?? {};
+        parsed.extra.type = "schedule";
+        delete metaKv["cat"];
+      }
       // merge legacy inline kv: only fill missing keys
       for (const k of Object.keys(inlineKv)) {
         const v = (inlineKv[k] ?? "").trim();

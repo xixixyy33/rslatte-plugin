@@ -125,6 +125,7 @@ export class AddCheckinItemModal extends Modal {
         id: this.newId,
         name: this.name,
         active: true,
+        checkinDifficulty: "normal",
         heatColor: undefined, // 默认绿色，不设置heatColor
       };
 

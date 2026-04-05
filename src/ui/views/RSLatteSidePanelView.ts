@@ -8,7 +8,23 @@ import { FinanceRecordModal } from "../modals/FinanceRecordModal";
 import { AddCheckinItemModal } from "../modals/AddCheckinItemModal";
 import { AddFinanceCategoryModal } from "../modals/AddFinanceCategoryModal";
 import { AddJournalPanelModal } from "../modals/AddJournalPanelModal";
+import { HealthCardModal } from "../modals/AddHealthRecordModal";
+import { EditHealthEntryModal } from "../modals/EditHealthEntryModal";
 import { createHeaderRow, appendDbSyncIndicator } from "../helpers/moduleHeader";
+import type { HealthRecordIndexItem } from "../../types/recordIndexTypes";
+import {
+  buildHealthCanonicalHeatPresence,
+  findLatestActiveHealthItemForCanonicalToday,
+  HEALTH_CANONICAL_METRICS_ORDER,
+  healthCanonicalShortLabelZh,
+  readHealthMetricsEnabledForUi,
+  type HealthCanonicalMetricKey,
+} from "../../services/health/healthCanonicalMetrics";
+import {
+  CHECKIN_DIFFICULTY_LABELS,
+  checkinDifficultyEmojiOnly,
+  normalizeCheckinDifficulty,
+} from "../../types/rslatteTypes";
 
 export class RSLatteSidePanelView extends ItemView {
   private plugin: RSLattePlugin;
@@ -20,14 +36,15 @@ export class RSLatteSidePanelView extends ItemView {
   }
 
   getViewType(): string { return VIEW_TYPE_RSLATTE; }
-  getDisplayText(): string { return "今日检查"; }
+  getDisplayText(): string { return "今日打卡"; }
   getIcon(): string { return "calendar-check"; }
 
   async onOpen() {
     // Step E1：按模块开关决定是否初始化（避免关闭模块仍访问后端）
     const checkinEnabled = this.plugin.isPipelineModuleEnabled("checkin");
     const financeEnabled = this.plugin.isPipelineModuleEnabled("finance");
-    if (!checkinEnabled && !financeEnabled) {
+    const healthEnabled = this.plugin.isHealthModuleEnabled();
+    if (!checkinEnabled && !financeEnabled && !healthEnabled) {
       void this.render();
       return;
     }
@@ -39,6 +56,14 @@ export class RSLatteSidePanelView extends ItemView {
     void this.render();
   }
   async onClose() { }
+
+  /** 今日打卡侧栏内滚动到打卡 / 财务 / 今日日记分区 */
+  public scrollToInspectSection(which: "checkin" | "finance" | "health" | "journal"): void {
+    const root = this.containerEl.children[1] as HTMLElement | undefined;
+    if (!root) return;
+    const el = root.querySelector(`[data-rslatte-inspect="${which}"]`) as HTMLElement | null;
+    el?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
 
   /**
    * Checklist 模式：不弹窗，直接切换"今日"打卡状态。
@@ -58,10 +83,11 @@ export class RSLatteSidePanelView extends ItemView {
     const todayState = this.plugin.getOrCreateTodayState();
     const container = this.containerEl.children[1];
     container.empty();
+
     // Step E1：模块开关（与 Engine 一致）
     const checkinEnabled = this.plugin.isPipelineModuleEnabled("checkin");
     const financeEnabled = this.plugin.isPipelineModuleEnabled("finance");
-
+    const healthEnabled = this.plugin.isHealthModuleEnabled();
 
     const checkins = this.plugin.settings.checkinItems.filter((x) => x.active);
     const finance = this.plugin.settings.financeCategories.filter((x) => x.active);
@@ -74,30 +100,19 @@ export class RSLatteSidePanelView extends ItemView {
       if (this.plugin.recordRSLatte) {
         const cSnap = await this.plugin.recordRSLatte.getCheckinSnapshot(false);
         checkinIndexItems = (cSnap?.items ?? []) as any[];
-        
-        // ✅ 优先使用财务统计缓存（包含全量数据，不受归档影响）
-        // 如果缓存不存在或为空，则回退到主索引
-        try {
-          const statsCache = await this.plugin.recordRSLatte.getFinanceStatsCache();
-          if (statsCache?.items && statsCache.items.length > 0) {
-            financeIndexItems = statsCache.items as any[];
-          } else {
-            // 回退到主索引
-            const fSnap = await this.plugin.recordRSLatte.getFinanceSnapshot(false);
-            financeIndexItems = (fSnap?.items ?? []) as any[];
-          }
-        } catch {
-          // 如果获取缓存失败，回退到主索引
-          const fSnap = await this.plugin.recordRSLatte.getFinanceSnapshot(false);
-          financeIndexItems = (fSnap?.items ?? []) as any[];
-        }
+
+        // 仅主索引（active）：归档阈值 ≥90 天，今日打卡展示的当月/上月/本年汇总均在近期，一般仍在 active；与财务侧栏「清单」同源，避免再走统计缓存分支
+        const fSnap = await this.plugin.recordRSLatte.getFinanceSnapshot(false);
+        financeIndexItems = (fSnap?.items ?? []) as any[];
       }
     } catch {
       // ignore
     }
 
+    // 并发 render：若期间又触发了新的 render，本帧已为过期，勿再向 container 追加（否则会叠两套「今日打卡」）
+    if (seq !== this._renderSeq) return;
 
-    // 今日检查标题
+    // 今日打卡标题
     const todayCheckSection = container.createDiv({ cls: "rslatte-section" });
     const { left: todayCheckLeft, right: todayCheckActions } = createHeaderRow(
       todayCheckSection,
@@ -105,7 +120,7 @@ export class RSLatteSidePanelView extends ItemView {
       "rslatte-section-title-left",
       "rslatte-task-actions",
     );
-    todayCheckLeft.createEl("h3", { text: "🔍 今日检查" });
+    todayCheckLeft.createEl("h3", { text: "🔍 今日打卡" });
     
     // 统一刷新按钮（刷新打卡、财务和今日日记）
     const unifiedRefreshBtn = todayCheckActions.createEl("button", { text: "🔄", cls: "rslatte-icon-btn" });
@@ -116,6 +131,7 @@ export class RSLatteSidePanelView extends ItemView {
         // 刷新打卡（不触发 render，只执行刷新逻辑）
         if (checkinEnabled) {
           await this.manualRefreshWithoutRender({ checkin: true, finance: false }, "打卡");
+          try { await this.plugin.recomputeCheckinContinuousDaysFromIndex?.(); } catch { }
         }
         // 刷新财务（不触发 render，只执行刷新逻辑）
         if (financeEnabled) {
@@ -136,6 +152,7 @@ export class RSLatteSidePanelView extends ItemView {
     if (checkinEnabled) {
     // ===== 打卡 =====
     const checkinSection = container.createDiv({ cls: "rslatte-section" });
+    checkinSection.setAttribute("data-rslatte-inspect", "checkin");
     const { left: ckLeft, right: ckActions } = createHeaderRow(
       checkinSection,
       "rslatte-section-title-row",
@@ -168,7 +185,7 @@ export class RSLatteSidePanelView extends ItemView {
         const done = !!todayState.checkinsDone[item.id];
 
         if (checkinStyle === "checklist") {
-          // Checklist style: [ ] Name .......... (30d count)
+          // Checklist style: [ ] Name（右上角连续天数角标）难度icon …… (30d count)
           const row = checkinList.createDiv({ cls: "rslatte-checklist-row" });
           const left = row.createDiv({ cls: "rslatte-checklist-left" });
 
@@ -181,7 +198,23 @@ export class RSLatteSidePanelView extends ItemView {
             void this.toggleCheckinQuick(item);
           });
 
-          left.createEl("span", { text: item.name, cls: done ? "rslatte-checklist-name is-done" : "rslatte-checklist-name" });
+          const nameWrap = left.createSpan({ cls: "rslatte-checkin-btn-wrap" });
+          nameWrap.createEl("span", { text: item.name, cls: done ? "rslatte-checklist-name is-done" : "rslatte-checklist-name" });
+          const streakCk = Math.max(0, item.continuousDays ?? 0);
+          if (streakCk > 0) {
+            const b = nameWrap.createSpan({
+              cls: "rslatte-checkin-streak-badge",
+              text: streakCk > 99 ? "99+" : String(streakCk),
+            });
+            b.title = "已连续打卡天数";
+          }
+
+          const ckDiffSlot = left.createDiv({ cls: "rslatte-checkin-diff-slot" });
+          ckDiffSlot.createSpan({
+            cls: "rslatte-checkin-diff-icon",
+            text: checkinDifficultyEmojiOnly((item as any).checkinDifficulty),
+          });
+
           row.addEventListener("click", () => { void this.toggleCheckinQuick(item); });
 
           const right = row.createDiv({ cls: "rslatte-checklist-right" });
@@ -189,13 +222,36 @@ export class RSLatteSidePanelView extends ItemView {
           const cntEl = right.createEl("span", { text: String(cnt), cls: "rslatte-checklist-count" });
           cntEl.title = `过去30天打卡次数：${cnt}`;
         } else {
-          // Button style: button + 30-day heatmap
+          // Button style：按钮（右上角连续天数角标）+ 难度 icon + 30 天热力图
           const row = checkinList.createDiv({ cls: "rslatte-record-row" });
-          const btn = row.createEl("button", {
+          const diff = normalizeCheckinDifficulty((item as any).checkinDifficulty);
+
+          const wrap = row.createSpan({ cls: "rslatte-checkin-btn-wrap" });
+          const btn = wrap.createEl("button", {
             text: item.name,
             cls: done ? "rslatte-btn done" : "rslatte-link",
           });
-          btn.onclick = async () => { new CheckinModal(this.app, this.plugin, item).open(); };
+          btn.title =
+            diff === "normal" ? item.name : `${item.name}（${CHECKIN_DIFFICULTY_LABELS[diff]}）`;
+          btn.onclick = async (ev) => {
+            ev.stopPropagation();
+            new CheckinModal(this.app, this.plugin, item).open();
+          };
+
+          const streakBtn = Math.max(0, item.continuousDays ?? 0);
+          if (streakBtn > 0) {
+            const b = wrap.createSpan({
+              cls: "rslatte-checkin-streak-badge",
+              text: streakBtn > 99 ? "99+" : String(streakBtn),
+            });
+            b.title = "已连续打卡天数";
+          }
+
+          const diffSlot = row.createDiv({ cls: "rslatte-checkin-diff-slot" });
+          diffSlot.createSpan({
+            cls: "rslatte-checkin-diff-icon",
+            text: checkinDifficultyEmojiOnly((item as any).checkinDifficulty),
+          });
 
           // 过去 30 天热力图（一天一个字符）
           this.renderCheckinHeatmap(row, item.id, checkinIndexItems, todayKey);
@@ -210,6 +266,7 @@ export class RSLatteSidePanelView extends ItemView {
     if (financeEnabled) {
     // ===== 财务 =====
     const financeSection = container.createDiv({ cls: "rslatte-section" });
+    financeSection.setAttribute("data-rslatte-inspect", "finance");
     const { left: finLeft, right: finActions } = createHeaderRow(
       financeSection,
       "rslatte-section-title-row",
@@ -268,16 +325,25 @@ export class RSLatteSidePanelView extends ItemView {
       for (const catData of sortedCategories) {
         const cat = catData.category;
         // 检查今日是否有记录
-        const existing = this.plugin.getTodayFinanceRecord(cat.id);
-        const done = !!(existing && (existing as any).is_delete === false);
+        const todayRows = this.plugin.getTodayFinanceRecords(cat.id).filter((r: any) => !r.is_delete);
+        const done = todayRows.length > 0;
         const btnCls = `rslatte-btn ${done ? 'done' : 'todo'}`;
         
-        // 左分区：按钮
+        // 左分区：按钮（角标：今日该分类有效笔数）
         const btnRow = leftColumn.createDiv({ cls: "rslatte-finance-btn-row" });
-        const btn = btnRow.createEl("button", { 
+        const wrap = btnRow.createSpan({ cls: "rslatte-finance-btn-wrap" });
+        const btn = wrap.createEl("button", { 
           text: catData.name, 
           cls: btnCls 
         });
+        if (todayRows.length > 0) {
+          const n = todayRows.length;
+          wrap.createSpan({
+            cls: "rslatte-finance-count-badge",
+            text: n > 99 ? "99+" : String(n),
+          });
+        }
+        btn.title = done ? `今日已记 ${todayRows.length} 笔，点击查看或新增` : "点击记账";
         btn.onclick = () => new FinanceRecordModal(this.app, this.plugin, cat).open();
 
         // 右分区：色条或收入标记
@@ -320,9 +386,66 @@ export class RSLatteSidePanelView extends ItemView {
 
     }
 
+    if (healthEnabled) {
+      const healthSection = container.createDiv({ cls: "rslatte-section" });
+      healthSection.setAttribute("data-rslatte-inspect", "health");
+      const { left: hthLeft, right: hthActions } = createHeaderRow(
+        healthSection,
+        "rslatte-section-title-row",
+        "rslatte-section-title-left",
+        "rslatte-task-actions",
+      );
+      hthLeft.createEl("h3", { text: "❤️ 健康" });
+      const openHealthBtn = hthActions.createEl("button", { text: "📋", cls: "rslatte-icon-btn" });
+      openHealthBtn.title = "打开健康管理侧栏";
+      openHealthBtn.onclick = () => void (this.plugin as any).activateHealthView?.();
+      const healthDetail = container.createDiv({ cls: "rslatte-section rslatte-health-inspect-detail" });
+
+      let healthItems: HealthRecordIndexItem[] = [];
+      try {
+        await this.plugin.recordRSLatte?.ensureReady?.();
+        const hs = await this.plugin.recordRSLatte?.getHealthSnapshot(false);
+        healthItems = (hs?.items ?? []) as HealthRecordIndexItem[];
+      } catch {
+        healthItems = [];
+      }
+      if (seq !== this._renderSeq) return;
+
+      const en = readHealthMetricsEnabledForUi((this.plugin.settings as any).healthPanel);
+      for (const canonical of HEALTH_CANONICAL_METRICS_ORDER) {
+        if (!en[canonical]) continue;
+        const row = healthDetail.createDiv({ cls: "rslatte-health-inspect-row" });
+        const todayItem = findLatestActiveHealthItemForCanonicalToday(healthItems, canonical, todayKey);
+        const done = !!todayItem;
+        const lab = healthCanonicalShortLabelZh(canonical);
+        const metricBtn = row.createEl("button", {
+          type: "button",
+          text: lab,
+          cls: `rslatte-btn rslatte-health-inspect-metric-btn ${done ? "done" : "todo"}`,
+        });
+        metricBtn.title = done ? `今日已记录，点击编辑「${lab}」` : `点击录入今日「${lab}」`;
+        metricBtn.onclick = () => {
+          if (todayItem) {
+            new EditHealthEntryModal(this.app, this.plugin, {
+              item: todayItem,
+              onSuccess: () => void this.render(),
+            }).open();
+          } else {
+            new HealthCardModal(this.app, this.plugin, {
+              singleCanonicalMetric: canonical,
+              lockAnchorToToday: true,
+              onSuccess: () => void this.render(),
+            }).open();
+          }
+        };
+        this.renderHealthMetricHeatmap(row, canonical, healthItems, todayKey);
+      }
+    }
+
 // ===== 今日日记（可选展示） =====
     if (this.plugin.settings.showJournalPanels !== false) {
       const todaySection = container.createDiv({ cls: "rslatte-section" });
+      todaySection.setAttribute("data-rslatte-inspect", "journal");
       // 标题 + 新增按钮
       const { left: todayLeft, right: todayActions } = createHeaderRow(
         todaySection,
@@ -376,7 +499,7 @@ export class RSLatteSidePanelView extends ItemView {
       }
     }
 
-    // 事项提醒（备忘录）模块已移动到「任务管理（Side Panel 2）」中。
+    // 事项提醒模块已移动到「任务管理（Side Panel 2）」中。
   }
 
   /**
@@ -443,7 +566,7 @@ export class RSLatteSidePanelView extends ItemView {
     try { await this.plugin.hydrateTodayFromRecordIndex(); } catch { }
   }
 
-  /** 手动归档：归档超过阈值天数的索引记录 -> 侧边栏重绘 */
+  /** 手动索引归档：超阈值记录迁入 archive 索引（日记笔记不移动）→ 侧栏重绘 */
   private async manualArchive(modules: { checkin: boolean; finance: boolean }, labelCn: string): Promise<void> {
     const moduleKey =
       modules.checkin && !modules.finance ? "checkin" : modules.finance && !modules.checkin ? "finance" : null;
@@ -451,12 +574,12 @@ export class RSLatteSidePanelView extends ItemView {
 
     const r = await this.plugin.pipelineEngine.runE2(this.plugin.getSpaceCtx(), moduleKey, "manual_archive");
     if (!r.ok) {
-      new Notice(`${labelCn}归档失败：${r.error.message}`);
+      new Notice(`${labelCn}索引归档失败：${r.error.message}`);
       return;
     }
     if (r.data.skipped) return;
 
-    new Notice(`${labelCn}已归档`);
+    new Notice(`${labelCn}索引归档已完成`);
     this.refresh();
   }
 
@@ -464,6 +587,28 @@ export class RSLatteSidePanelView extends ItemView {
   // =========================
   // UI helpers
   // =========================
+
+  /** 健康合并项：过去 30 天是否有有效记录落在该自然日（周/月卡按覆盖日展开）。 */
+  private renderHealthMetricHeatmap(
+    parentRow: HTMLElement,
+    canonical: HealthCanonicalMetricKey,
+    allItems: HealthRecordIndexItem[],
+    todayKey: string,
+  ) {
+    const heat = parentRow.createDiv({ cls: "rslatte-heatmap rslatte-health-inspect-heatmap" });
+    const presence = buildHealthCanonicalHeatPresence(allItems, canonical, todayKey);
+    const end = momentFn(todayKey, "YYYY-MM-DD");
+    for (let i = 0; i < 30; i++) {
+      const off = 29 - i;
+      const d = end.clone().subtract(off, "days").format("YYYY-MM-DD");
+      const done = presence[i];
+      const cell = heat.createEl("span", { cls: done ? "rslatte-heat-cell is-on" : "rslatte-heat-cell", text: "" });
+      cell.style.backgroundColor = done
+        ? "var(--interactive-accent, var(--color-purple))"
+        : "var(--rslatte-heat-off-bg, rgba(120, 120, 120, 0.60))";
+      cell.title = done ? `${d} 已记录` : `${d} 未记录`;
+    }
+  }
 
   /** 打卡热力图：过去 30 天，一天一个字符；有打卡则显示色块，无则空格。 */
   private renderCheckinHeatmap(parentRow: HTMLElement, checkinId: string, allItems: any[], todayKey: string) {

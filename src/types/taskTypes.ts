@@ -24,26 +24,6 @@ export type TaskCategoryDef = {
   timeRanges: TaskTimeRangeDef[];
 };
 
-/** 内置任务清单 ID */
-export type BuiltinTaskListId =
-  | "todayTodo"
-  | "weekTodo"
-  | "inProgress"
-  | "overdue"
-  | "todayDone"
-  | "cancelled7d"
-  | "allTasks";
-
-/** 内置清单的展示/排序配置 */
-export type BuiltinTaskListDef = {
-  enabled: boolean;
-  maxItems: number; // <=30
-  sortField: TaskDateField;
-  sortOrder: TaskSortOrder;
-  /** 是否默认收起 */
-  defaultCollapsed?: boolean; // default: false
-};
-
 export type TaskPanelSettings = {
   /** 任务数据所在目录（支持多个目录，按需遍历子目录） */
   taskFolders: string[];
@@ -51,28 +31,14 @@ export type TaskPanelSettings = {
   includeTags: string[];
   /** 文档不包含 tags（求并集）：配置后要求全部不命中 */
   excludeTags: string[];
-  /**
-   * 任务清单（内置清单，不再支持自定义 timeRanges）
-   * - todayTodo: 今日待完成（due=今天 且 TODO/IN_PROGRESS）
-   * - weekTodo: 待本周完成（due 在本周 且 TODO/IN_PROGRESS）
-   * - inProgress: 进行中任务（IN_PROGRESS 或 start<今天 的 TODO）
-   * - overdue: 超期未完成（due<今天 且 TODO/IN_PROGRESS）
-   * - todayDone: 今日已完成（done=今天 或 cancelled=今天）
-   * - cancelled7d: 近七天取消任务（cancelled 在近 7 天内）
-   */
-  builtinLists?: Partial<Record<BuiltinTaskListId, BuiltinTaskListDef>>;
-
-  /** v26：内置任务清单的显示顺序（可在设置中用 ↑↓ 调整） */
-  builtinListOrder?: BuiltinTaskListId[];
-
-  /** v5：侧边栏清单折叠状态（key=listId, true=collapsed）。由 UI 自动维护。 */
+  /** v5：侧边栏清单折叠状态（key=分区 ID，true=collapsed）。分区 ID：todayAction/todayFollowUp/overdue/otherRisk/otherActive/closedCancelled/closedDone */
   collapsedLists?: Record<string, boolean>;
 
   /** 旧版自定义分类（兼容读取；新 UI 不再维护） */
   categories?: TaskCategoryDef[];
 
   /** v22：索引/队列/归档所在目录（vault 相对路径） */
-  rslatteIndexDir?: string; // default: 95-Tasks/.rslatte
+  rslatteIndexDir?: string; // default: 00-System/.rslatte (V2)
   /** v22：是否启用与后端 rslatte-items 的同步（断连时会离线积压队列） */
   enableDbSync?: boolean; // default: true
 
@@ -84,19 +50,22 @@ export type TaskPanelSettings = {
 
   /**
    * v27：Reconcile 安全门：仅对“干净文件”执行 reconcile。
-   * 干净文件定义：在本次扫描结果中，该文件内不存在 uidMissing（即每条任务/备忘都已具备 uid）。
+   * 干净文件定义：在本次扫描结果中，该文件内不存在 uidMissing（即每条任务/提醒都已具备 uid）。
    * 目的：避免“部分文件未补齐 uid/未纳入 present_uids”导致 reconcile 误删。
    */
   reconcileRequireFileClean?: boolean; // default: true
-  /** v22：重要事项（备忘录）默认展示范围：今天 + N 天 */
-  memoLookaheadDays?: number; // default: 7
-  /** v22：是否在 RSLatte（Side Panel 1）“今日日志”下方展示重要事项 */
-  showImportantMemosInRSLattePanel?: boolean; // default: true
-
-  /** v28：全量备忘清单（显示在事项提醒下方） */
+  /** v28：全量提醒清单（显示在事项提醒下方） */
   memoAllEnabled?: boolean; // default: true
   memoAllMaxItems?: number; // default: 50
   memoAllStatuses?: Array<"DONE" | "CANCELLED" | "TODO" | "IN_PROGRESS">; // default: ["TODO","IN_PROGRESS"]
+  /** 提醒卡片“即将到期”阈值（天）。默认 5 */
+  reminderUpcomingDays?: number;
+  /** 事项提醒：近期完成/取消/失效窗口（天）。默认 30，范围 7-100 */
+  recentClosedMemoWindowDays?: number;
+  /** 日程：即将超期阈值（天）。默认 5 */
+  scheduleUpcomingDays?: number;
+  /** 日程：近期完成/取消/失效窗口（天）。默认 30，范围 7-100 */
+  scheduleRecentClosedDays?: number;
 
   /** v22：是否启用自动归档（每天打开知识库触发一次） */
   autoArchiveEnabled?: boolean; // default: true
@@ -109,8 +78,40 @@ export type TaskPanelSettings = {
 
   /** v22：新增任务写入今日日记的 H2 分区标题（会自动转成 H2） */
   taskInsertSectionH2?: string; // default: "任务"
-  /** v22：新增备忘写入今日日记的 H2 分区标题（会自动转成 H2） */
-  memoInsertSectionH2?: string; // default: "重要事项"
+  /** v22：新增提醒写入今日日记的 H2 分区标题（会自动转成 H2） */
+  memoInsertSectionH2?: string; // default: "提醒"
+
+  /** 任务标签：假活跃阈值（天），处理中/跟进中超过 N 天未更新进度即标为假活跃。默认 3 */
+  fakeActiveThresholdDays?: number;
+  /** 任务基准日期模式：local=本地日期，zone=指定时区当前日。默认 local */
+  taskBaseDateMode?: "local" | "zone";
+  /** 任务基准时区（仅 taskBaseDateMode=zone 时有效），如 Asia/Shanghai、UTC */
+  taskBaseTimeZone?: string;
+
+  /** 重点关注清单显示条数（重要性 Top N），范围 3–10，默认 3 */
+  focusTopN?: number;
+  /** 即将超期天数：due 在 [今天, 今天+N] 视为即将超期，默认 3，范围 1–30 */
+  overdueWithinDays?: number;
+  /** 近期闭环天数：近期取消/近期完成的窗口（今天−N ～ 今天），默认 7，范围 1–90 */
+  closedTaskWindowDays?: number;
+
+  /**
+   * 任务业务分类（学习/工作/生活等），按空间在 `settingsSnapshot` 中独立存储。
+   * 任务 meta 键 `task_category` 存**当时选用的名称快照**，设置中改名/删项不改历史条目。
+   */
+  taskBusinessCategories?: string[];
+  /** 新建任务时默认选中的分类名（须为 `taskBusinessCategories` 中一项） */
+  defaultTaskBusinessCategory?: string;
+
+  /**
+   * 侧栏任务卡片：勾选 id 表示收入「⋯」更多菜单（仍受状态等显隐条件约束）。
+   * 稳定 id 见 `src/constants/sidePanelCardActions.ts`。
+   */
+  sidePanelTaskCardActionsInMore?: string[];
+  /** 侧栏提醒卡片（活跃分区与全量提醒列表）同上 */
+  sidePanelMemoCardActionsInMore?: string[];
+  /** 侧栏「近期闭环」提醒卡片 */
+  sidePanelMemoClosedCardActionsInMore?: string[];
 };
 
 export type ParsedTaskItem = {

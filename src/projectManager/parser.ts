@@ -1,4 +1,6 @@
 import type { MilestoneProgress, ProjectTaskItem } from "./types";
+import { reconcileTaskDisplayPhase } from "../taskRSLatte/utils";
+import { TASK_DESC_PREFIX_STRIP_RE } from "../taskRSLatte/parser";
 
 export const DEFAULT_MILESTONE_PATH = "未指定里程碑";
 
@@ -21,12 +23,20 @@ export type MilestoneNode = {
   insertBeforeLineNo: number;
   /** Optional milestone status written under heading as a rslatte comment. */
   milestoneStatus?: "active" | "done" | "cancelled";
-  /** Creation timestamp (ISO string) from rslatte comment ts field when milestone_status=active or first created */
-  createdDate?: string; // YYYY-MM-DD
-  /** Done timestamp (ISO string) from rslatte comment ts field when milestone_status=done */
-  doneDate?: string; // YYYY-MM-DD
-  /** Cancelled timestamp (ISO string) from rslatte comment ts field when milestone_status=cancelled */
-  cancelledDate?: string; // YYYY-MM-DD
+  /** 创建/激活日 YYYY-MM-DD；优先 meta `milestone_created_date`，否则由 ts= 推断 */
+  created_date?: string;
+  /** 实际完成日 YYYY-MM-DD；优先 `milestone_done_date`，否则由 ts= 推断 */
+  done_date?: string;
+  /** 实际取消日 YYYY-MM-DD；优先 `milestone_cancelled_date`，否则由 ts= 推断 */
+  cancelled_date?: string;
+  /** 计划完成日，meta milestone_planned_end */
+  planned_end?: string;
+  /** 首次延期前计划完成日，meta milestone_original_planned_end */
+  original_planned_end?: string;
+  /** 里程碑延期次数，meta milestone_postpone_count */
+  postpone_count?: number;
+  /** 里程碑权重 1–100，meta milestone_weight */
+  milestone_weight?: number;
 };
 
 /**
@@ -43,76 +53,91 @@ export function parseMilestoneNodes(markdown: string): MilestoneNode[] {
   const lines = text.split(/\r?\n/);
   const parseStatusAndDatesInRange = (from: number, to: number): {
     status?: "active" | "done" | "cancelled";
-    createdDate?: string;
-    doneDate?: string;
-    cancelledDate?: string;
+    created_date?: string;
+    done_date?: string;
+    cancelled_date?: string;
+    planned_end?: string;
+    original_planned_end?: string;
+    postpone_count?: number;
+    milestone_weight?: number;
   } => {
-    // Scan heading block range [from, to) for milestone_status and timestamps; tolerate multiple/unsorted lines and take the last valid one.
+    // 6-细8：同一里程碑下选最后一条带 milestone_status 的行，在该行上解析所有键；解析兼容乱序
     let lastStatus: "active" | "done" | "cancelled" | undefined = undefined;
-    let createdDate: string | undefined = undefined;
-    let doneDate: string | undefined = undefined;
-    let cancelledDate: string | undefined = undefined;
-    let firstTsDate: string | undefined = undefined; // 第一个 ts 日期（用于创建时间）
-    
+    let created_date: string | undefined = undefined;
+    let done_date: string | undefined = undefined;
+    let cancelled_date: string | undefined = undefined;
+    let firstTsDate: string | undefined = undefined;
+    let planned_end: string | undefined = undefined;
+    let original_planned_end: string | undefined = undefined;
+    let postpone_count: number | undefined = undefined;
+    let milestone_weight: number | undefined = undefined;
+    let lastLineWithStatus: { status: "active" | "done" | "cancelled"; kv: Record<string, string> } | null = null;
+
+    const parseKv = (body: string): Record<string, string> => {
+      const kv: Record<string, string> = {};
+      body.split(/[;\s]+/).forEach((p) => {
+        const eq = p.indexOf("=");
+        if (eq > 0) kv[p.slice(0, eq).trim()] = p.slice(eq + 1).trim();
+      });
+      return kv;
+    };
+
     for (let j = Math.max(0, from); j < Math.min(lines.length, to); j++) {
       const s = String(lines[j] ?? "").trim();
       if (!s) continue;
       const mm = s.match(/<!--\s*rslatte:([\s\S]*?)-->/i);
       if (!mm) continue;
       const body = String(mm[1] ?? "");
-      
-      // Parse milestone_status
+      const kv = parseKv(body);
+
       const sm = body.match(/milestone_status\s*=\s*([^;\s]+)\b/i);
       let currentStatus: "active" | "done" | "cancelled" | undefined = undefined;
       if (sm?.[1]) {
         const v = String(sm[1]).trim().toLowerCase();
-        if (v === "done") {
-          currentStatus = "done";
-          lastStatus = "done";
-        } else if (v === "cancelled" || v === "canceled") {
-          currentStatus = "cancelled";
-          lastStatus = "cancelled";
-        } else if (v === "active" || v === "todo" || v === "open") {
-          currentStatus = "active";
-          lastStatus = "active";
-        }
+        if (v === "done") { currentStatus = "done"; lastStatus = "done"; }
+        else if (v === "cancelled" || v === "canceled") { currentStatus = "cancelled"; lastStatus = "cancelled"; }
+        else if (v === "active" || v === "todo" || v === "open") { currentStatus = "active"; lastStatus = "active"; }
+        if (currentStatus) lastLineWithStatus = { status: currentStatus, kv };
       }
-      
-      // Parse ts (timestamp) - extract YYYY-MM-DD from ISO string
+
       const tsMatch = body.match(/ts\s*=\s*([^;\s]+)\b/i);
       if (tsMatch?.[1]) {
-        const ts = String(tsMatch[1]).trim();
-        // Extract YYYY-MM-DD from ISO timestamp (e.g., "2026-01-23T10:30:00+08:00" -> "2026-01-23")
-        const dateMatch = ts.match(/^(\d{4}-\d{2}-\d{2})/);
+        const dateMatch = String(tsMatch[1]).trim().match(/^(\d{4}-\d{2}-\d{2})/);
         if (dateMatch?.[1]) {
           const dateStr = dateMatch[1];
-          
-          // 记录第一个 ts 作为创建时间（如果还没有创建时间）
-          if (!firstTsDate) {
-            firstTsDate = dateStr;
-            createdDate = dateStr;
-          }
-          
-          // 根据当前状态确定日期类型
-          if (currentStatus === "done") {
-            doneDate = dateStr;
-          } else if (currentStatus === "cancelled") {
-            cancelledDate = dateStr;
-          }
+          if (!firstTsDate) { firstTsDate = dateStr; created_date = dateStr; }
+          if (currentStatus === "done") done_date = dateStr;
+          else if (currentStatus === "cancelled") cancelled_date = dateStr;
         }
       }
     }
-    
-    // 如果没有找到创建时间，但找到了第一个 ts，使用它
-    if (!createdDate && firstTsDate) {
-      createdDate = firstTsDate;
+
+    if (!created_date && firstTsDate) created_date = firstTsDate;
+
+    if (lastLineWithStatus) {
+      const k = lastLineWithStatus.kv;
+      if (k["milestone_planned_end"] && /^\d{4}-\d{2}-\d{2}$/.test(k["milestone_planned_end"])) planned_end = k["milestone_planned_end"];
+      if (k["milestone_original_planned_end"] && /^\d{4}-\d{2}-\d{2}$/.test(k["milestone_original_planned_end"])) original_planned_end = k["milestone_original_planned_end"];
+      if (k["milestone_postpone_count"] && /^\d+$/.test(k["milestone_postpone_count"])) postpone_count = Number(k["milestone_postpone_count"]);
+      if (k["milestone_weight"] && /^\d+$/.test(k["milestone_weight"])) {
+        const w = Number(k["milestone_weight"]);
+        if (Number.isFinite(w)) milestone_weight = Math.min(100, Math.max(1, Math.floor(w)));
+      }
+      // 显式日期键优先于上文从 ts= 推断的 created/done/cancelled（与 service 写入 milestone_*_date 一致）
+      if (k["milestone_created_date"] && /^\d{4}-\d{2}-\d{2}$/.test(k["milestone_created_date"])) created_date = k["milestone_created_date"];
+      if (k["milestone_done_date"] && /^\d{4}-\d{2}-\d{2}$/.test(k["milestone_done_date"])) done_date = k["milestone_done_date"];
+      if (k["milestone_cancelled_date"] && /^\d{4}-\d{2}-\d{2}$/.test(k["milestone_cancelled_date"])) cancelled_date = k["milestone_cancelled_date"];
     }
-    
+
     return {
       status: lastStatus,
-      createdDate,
-      doneDate,
-      cancelledDate,
+      created_date,
+      done_date,
+      cancelled_date,
+      planned_end,
+      original_planned_end,
+      postpone_count,
+      milestone_weight,
     };
   };
 
@@ -165,6 +190,8 @@ export function parseMilestoneNodes(markdown: string): MilestoneNode[] {
     }
 
     const statusAndDates = parseStatusAndDatesInRange(h.line + 1, insertBeforeLineNo);
+    const isL1 = h.level === 1;
+    // 二、三级里程碑不维护计划完成日与延期次数字段（索引与衍生仅认一级）
     out.push({
       name: h.name,
       path: h.path,
@@ -174,9 +201,13 @@ export function parseMilestoneNodes(markdown: string): MilestoneNode[] {
       blockEndLineNo,
       insertBeforeLineNo,
       milestoneStatus: statusAndDates.status,
-      createdDate: statusAndDates.createdDate,
-      doneDate: statusAndDates.doneDate,
-      cancelledDate: statusAndDates.cancelledDate,
+      created_date: statusAndDates.created_date,
+      done_date: statusAndDates.done_date,
+      cancelled_date: statusAndDates.cancelled_date,
+      planned_end: isL1 ? statusAndDates.planned_end : undefined,
+      original_planned_end: isL1 ? statusAndDates.original_planned_end : undefined,
+      postpone_count: isL1 ? statusAndDates.postpone_count : undefined,
+      milestone_weight: statusAndDates.milestone_weight,
     });
   }
 
@@ -231,9 +262,13 @@ export function parseMilestonesAndCounts(markdown: string): MilestoneProgress[] 
       parentPath: n.parentPath,
       headingLineNo: n.headingLineNo,
       milestoneStatus: n.milestoneStatus,
-      createdDate: n.createdDate,
-      doneDate: n.doneDate,
-      cancelledDate: n.cancelledDate,
+      created_date: n.created_date,
+      done_date: n.done_date,
+      cancelled_date: n.cancelled_date,
+      planned_end: n.planned_end,
+      original_planned_end: n.original_planned_end,
+      postpone_count: n.postpone_count,
+      milestone_weight: n.milestone_weight,
       done,
       todo,
       inprogress,
@@ -279,6 +314,14 @@ export function parseTaskItems(markdown: string): ProjectTaskItem[] {
     return m?.[1];
   };
 
+  /** 📅 优先；否则识别行内 🗓️ 日期为计划完成日（与 `computeTaskTags`·今日应处理一致） */
+  const extractPlannedEndYmd = (meta: string): string | undefined => {
+    const fromDue = extractDateToken(meta, "📅");
+    if (fromDue) return fromDue;
+    const m = String(meta).match(/\u{1F5D3}\uFE0F?\s*(\d{4}-\d{2}-\d{2})/u);
+    return m?.[1];
+  };
+
   // maintain heading stack while scanning
   const stack: Array<{ name: string; level: 1 | 2 | 3; path: string }> = [];
   let currentPath = DEFAULT_MILESTONE_PATH;
@@ -311,33 +354,158 @@ export function parseTaskItems(markdown: string): ProjectTaskItem[] {
     const rest = (m[2] ?? "").trim();
 
     let taskId = extractTaskIdFromRSLatte(rest);
-    if (!taskId) taskId = extractTaskIdFromRSLatte(lines[i + 1] ?? "");
+    const nextLine = lines[i + 1] ?? "";
+    if (!taskId) taskId = extractTaskIdFromRSLatte(nextLine);
 
-    const firstTokenIdx = (() => {
-      const tokens = ["➕", "🛫", "⏳", "📅", "✅", "❌"]; 
-      const idx = tokens.map((t) => rest.indexOf(t)).filter((n) => n >= 0);
-      return idx.length ? Math.min(...idx) : -1;
-    })();
-    const titlePart = firstTokenIdx >= 0 ? rest.slice(0, firstTokenIdx) : rest;
-    const metaPart = firstTokenIdx >= 0 ? rest.slice(firstTokenIdx) : "";
-    const text2 = stripRSLatteComments(titlePart);
+    /**
+     * 与 ProjectManagerService.patchProjectTaskMetaInLines 一致：同条注释内用分号拼接键值，
+     * 仅按 `;` 分割（不按空格），否则 progress_note 等含空格的字段会被拆碎导致解析失败。
+     * 任务行与下一行均可能有 `<!-- rslatte:... -->`（例如 task_id 在行尾、完整 meta 在下一行），需合并。
+     */
+    const parseRslatteMetaFromText = (s: string): {
+      estimate_h?: number;
+      complexity?: "high" | "normal" | "light";
+      task_phase?: "todo" | "in_progress" | "waiting_others" | "waiting_until" | "done" | "cancelled";
+      progress_note?: string;
+      progress_updated?: string;
+      wait_until?: string;
+      follow_up?: string;
+      follow_contact_uids?: string[];
+      follow_contact_names?: string[];
+      postpone_count?: number;
+      original_due?: string;
+      starred?: boolean;
+      linked_schedule_uids?: string[];
+    } => {
+      const raw = String(s ?? "");
+      const comments = raw.match(/<!--\s*rslatte:[\s\S]*?-->/gi) ?? [];
+      const kv: Record<string, string> = {};
+      for (const c of comments) {
+        const mm = c.match(/<!--\s*rslatte:([^>]*)-->/i);
+        const body = (mm?.[1] ?? "").trim();
+        const parts = body.split(";").map((p) => p.trim()).filter(Boolean);
+        for (const part of parts) {
+          const eq = part.indexOf("=");
+          if (eq <= 0) continue;
+          const k = part.slice(0, eq).trim();
+          const v = part.slice(eq + 1).trim();
+          if (k) kv[k] = v;
+        }
+      }
+      let estimate_h: number | undefined;
+      let complexity: "high" | "normal" | "light" | undefined;
+      let task_phase: "todo" | "in_progress" | "waiting_others" | "waiting_until" | "done" | "cancelled" | undefined;
+      let progress_note: string | undefined;
+      let progress_updated: string | undefined;
+      let wait_until: string | undefined;
+      let follow_up: string | undefined;
+      let follow_contact_uids: string[] | undefined;
+      let follow_contact_names: string[] | undefined;
+      let postpone_count: number | undefined;
+      let original_due: string | undefined;
+      let starred: boolean | undefined;
+      let linked_schedule_uids: string[] | undefined;
+      for (const [k, v] of Object.entries(kv)) {
+        if (k === "estimate_h" && /^[\d.]+$/.test(v)) estimate_h = Number(v);
+        if (k === "complexity" && (v === "high" || v === "normal" || v === "light")) complexity = v;
+        if (
+          k === "task_phase" &&
+          (v === "todo" ||
+            v === "in_progress" ||
+            v === "waiting_others" ||
+            v === "waiting_until" ||
+            v === "done" ||
+            v === "cancelled")
+        )
+          task_phase = v;
+        if (k === "progress_note") progress_note = String(v).replace(/\u200B/g, " ");
+        if (k === "progress_updated") progress_updated = v;
+        if (k === "wait_until" && /^\d{4}-\d{2}-\d{2}$/.test(v)) wait_until = v;
+        if (k === "follow_up" && /^\d{4}-\d{2}-\d{2}$/.test(v)) follow_up = v;
+        if (k === "follow_contact_uids" && v) follow_contact_uids = v.split(/[,;]/).map((x) => x.trim()).filter(Boolean);
+        if (k === "follow_contact_name" && v)
+          follow_contact_names = String(v)
+            .split("|")
+            .map((x) => x.trim())
+            .filter(Boolean);
+        if (k === "postpone_count" && /^\d+$/.test(v)) postpone_count = Number(v);
+        if (k === "original_due" && /^\d{4}-\d{2}-\d{2}$/.test(v)) original_due = v;
+        if (k === "starred") starred = v === "1" || v === "true";
+        if (k === "linked_schedule_uids" && v) linked_schedule_uids = v.split(/[,;]/).map((x) => x.trim()).filter(Boolean);
+      }
+      return {
+        estimate_h,
+        complexity,
+        task_phase,
+        progress_note,
+        progress_updated,
+        wait_until,
+        follow_up,
+        follow_contact_uids,
+        follow_contact_names,
+        postpone_count,
+        original_due,
+        starred,
+        linked_schedule_uids,
+      };
+    };
+    const metaFromRest = parseRslatteMetaFromText(rest);
+    const metaFromNext = parseRslatteMetaFromText(nextLine);
+    const nextMeta: ReturnType<typeof parseRslatteMetaFromText> = { ...metaFromRest, ...metaFromNext };
 
-    out.push({
-      milestone: currentLeaf,
+    // 必须与 taskRSLatte / service 一致：用「前置空格 + 图标 + 空格」定位**日期/元数据** token。
+    // 不可对 rest 做裸 indexOf("⏳")：行尾计划开始为「⏳ 日期」；延期前缀现为 ↪（旧笔记可能仍为 ⏳）。
+    // 🗓️（U+1F5D3）：部分笔记用日历 emoji 代替 📅 作为截止日，需参与切分与 planned_end 解析。
+    const TASK_BODY_META_SPLIT_RE = /\s(📅|\u{1F5D3}\uFE0F?|➕|⏳|🛫|✅|❌)\s/u;
+    const metaSplit = rest.match(TASK_BODY_META_SPLIT_RE);
+    let titlePart: string;
+    let metaPart: string;
+    if (metaSplit && typeof metaSplit.index === "number") {
+      titlePart = rest.slice(0, metaSplit.index).trimEnd();
+      metaPart = rest.slice(metaSplit.index).trimStart();
+    } else {
+      titlePart = rest;
+      metaPart = "";
+    }
+    const titleClean = stripRSLatteComments(titlePart);
+    const text2 = titleClean.replace(TASK_DESC_PREFIX_STRIP_RE, "").trim();
+
+    const statusName = toStatusName(statusMark);
+    const item: ProjectTaskItem = {
+      /** 与里程碑 `path` 一致的全路径（L1 / L2 / L3），供索引与 DB 同步唯一标识 */
+      milestone: currentPath,
       milestonePath: currentPath,
       lineNo: i,
       statusMark,
-      statusName: toStatusName(statusMark),
+      statusName,
       text: text2,
       rawLine: line,
       taskId,
-      createdDate: extractDateToken(metaPart, "➕"),
-      startDate: extractDateToken(metaPart, "🛫"),
-      scheduledDate: extractDateToken(metaPart, "⏳"),
-      dueDate: extractDateToken(metaPart, "📅"),
-      doneDate: extractDateToken(metaPart, "✅"),
-      cancelledDate: extractDateToken(metaPart, "❌"),
-    });
+      created_date: extractDateToken(metaPart, "➕"),
+      actual_start: extractDateToken(metaPart, "🛫"),
+      planned_start: extractDateToken(metaPart, "⏳"),
+      planned_end: extractPlannedEndYmd(metaPart),
+      done_date: extractDateToken(metaPart, "✅"),
+      cancelled_date: extractDateToken(metaPart, "❌"),
+      ...(nextMeta.estimate_h != null && { estimate_h: nextMeta.estimate_h }),
+      ...(nextMeta.complexity && { complexity: nextMeta.complexity }),
+      ...(nextMeta.task_phase && { task_phase: nextMeta.task_phase }),
+      ...(nextMeta.progress_note != null && { progress_note: nextMeta.progress_note }),
+      ...(nextMeta.progress_updated && { progress_updated: nextMeta.progress_updated }),
+      ...(nextMeta.wait_until && { wait_until: nextMeta.wait_until }),
+      ...(nextMeta.follow_up && { follow_up: nextMeta.follow_up }),
+      ...(nextMeta.follow_contact_uids && nextMeta.follow_contact_uids.length > 0 && { follow_contact_uids: nextMeta.follow_contact_uids }),
+      ...(nextMeta.follow_contact_names && nextMeta.follow_contact_names.length > 0 && { follow_contact_names: nextMeta.follow_contact_names }),
+      ...(nextMeta.postpone_count != null && { postpone_count: nextMeta.postpone_count }),
+      ...(nextMeta.original_due && { original_due: nextMeta.original_due }),
+      ...(nextMeta.starred !== undefined && { starred: nextMeta.starred }),
+      ...(nextMeta.linked_schedule_uids && nextMeta.linked_schedule_uids.length > 0 && { linked_schedule_uids: nextMeta.linked_schedule_uids }),
+    };
+    item.task_phase = reconcileTaskDisplayPhase(item.statusName, item.task_phase, {
+      wait_until: item.wait_until,
+      follow_up: item.follow_up,
+    }) as ProjectTaskItem["task_phase"];
+    out.push(item);
   }
 
   return out;

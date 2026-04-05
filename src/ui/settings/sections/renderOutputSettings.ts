@@ -1,8 +1,11 @@
 // Auto-split from RSLatteSettingTab.ts to reduce file size and isolate failures.
 import { Notice, Setting, normalizePath, TFile } from "obsidian";
 import { DEFAULT_SETTINGS } from "../../../constants/defaults";
+import type { OutputCreateExtraFieldDef } from "../../../types/outputTypes";
+import { isReservedOutputFmKey } from "../../../utils/outputYamlExtras";
+import { mountOutputTemplatesSection } from "../../outputTemplatesTable";
 
-export type ModuleWrapFactory = (moduleKey: any, title: string) => HTMLElement;
+export type ModuleWrapFactory = (moduleKey: any, title: string, scopeTag?: "global" | "space") => HTMLElement;
 export type HeaderButtonsVisibilityAdder = (wrap: HTMLElement, moduleKey: any, defaultShow: boolean) => void;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -114,8 +117,8 @@ export function renderOutputSettings(opts: {
 
     const archiveRootDirUpdate = addDirCheckButton(
       new Setting(outputWrap)
-        .setName("归档目录")
-        .setDesc("归档根目录，例如：99-Archive；归档后路径保持原相对路径")
+        .setName("输出笔记归档根目录")
+        .setDesc("「笔记归档」：已完成输出文档移动到此根下并保持相对路径（如 99-Archive）。取消类可走各根下 _archived。另伴随「索引归档」（output-index 条目迁出），见模块管理表下说明。")
         .addText((t) => {
           t.setPlaceholder("99-Archive");
           t.setValue(String(op.archiveRootDir ?? "99-Archive"));
@@ -138,8 +141,8 @@ export function renderOutputSettings(opts: {
     };
 
     const archiveRootsSetting = new Setting(outputWrap)
-      .setName("输出文档存档目录（根目录）")
-      .setDesc("用于扫描输出文档中央索引；一行一个目录，例如：00-Inbox\n02-Notes")
+      .setName("输出文档扫描根目录（多行）")
+      .setDesc("纳入「输出」中央索引扫描的路径列表（一行一个）。与「输出笔记归档根目录」（已完成文档 **笔记归档** 目的地）不是同一设置。")
       .addTextArea((ta) => {
         ta.setPlaceholder("00-Inbox\n02-Notes");
         ta.setValue((op.archiveRoots ?? []).join("\n"));
@@ -197,6 +200,19 @@ export function renderOutputSettings(opts: {
     void updateArchiveRootsStatus();
 
     new Setting(outputWrap)
+      .setName("全量重建时扫描旧版物理归档目录")
+      .setDesc(
+        "开启：🧱 全量仍会扫描「输出笔记归档根目录」及 _archived（兼容曾把 DONE 搬到独立归档夹）。关闭：以「输出文档扫描根目录」+ 磁盘扫描 + 合并 `.history/output-ledger` 为主；DONE 且留在扫描根下的条目仅按下方「索引归档阈值」做索引迁出并写台账。",
+      )
+      .addToggle((tg) => {
+        tg.setValue((op as any).fullRebuildScanLegacyArchiveDirs !== false);
+        tg.onChange(async (v) => {
+          (op as any).fullRebuildScanLegacyArchiveDirs = v;
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
+    new Setting(outputWrap)
       .setName("Timeline 时间字段")
       .setDesc("文档列表分组与排序使用的时间字段")
       .addDropdown((dd) => {
@@ -223,183 +239,82 @@ export function renderOutputSettings(opts: {
         });
       });
 
+    // ----- 创建输出 · 自定义属性（§3.2.2） -----
+    outputWrap.createEl("h4", { text: "创建输出 · 自定义属性" });
+    outputWrap.createDiv({
+      cls: "rslatte-muted",
+      text: "在新建输出弹窗中追加可编辑项，保存为 YAML 标量；键名不可与 status、output_id、tags、领域、project_id 等保留键重复。",
+    });
+    const extras = (op.createOutputExtraFields ?? []) as OutputCreateExtraFieldDef[];
+    const exTable = outputWrap.createEl("table", { cls: "rslatte-checkin-table" });
+    const exHead = exTable.createEl("thead");
+    const exHr = exHead.createEl("tr");
+    ["键名（英文）", "标签", "占位提示", "多行", "操作"].forEach((h) => exHr.createEl("th", { text: h }));
+    const exBody = exTable.createEl("tbody");
 
-    {
-    outputWrap.createEl("h4", { text: "输出文档模板清单" });
-    outputWrap.createDiv({ cls: "rslatte-muted", text: "每条记录对应侧边栏一个快速创建按钮" });
-
-    const templates = (op.templates ?? []) as any[];
-    op.templates = templates;
-
-    const ensureTplId = (tpl: any) => {
-      if (tpl.id) return;
-      tpl.id = `OT_${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-    };
-
-    const table = outputWrap.createEl("table", { cls: "rslatte-checkin-table" });
-    const thead = table.createEl("thead");
-    const hr = thead.createEl("tr");
-    ["按钮名称", "文档分类", "文档模板", "存档目录", "tags", "type", "操作"].forEach((h) => hr.createEl("th", { text: h }));
-    const tbody = table.createEl("tbody");
-
-    const toCsv = (arr: any): string => {
-      if (!arr) return "";
-      const a = Array.isArray(arr) ? arr : String(arr).split(",");
-      return a.map((s) => String(s).trim()).filter(Boolean).join(",");
-    };
-
-    const parseCsv = (v: string): string[] => {
-      return String(v ?? "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-    };
-
-    const renderTplRow = async (tpl: any, idx: number) => {
-      ensureTplId(tpl);
-      const tr = tbody.createEl("tr");
-
-      const mkInput = (td: HTMLElement, cls: string, val: string, onCommit: (v: string) => void) => {
-        const inp = td.createEl("input", { cls });
-        inp.type = "text";
+    extras.forEach((row, idx) => {
+      const tr = exBody.createEl("tr");
+      const mkInput = (td: HTMLElement, val: string, onCommit: (v: string) => void) => {
+        const inp = td.createEl("input", { type: "text", cls: "col-name" });
+        inp.style.width = "100%";
         inp.value = val;
         inp.addEventListener("change", () => onCommit(inp.value));
-        return inp;
       };
-
-      const mkTextarea = (td: HTMLElement, cls: string, val: string, onCommit: (v: string) => void) => {
-        const ta = td.createEl("textarea", { cls });
-        ta.value = val;
-        ta.style.width = "100%";
-        ta.style.minHeight = "2em";
-        ta.style.resize = "vertical";
-        ta.style.whiteSpace = "pre-wrap";
-        ta.style.wordWrap = "break-word";
-        ta.addEventListener("change", () => onCommit(ta.value));
-        return ta;
-      };
-
-      mkInput(tr.createEl("td"), "col-name", tpl.buttonName || "", (v) => { tpl.buttonName = v; void tab.saveAndRefreshSidePanelDebounced(); });
-      mkInput(tr.createEl("td"), "col-name", tpl.docCategory || "", (v) => { tpl.docCategory = v; void tab.saveAndRefreshSidePanelDebounced(); });
-      
-      // 文档模板：使用 textarea 并检查文件是否存在
-      const templateTd = tr.createEl("td");
-      const templateInput = templateTd.createEl("textarea", { cls: "col-path" });
-      templateInput.value = tpl.templatePath || "";
-      templateInput.style.width = "100%";
-      templateInput.style.minHeight = "2em";
-      templateInput.style.resize = "vertical";
-      templateInput.style.whiteSpace = "pre-wrap";
-      templateInput.style.wordWrap = "break-word";
-      
-      // 检查文件是否存在
-      const checkTemplateExists = async () => {
-        const path = normalizePath(templateInput.value.trim());
-        if (!path) {
-          templateInput.style.color = "";
+      mkInput(tr.createEl("td"), row.id ?? "", (v) => {
+        const nk = String(v ?? "").trim();
+        if (nk && isReservedOutputFmKey(nk)) {
+          new Notice("该键名为系统保留");
           return;
         }
-        
-        const candidates: string[] = [path];
-        if (!/\.md$/i.test(path)) {
-          candidates.push(path + ".md");
-        }
-        
-        let exists = false;
-        for (const p of candidates) {
-          const file = plugin.app.vault.getAbstractFileByPath(p);
-          if (file && file instanceof TFile) {
-            exists = true;
-            break;
-          }
-        }
-        
-        if (!exists) {
-          templateInput.style.color = "var(--text-error)";
-        } else {
-          templateInput.style.color = "";
-        }
+        row.id = nk;
+        void tab.saveAndRefreshSidePanelDebounced();
+      });
+      mkInput(tr.createEl("td"), row.label ?? "", (v) => {
+        row.label = v;
+        void tab.saveAndRefreshSidePanelDebounced();
+      });
+      mkInput(tr.createEl("td"), row.placeholder ?? "", (v) => {
+        row.placeholder = v;
+        void tab.saveAndRefreshSidePanelDebounced();
+      });
+      const tdM = tr.createEl("td");
+      const cb = tdM.createEl("input");
+      cb.type = "checkbox";
+      cb.checked = !!row.multiline;
+      cb.addEventListener("change", () => {
+        row.multiline = !!cb.checked;
+        void tab.saveAndRefreshSidePanelDebounced();
+      });
+      const del = tr.createEl("td").createEl("button", { text: "删除", cls: "rslatte-text-btn" });
+      del.onclick = async () => {
+        extras.splice(idx, 1);
+        await plugin.saveSettings();
+        tab.saveAndRerender();
       };
-      
-      templateInput.addEventListener("change", () => {
-        tpl.templatePath = normalizePath(templateInput.value.trim());
-        void tab.saveAndRefreshSidePanelDebounced();
-        void checkTemplateExists();
-      });
-      void checkTemplateExists();
-      
-      // 存档目录：使用 textarea
-      const archiveTd = tr.createEl("td");
-      const archiveInput = archiveTd.createEl("textarea", { cls: "col-path" });
-      archiveInput.value = tpl.archiveDir || "";
-      archiveInput.style.width = "100%";
-      archiveInput.style.minHeight = "2em";
-      archiveInput.style.resize = "vertical";
-      archiveInput.style.whiteSpace = "pre-wrap";
-      archiveInput.style.wordWrap = "break-word";
-      archiveInput.addEventListener("change", () => {
-        tpl.archiveDir = normalizePath(archiveInput.value.trim());
-        void tab.saveAndRefreshSidePanelDebounced();
-      });
-      
-      // tags：使用 textarea
-      const tagsTd = tr.createEl("td");
-      const tagsInput = tagsTd.createEl("textarea", { cls: "col-tags" });
-      tagsInput.value = toCsv(tpl.tags);
-      tagsInput.style.width = "100%";
-      tagsInput.style.minHeight = "2em";
-      tagsInput.style.resize = "vertical";
-      tagsInput.style.whiteSpace = "pre-wrap";
-      tagsInput.style.wordWrap = "break-word";
-      tagsInput.addEventListener("change", () => {
-        tpl.tags = parseCsv(tagsInput.value);
-        void tab.saveAndRefreshSidePanelDebounced();
-      });
-      
-      // type：使用 textarea
-      const typeTd = tr.createEl("td");
-      const typeInput = typeTd.createEl("textarea", { cls: "col-type" });
-      typeInput.value = tpl.type || "";
-      typeInput.style.width = "100%";
-      typeInput.style.minHeight = "2em";
-      typeInput.style.resize = "vertical";
-      typeInput.style.whiteSpace = "pre-wrap";
-      typeInput.style.wordWrap = "break-word";
-      typeInput.addEventListener("change", () => {
-        tpl.type = typeInput.value.trim();
-        void tab.saveAndRefreshSidePanelDebounced();
-      });
-
-      const tdOps = tr.createEl("td");
-      const del = tdOps.createEl("button", { text: "删除", cls: "rslatte-text-btn" });
-      del.onclick = () => {
-        templates.splice(idx, 1);
-        void tab.saveAndRerender();
-      };
-    };
-
-    templates.forEach((tpl, idx) => void renderTplRow(tpl, idx));
+    });
 
     new Setting(outputWrap)
-      .setName("新增模板")
-      .setDesc("添加一条输出文档模板记录")
+      .setName("添加自定义字段")
+      .setDesc("新增一行后在「键名」列填写英文 id（如 topic）")
       .addButton((btn) => {
         btn.setButtonText("添加");
-        btn.setCta();
         btn.onClick(async () => {
-          templates.push({
-            id: `OT_${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
-            buttonName: "新建",
-            docCategory: "输出",
-            templatePath: "",
-            archiveDir: (op.archiveRoots?.[0] ?? "00-Inbox"),
-            tags: [],
-            type: "",
+          extras.push({
+            id: "",
+            label: "新字段",
+            placeholder: "",
+            multiline: false,
           });
-          await tab.saveAndRerender();
+          await plugin.saveSettings();
+          tab.saveAndRerender();
         });
       });
 
+    {
+      mountOutputTemplatesSection(outputWrap, plugin, {
+        afterFieldChange: () => tab.saveAndRefreshSidePanelDebounced(),
+        afterStructuralChange: () => tab.saveAndRerender(),
+      });
     }
 
     // =========================

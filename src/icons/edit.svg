@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+  <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 20h4l11-11a2.1 2.1 0 0 0 0-3l-1-1a2.1 2.1 0 0 0-3 0L4 16v4z"/>
+    <path d="M13 6l5 5"/>
+  </g>
+
+  <defs>
+    <!-- Coffee-bean seam cutout (unique per render via __UID__) -->
+    <mask id="rslatte-beanCut-edit-__UID__" maskUnits="userSpaceOnUse">
+      <rect width="24" height="24" fill="white"/>
+      <!-- seam: spans major diameter, thin, slightly curved -->
+      <path d="M-1.50 0 C -0.55 -0.35 0.55 -0.35 1.50 0"
+            stroke="black" stroke-width="0.85" stroke-linecap="round"
+            transform="translate(20 4) rotate(-25)"/>
+    </mask>
+  </defs>
+
+  <!-- bean body (move by editing cx/cy + translate above) -->
+  <ellipse cx="20" cy="4" rx="1.5" ry="1.1"
+           transform="rotate(-25 20 4)"
+           fill="currentColor"
+           mask="url(#rslatte-beanCut-edit-__UID__)"/>
+</svg>

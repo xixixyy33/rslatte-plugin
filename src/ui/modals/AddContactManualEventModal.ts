@@ -1,7 +1,12 @@
 import { App, ButtonComponent, Modal, Notice, Setting, TextAreaComponent, TFile } from "obsidian";
+import { normalizePath } from "obsidian";
 import type RSLattePlugin from "../../main";
 import type { ContactIndexItem } from "../../contactsRSLatte/types";
 import { appendManualContactEvent } from "../../services/contacts/contactNoteWriter";
+import { appendManualContactToInteractionsIndex, updateContactLastInteractionAtIfNewer } from "../../services/contacts/manualContactInteractionIndex";
+import { writeContactsInteractionReplicaSnapshot } from "../../services/contacts/contactsInteractionReplica";
+import { bumpManualNewToday, ensureContactsInteractionRollup } from "../../services/contacts/contactInteractionDisplay";
+import { VIEW_TYPE_CAPTURE } from "../../constants/viewTypes";
 
 export class AddContactManualEventModal extends Modal {
   private inFlight = false;
@@ -26,11 +31,25 @@ export class AddContactManualEventModal extends Modal {
     let text = "";
     let textInput!: TextAreaComponent;
     let saveBtn!: ButtonComponent;
+    let dtInput!: HTMLInputElement;
 
     const refresh = () => {
       const ok = (text ?? "").trim().length > 0 && !this.inFlight;
       saveBtn?.setDisabled(!ok);
       return ok;
+    };
+
+    const openCaptureHint = () => {
+      try {
+        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CAPTURE);
+        if (leaves.length > 0) {
+          void this.app.workspace.revealLeaf(leaves[0]);
+        } else {
+          void this.app.workspace.getLeaf(true).setViewState({ type: VIEW_TYPE_CAPTURE, active: true });
+        }
+      } catch {
+        // ignore
+      }
     };
 
     const doSave = async () => {
@@ -46,19 +65,73 @@ export class AddContactManualEventModal extends Modal {
         return;
       }
 
+      const rawDt = String(dtInput?.value ?? "").trim();
+      if (!rawDt) {
+        new Notice("请选择互动日期与时间");
+        return;
+      }
+      const picked = new Date(rawDt);
+      if (Number.isNaN(picked.getTime())) {
+        new Notice("日期时间无效");
+        return;
+      }
+      if (picked.getTime() > Date.now() + 60 * 1000) {
+        new Notice("不能记录未来时间的互动；请使用 Capture 记录待办。");
+        openCaptureHint();
+        return;
+      }
+
       this.inFlight = true;
       refresh();
 
       try {
         const sAny: any = this.plugin.settings as any;
         const cm: any = sAny?.contactsModule ?? {};
+        const tp = sAny?.taskPanel;
+        ensureContactsInteractionRollup(cm, tp);
+        if (!cm.contactsInteractionFirstEnabledAt) {
+          cm.contactsInteractionFirstEnabledAt = new Date().toISOString();
+        }
+
         const sectionHeader = String(cm.eventSectionHeader ?? cm.manualEventSectionHeader ?? "## 互动记录").trim() || "## 互动记录";
         const subHeader = String(cm.manualEventSubHeader ?? "### 手动互动").trim();
+
+        const occurredIso = picked.toISOString();
 
         await appendManualContactEvent(this.app, af, text, {
           sectionHeader,
           subHeader,
+          occurredAt: picked,
         });
+
+        await appendManualContactToInteractionsIndex(this.plugin, {
+          contactUid: String(this.contact.contact_uid ?? "").trim(),
+          contactFilePath: this.contactFilePath,
+          snippet: text,
+          occurredAtIso: occurredIso,
+        });
+
+        await updateContactLastInteractionAtIfNewer(this.app, af, occurredIso);
+
+        bumpManualNewToday(cm, String(this.contact.contact_uid ?? ""));
+        sAny.contactsModule = cm;
+        await this.plugin.saveSettings();
+
+        const contactsDir = normalizePath(String(cm.contactsDir ?? "90-Contacts").trim() || "90-Contacts");
+        await writeContactsInteractionReplicaSnapshot(this.app, {
+          contactsDir,
+          contactUid: String(this.contact.contact_uid ?? "").trim(),
+          getInteractionsStore: () => this.plugin.contactsIndex.getInteractionsStore(),
+        });
+
+        try {
+          const r = await this.plugin.rebuildContactsIndex();
+          if (!(r as any)?.ok) {
+            console.warn("[RSLatte][contacts][manualEvent] rebuildContactsIndex not ok", r);
+          }
+        } catch (e) {
+          console.warn("[RSLatte][contacts][manualEvent] rebuildContactsIndex failed", e);
+        }
 
         new Notice("已写入互动记录");
         try {
@@ -75,6 +148,21 @@ export class AddContactManualEventModal extends Modal {
         refresh();
       }
     };
+
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const defaultLocal = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+
+    new Setting(contentEl)
+      .setName("互动时间")
+      .setDesc("默认当前；禁止未来时间（请用 Capture）")
+      .addText((t) => {
+        const el = t.inputEl;
+        el.type = "datetime-local";
+        el.classList.add("rslatte-contact-manual-datetime");
+        el.value = defaultLocal;
+        dtInput = el;
+      });
 
     new Setting(contentEl)
       .setName("互动内容*")
@@ -109,9 +197,10 @@ export class AddContactManualEventModal extends Modal {
 
     refresh();
 
-    // focus textarea for better UX
     setTimeout(() => {
-      try { textInput?.inputEl?.focus(); } catch {}
+      try {
+        textInput?.inputEl?.focus();
+      } catch {}
     }, 50);
   }
 }

@@ -13,8 +13,8 @@ import type { RSLatteLockGroup, RSLatteLockKey, RSLatteModuleKey } from "./types
 /** Resolve lock key for a module (stable rule). */
 /** Resolve lock *group* for a module (no scope prefix). */
 export function getLockGroupForModule(moduleKey: RSLatteModuleKey): RSLatteLockGroup {
-  // ✅ Shared lock group for record-rslatte modules (checkin/finance)
-  if (moduleKey === "checkin" || moduleKey === "finance") return "record";
+  // ✅ Shared lock group for record-rslatte modules（打卡 / 财务 / 健康）
+  if (moduleKey === "checkin" || moduleKey === "finance" || moduleKey === "health") return "record";
   return moduleKey;
 }
 

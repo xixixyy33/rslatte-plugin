@@ -24,7 +24,20 @@ export type RSLatteModuleKpiTask = {
 
 export type RSLatteModuleKpiMemo = {
   total: number;
+  /** 近 7 日新增（展示用；定级优先用 O/U） */
   new7d: number;
+  /** §9.4.2：逾期未关闭（memoDate < 今日且未闭环） */
+  overdueUnclosed?: number;
+  /** §9.4.2：未来 7 日内待处理（含今日，未闭环，不含已计入 O 的逾期项） */
+  dueWithin7dUnclosed?: number;
+};
+
+/** §9.4.3：日程索引聚合（小时 / 条数） */
+export type RSLatteModuleKpiSchedule = {
+  /** 未来 7 天（含今日）内已排程块时长之和（小时，简单求和各块 duration） */
+  scheduledHoursNext7d: number;
+  /** 已超过计划结束时刻仍未闭环的日程块数 */
+  expectedUnclosedCount: number;
 };
 
 export type RSLatteModuleKpiCheckin = {
@@ -61,6 +74,7 @@ export type RSLatteModuleKpiContacts = {
 export type RSLatteModuleKpiByModule = {
   task?: RSLatteModuleKpiTask;
   memo?: RSLatteModuleKpiMemo;
+  schedule?: RSLatteModuleKpiSchedule;
   checkin?: RSLatteModuleKpiCheckin;
   finance?: RSLatteModuleKpiFinance;
   project?: RSLatteModuleKpiProject;

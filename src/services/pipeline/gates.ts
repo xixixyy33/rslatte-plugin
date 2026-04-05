@@ -57,6 +57,7 @@ export function evaluateReconcileGate(args: {
   const deltaSize = Number.isFinite(deltaN) ? deltaN : undefined;
 
   const dbSyncEnabled = gate.dbSyncEnabled === true;
+  const allowReconcileWithoutDb = gate.allowReconcileWithoutDbSync === true;
 
   const debug = {
     mode: args.mode,
@@ -76,8 +77,8 @@ export function evaluateReconcileGate(args: {
     return { allowed: false, reason: "MODE_NOT_ALLOWED", debug };
   }
 
-  // 规则 1：dbSync 未启用
-  if (!dbSyncEnabled) {
+  // 规则 1：dbSync 未启用（纯本地索引 reconcile 的模块可显式放行）
+  if (!dbSyncEnabled && !allowReconcileWithoutDb) {
     return { allowed: false, reason: "DBSYNC_DISABLED", debug };
   }
 

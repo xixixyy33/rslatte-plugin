@@ -14,7 +14,7 @@ export function normPath(p: string): string {
   return normalizePath(String(p ?? "").trim());
 }
 
-/** 分析图命名规范："[项目名称]-项目分析图.md" */
+/** 分析图默认文件名（扩展名以设置中「项目分析图模板」路径为准，常见为 .md 或 .canvas） */
 export function makeProjectAnalysisFilename(projectName: string): string {
   const name = String(projectName ?? "").trim();
   return `${name}-项目分析图.md`;

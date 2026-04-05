@@ -7,6 +7,7 @@ import {
   Setting,
   TextAreaComponent,
   TextComponent,
+  normalizePath,
 } from "obsidian";
 
 import type RSLattePlugin from "../../main";
@@ -74,14 +75,21 @@ export class EditProjectTaskModal extends Modal {
     let milestone = origEffectiveMilestone || DEFAULT_MILESTONE_PATH;
     let status = origStatus || "TODO";
     let text = String((this.task as any).text ?? "");
-    let due = String((this.task as any).dueDate ?? "");
-    let start = String((this.task as any).startDate ?? "");
-    let scheduled = String((this.task as any).scheduledDate ?? "");
+    // 与 projectManager/parser 中 ProjectTaskItem 字段一致（planned_end=📅、planned_start=⏳、estimate_h=meta）
+    const tk = this.task as any;
+    let due = String(tk.planned_end ?? tk.dueDate ?? "").trim();
+    let scheduled = String(tk.planned_start ?? tk.scheduledDate ?? "").trim();
+    const estRaw = tk.estimate_h ?? tk.estimateH;
+    let estimateH = estRaw != null && estRaw !== "" ? String(estRaw) : "";
+    let complexity: "high" | "normal" | "light" =
+      (this.task as any).complexity === "high" ? "high"
+      : (this.task as any).complexity === "light" ? "light" : "normal";
 
     let textInput!: TextAreaComponent;
     let dueInput!: TextComponent;
-    let startInput!: TextComponent;
     let scheduledInput!: TextComponent;
+    let estimateHInput!: TextComponent;
+    let complexityDd!: DropdownComponent;
     let milestoneDd!: DropdownComponent;
     let statusDd!: DropdownComponent;
     let saveBtn!: ButtonComponent;
@@ -92,8 +100,9 @@ export class EditProjectTaskModal extends Modal {
     const refresh = () => {
       text = oneLine(textInput?.getValue?.() ?? text);
       due = String(dueInput?.getValue?.() ?? due).trim();
-      start = String(startInput?.getValue?.() ?? start).trim();
       scheduled = String(scheduledInput?.getValue?.() ?? scheduled).trim();
+      estimateH = String(estimateHInput?.getValue?.() ?? estimateH).trim();
+      complexity = (complexityDd?.getValue?.() as "high" | "normal" | "light") || complexity;
       milestone = String(milestoneDd?.getValue?.() ?? milestone).trim() || DEFAULT_MILESTONE_PATH;
       status = (String(statusDd?.getValue?.() ?? status).trim() as any) || "TODO";
 
@@ -105,13 +114,20 @@ export class EditProjectTaskModal extends Modal {
         saveBtn?.setDisabled(true);
         return false;
       }
-      if (start && !isYmd(start)) {
-        saveBtn?.setDisabled(true);
-        return false;
-      }
       if (scheduled && !isYmd(scheduled)) {
         saveBtn?.setDisabled(true);
         return false;
+      }
+      if (estimateH && !/^\d+(\.\d+)?$/.test(estimateH)) {
+        saveBtn?.setDisabled(true);
+        return false;
+      }
+      if (status === "DONE") {
+        const estN = estimateH ? parseFloat(estimateH.replace(",", ".")) : NaN;
+        if (!Number.isFinite(estN) || estN <= 0) {
+          saveBtn?.setDisabled(true);
+          return false;
+        }
       }
       saveBtn?.setDisabled(false);
       return true;
@@ -185,56 +201,74 @@ export class EditProjectTaskModal extends Modal {
         });
       });
 
-    new Setting(contentEl).setName("到期日期 due（必填）").addText((t) => {
-      dueInput = t;
-      t.inputEl.type = "date";
-      t.setValue(due || "");
-      t.onChange((v) => {
-        due = (v ?? "").trim();
-        t.inputEl.classList.toggle("is-invalid", !isYmd(due));
-        refresh();
+    new Setting(contentEl)
+      .setName("计划开始日")
+      .setDesc("可选，对应任务行 ⏳（计划开始）")
+      .addText((t) => {
+        scheduledInput = t;
+        t.inputEl.type = "date";
+        t.setValue(scheduled || "");
+        t.onChange((v) => {
+          scheduled = (v ?? "").trim();
+          t.inputEl.classList.toggle("is-invalid", scheduled && !isYmd(scheduled));
+          refresh();
+        });
+        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
+          if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            void doSave();
+          }
+        });
       });
-      t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-        if (ev.key === "Enter" && !ev.shiftKey) {
-          ev.preventDefault();
-          void doSave();
-        }
-      });
-    });
 
-    new Setting(contentEl).setName("开始日期 start（可选）").addText((t) => {
-      startInput = t;
-      t.inputEl.type = "date";
-      t.setValue(start || "");
-      t.onChange((v) => {
-        start = (v ?? "").trim();
-        t.inputEl.classList.toggle("is-invalid", start && !isYmd(start));
-        refresh();
+    new Setting(contentEl)
+      .setName("计划结束日*")
+      .setDesc("必填，对应任务行 📅（计划完成/承诺完成日）")
+      .addText((t) => {
+        dueInput = t;
+        t.inputEl.type = "date";
+        t.setValue(due || "");
+        t.onChange((v) => {
+          due = (v ?? "").trim();
+          t.inputEl.classList.toggle("is-invalid", !isYmd(due));
+          refresh();
+        });
+        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
+          if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            void doSave();
+          }
+        });
       });
-      t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-        if (ev.key === "Enter" && !ev.shiftKey) {
-          ev.preventDefault();
-          void doSave();
-        }
-      });
-    });
 
-    new Setting(contentEl).setName("计划日期 scheduled（可选）").addText((t) => {
-      scheduledInput = t;
-      t.inputEl.type = "date";
-      t.setValue(scheduled || "");
-      t.onChange((v) => {
-        scheduled = (v ?? "").trim();
-        t.inputEl.classList.toggle("is-invalid", scheduled && !isYmd(scheduled));
-        refresh();
+    new Setting(contentEl)
+      .setName("工时评估 h")
+      .setDesc("非必填，单位：小时")
+      .addText((t) => {
+        estimateHInput = t;
+        t.inputEl.type = "number";
+        t.inputEl.placeholder = "例如 2 或 1.5";
+        t.setValue(estimateH || "");
+        t.onChange((v) => {
+          estimateH = (v ?? "").trim();
+          t.inputEl.classList.toggle("is-invalid", estimateH && !/^\d+(\.\d)?$/.test(estimateH));
+          refresh();
+        });
       });
-      t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-        if (ev.key === "Enter" && !ev.shiftKey) {
-          ev.preventDefault();
-          void doSave();
-        }
+
+    new Setting(contentEl)
+      .setName("任务复杂度")
+      .addDropdown((dd) => {
+        complexityDd = dd;
+        dd.addOption("normal", "一般任务");
+        dd.addOption("high", "高脑力 🧠");
+        dd.addOption("light", "轻量任务 🍃");
+        dd.setValue(complexity || "normal");
+        dd.onChange((v) => {
+          complexity = (v as "high" | "normal" | "light") || "normal";
+          refresh();
+        });
       });
-    });
 
     new Setting(contentEl)
       .setName("所属里程碑")
@@ -284,23 +318,47 @@ export class EditProjectTaskModal extends Modal {
           await this.plugin.projectMgr.moveProjectTaskToMilestone(this.projectFolderPath, ref, milestone);
         }
 
-        // 2) basic info update
+        // 2) basic info update（开始日期不在弹窗编辑，由「开始处理」时写入；已有 🛫 会保留）
+        const est = (estimateH ?? "").trim();
         await this.plugin.projectMgr.updateProjectTaskBasicInfo(this.projectFolderPath, ref, {
           text,
           due,
-          start,
           scheduled,
+          ...(est ? { estimateH: Number(est) } : {}),
+          ...(complexity !== "normal" ? { complexity } : {}),
         });
 
         // 3) status update
         if (status && status !== origStatus) {
-          await this.plugin.projectMgr.setProjectTaskStatus(this.projectFolderPath, ref, status);
+          const estForDone =
+            status === "DONE" ? parseFloat(String(estimateH ?? "").trim().replace(",", ".")) : NaN;
+          await this.plugin.projectMgr.setProjectTaskStatus(
+            this.projectFolderPath,
+            ref,
+            status,
+            status === "DONE" && Number.isFinite(estForDone) && estForDone > 0 ? { estimateH: estForDone } : undefined,
+          );
         }
 
         // best-effort: refresh index
         try {
           await this.plugin.projectMgr?.refreshDirty?.({ reason: "edit_project_task" });
         } catch {}
+
+        if (status && status !== origStatus && typeof this.plugin.refreshContactInteractionsForTasklistFile === "function") {
+          try {
+            const folder = String(this.projectFolderPath ?? "").trim();
+            if (folder) {
+              const snap = (this.plugin.projectMgr as any)?.getSnapshot?.() as any;
+              const projects = Array.isArray(snap?.projects) ? snap.projects : [];
+              const proj = projects.find((x: any) => String(x?.folderPath ?? x?.folder_path ?? "").trim() === folder);
+              const tasklistPath = (proj as any)?.tasklistFilePath ?? (proj as any)?.tasklist_file_path ?? normalizePath(`${folder}/项目任务清单.md`);
+              await this.plugin.refreshContactInteractionsForTasklistFile(tasklistPath);
+            }
+          } catch (e) {
+            console.warn("[RSLatte] refreshContactInteractions after edit project task failed", e);
+          }
+        }
 
         new Notice("已修改项目任务");
         this.plugin.refreshSidePanel();

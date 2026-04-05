@@ -17,7 +17,7 @@ export type AutoRefreshCoordinatorOptions = {
   registry: ModuleRegistry;
   engine: PipelineEngine;
 
-  /** 模块关闭不调度（coordinator 不调用 engine.run） */
+  /** 模块关闭不调度 */
   isModuleEnabled: (moduleKey: RSLatteModuleKey) => boolean;
 
   /** 每模块独立 interval（毫秒）。lastAutoRunAt 仅在成功后更新 */
@@ -41,31 +41,18 @@ export type AutoRefreshCoordinatorOptions = {
   afterTick?: () => void;
 
   /**
-   * 是否维持旧行为：task/memo auto_refresh 成功后弹 Notice
+   * 是否维持旧行为：task / memo / **schedule** 在 auto_refresh 成功后弹 Notice（文案「任务、提醒、日程」）。
    * 默认 true（尽量不改变用户可感知行为）。
    */
   showNoticeForTaskMemo?: boolean;
 };
 
 /**
- * Step S8: Coordinator 调度选择声明式（表驱动）
- * - record/task/memo = E2
- *   - record 组对应 checkin/finance（共享锁 record）
- * - publish 仅实现 atomic spec，无 legacy，必须走 E2
- * - 其他模块 = legacy（run）
- *
- * ⚠️ 只集中“选择策略”，不改变 tick 的时机/频率/顺序。
+ * **[X-Pipeline]（自动调度单轨）**
+ * - `tick` 内 **`auto_refresh` / `auto_archive` 一律 `engine.runE2`**，不再分支 `engine.run`（LEGACY）。
+ * - Atomic spec 由 `pipelineManager` + `specRegistry` 注入；无 atomic 时 `runE2` 返回 `SPEC_NOT_ATOMIC`（skipped）。
+ * - 各模块语义与门控见《索引优化方案》§7.0.1；`schedule` 的 **legacy** 槽仅为兼容占位，**自动 tick 不经过**。
  */
-const AUTO_PIPELINE_ROUTE: Readonly<Record<RSLatteModuleKey, "E2" | "LEGACY">> = {
-  task: "E2",
-  memo: "E2",
-  checkin: "E2", // record group
-  finance: "E2", // record group
-  project: "E2",
-  output: "E2",
-  contacts: "E2",
-  publish: "E2", // 仅 atomic spec，无 legacy-capable
-} as const;
 
 type ModuleAutoState = {
   lastAutoRunAt?: number; // epoch ms
@@ -121,19 +108,13 @@ export class AutoRefreshCoordinator {
     return momentFn().format("YYYY-MM-DD");
   }
 
-  /**
-   * Step S8: 表驱动选择 run/runE2。
-   * - 不改变 tick 频率/时机/顺序
-   * - 仅集中“模块->执行入口”的路由
-   */
+  /** 自动调度仅走 E2（与 `runAutoRefreshTick` / 侧栏手动 `runE2` 同源）。 */
   private async runAutoByRoute(
     spaceCtx: SpaceCtx,
     moduleKey: RSLatteModuleKey,
     mode: "auto_refresh" | "auto_archive"
   ): Promise<RSLatteResult<AutoRunData>> {
-    const route = AUTO_PIPELINE_ROUTE[moduleKey] ?? "LEGACY";
-    const r: any = route === "E2" ? await this.engine.runE2(spaceCtx, moduleKey, mode) : await this.engine.run(spaceCtx, moduleKey, mode);
-    // 统一返回形状：至少包含 skipped/reason（Engine 两条路径都满足）
+    const r: any = await this.engine.runE2(spaceCtx, moduleKey, mode);
     return r as RSLatteResult<AutoRunData>;
   }
 
@@ -141,7 +122,7 @@ export class AutoRefreshCoordinator {
    * 单次 tick：
    * - 逐模块判断是否到达 interval，决定是否调度 auto_refresh
    * - 每日一次 per-module auto_archive
-   * - 实际执行统一通过 engine.run / engine.runE2（逐模块选择）
+   * - 实际执行统一通过 **engine.runE2**
    */
   public async tick(spaceCtx: SpaceCtx): Promise<CoordinatorTickResult> {
     const now = Date.now();
@@ -216,11 +197,12 @@ export class AutoRefreshCoordinator {
       }
     }
 
-    // 维持旧行为：task/memo auto_refresh 成功后弹 Notice（仅这两个）
+    // 维持旧行为：任务域三模块 auto_refresh 成功后弹 Notice（与 E2 路由一致）
     if (this.showNoticeForTaskMemo) {
       const labels: string[] = [];
       if (ranAutoRefresh.includes("task")) labels.push("任务");
-      if (ranAutoRefresh.includes("memo")) labels.push("备忘");
+      if (ranAutoRefresh.includes("memo")) labels.push("提醒");
+      if (ranAutoRefresh.includes("schedule")) labels.push("日程");
       if (labels.length) {
         new Notice(`自动刷新完成：${labels.join("、")}`);
       }

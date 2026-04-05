@@ -5,7 +5,6 @@ import {
   Notice,
   Setting,
   ToggleComponent,
-  moment,
   normalizePath,
   TFolder,
 } from "obsidian";
@@ -19,6 +18,9 @@ type ImRow = { platform: string; handle: string; primary: boolean };
 type AddContactModalOpts = {
   onCreated?: () => Promise<void> | void;
 };
+
+const CONTACT_GEN_START = "<!-- rslatte:contact:generated:start -->";
+const CONTACT_GEN_END = "<!-- rslatte:contact:generated:end -->";
 
 function splitList(raw: string): string[] {
   return (raw ?? "")
@@ -123,70 +125,93 @@ async function ensureFolder(app: App, path: string): Promise<void> {
   }
 }
 
-async function readTemplate(app: App, templatePath: string): Promise<string> {
-  const raw = (templatePath ?? "").trim();
-  if (!raw) return "";
-
-  const candidates: string[] = [];
-  candidates.push(normalizePath(raw));
-  if (!/\.md$/i.test(raw)) candidates.push(normalizePath(raw + ".md"));
-
-  for (const p of candidates) {
-    const af = app.vault.getAbstractFileByPath(p);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const TFileAny: any = (app as any).vault?.getAbstractFileByPath(p)?.constructor;
-    if (af && (af as any).extension === "md") {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return await app.vault.read(af as any);
-      } catch {
-        // ignore
-      }
-    } else if (af && af instanceof (window as any).TFile) {
-      // fallback (in case runtime has TFile global)
-      try {
-        return await app.vault.read(af as any);
-      } catch {
-        // ignore
-      }
-    } else if (af && TFileAny && af instanceof TFileAny) {
-      try {
-        return await app.vault.read(af as any);
-      } catch {
-        // ignore
-      }
-    }
-  }
-  return "";
+function joinSlash(values: any): string {
+  if (!Array.isArray(values)) return "";
+  const xs = values.map((x) => String(x ?? "").trim()).filter(Boolean);
+  return xs.join(" / ");
 }
 
-function applyFrontmatterToTemplate(tplRaw: string, fmYaml: string, vars: Record<string, string>): string {
-  const fmBlock = `---\n${fmYaml}\n---\n`;
-  const tpl = (tplRaw ?? "").toString();
-
-  const hasFm = /^---\s*\n[\s\S]*?\n---\s*\n?/m.test(tpl);
-  let content = tpl;
-  if (hasFm) {
-    content = content.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/m, fmBlock);
-  } else {
-    content = fmBlock + (content ? `\n${content}` : "");
+function renderKvLines(rows: any): string[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const out: string[] = [];
+  for (const r of rows) {
+    if (!r || typeof r !== "object") continue;
+    const label = String((r as any).label ?? "").trim();
+    const value = String((r as any).value ?? "").trim();
+    if (!label && !value) continue;
+    if (label && value) out.push(`- ${label}：${value}`);
+    else out.push(`- ${label || value}`);
   }
+  return out;
+}
 
-  // Simple placeholder replacement (no dependency on templater)
-  for (const [k, v] of Object.entries(vars)) {
-    content = content.replace(new RegExp(`\\{\\{${k}\\}\\}`, "g"), v ?? "");
+function renderImLines(rows: any): string[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const out: string[] = [];
+  for (const r of rows) {
+    if (!r || typeof r !== "object") continue;
+    const platform = String((r as any).platform ?? "").trim();
+    const handle = String((r as any).handle ?? "").trim();
+    if (!platform && !handle) continue;
+    if (platform && handle) out.push(`- ${platform}：${handle}`);
+    else out.push(`- ${platform || handle}`);
   }
+  return out;
+}
 
-  // Clear any remaining placeholders to avoid leaking raw template tokens
-  // (keeps the file readable even if the template contains extra vars we don't provide yet)
-  content = content.replace(/\{\{[^}]+\}\}/g, "");
+function renderGeneratedContactSection(obj: Record<string, any>): string {
+  const displayName = String(obj.display_name ?? "").trim();
+  const aliases = joinSlash(obj.aliases);
+  const groupName = String(obj.group_name ?? "").trim();
+  const title = String(obj.title ?? "").trim();
+  const status = String(obj.status ?? "").trim();
+  const tags = joinSlash(obj.tags);
+  const summary = String(obj.summary ?? "").trim();
+  const company = String(obj.company ?? "").trim();
+  const department = String(obj.department ?? "").trim();
+  const phones = renderKvLines(obj.phones);
+  const emails = renderKvLines(obj.emails);
+  const im = renderImLines(obj.im);
 
-  // If template body is empty, give a minimal title
-  const body = content.replace(/^---[\s\S]*?---\s*\n?/m, "").trim();
-  if (!body) {
-    content = fmBlock + `\n# ${vars.display_name || vars.displayName || "联系人"}\n`;
+  const lines: string[] = [];
+  lines.push(CONTACT_GEN_START);
+  lines.push("## 基本信息");
+  if (displayName) lines.push(`- 姓名：${displayName}`);
+  if (aliases) lines.push(`- 别名：${aliases}`);
+  if (groupName) lines.push(`- 分组：${groupName}`);
+  lines.push(`- 职位/头衔：${title || "-"}`);
+  if (status) lines.push(`- 状态：${status}`);
+  if (tags) lines.push(`- 标签：${tags}`);
+  lines.push("");
+  lines.push("## 工作信息");
+  if (company) lines.push(`- 公司：${company}`);
+  if (department) lines.push(`- 部门：${department}`);
+  if (summary) lines.push(`- 简介：${summary}`);
+  lines.push("");
+  lines.push("## 联系方式");
+  if (phones.length) {
+    lines.push("### 电话（phones）");
+    lines.push(...phones);
+    lines.push("");
   }
-  return content;
+  if (emails.length) {
+    lines.push("### 邮箱（emails）");
+    lines.push(...emails);
+    lines.push("");
+  }
+  if (im.length) {
+    lines.push("### 即时通讯（im）");
+    lines.push(...im);
+    lines.push("");
+  }
+  lines.push(CONTACT_GEN_END);
+  return lines.join("\n").trim() + "\n";
+}
+
+function buildContactFileContent(fmYaml: string, obj: Record<string, any>): string {
+  const title = String(obj.display_name ?? "联系人").trim() || "联系人";
+  const generated = renderGeneratedContactSection(obj);
+  return `---\n${fmYaml}\n---\n\n# ${title}\n\n${generated}`;
 }
 
 async function writeBinary(app: App, path: string, data: ArrayBuffer): Promise<void> {
@@ -232,7 +257,7 @@ export class AddContactModal extends Modal {
     // Required
     let displayName = "";
     let aliasesRaw = "";
-    let groupName = "";
+    let groupName = "default";
     let title = "";
 
     // Optional
@@ -247,7 +272,7 @@ export class AddContactModal extends Modal {
     let bDay = "";
     let bLeap = false;
     let bNote = "";
-    let bAddMemo = false; // ✅ 是否添加生日备忘
+    let bAddMemo = false; // ✅ 是否添加生日提醒
 
     const phones: KVPrimary[] = [];
     const emails: KVPrimary[] = [];
@@ -257,12 +282,19 @@ export class AddContactModal extends Modal {
 
     let saveBtn!: ButtonComponent;
 
+    const getGroupBlacklist = (): Set<string> => {
+      const raw = (this.plugin.settings as any)?.contactsModule?.groupDirBlacklist;
+      const arr = Array.isArray(raw) ? raw : ["templates", "_archived"];
+      return new Set(
+        arr
+          .map((x: any) => String(x ?? "").trim().toLowerCase())
+          .filter(Boolean)
+      );
+    };
+
     const refreshSaveState = () => {
       const dnOk = (displayName ?? "").trim().length > 0;
-      const alOk = uniq(splitList(aliasesRaw)).length > 0;
-      const gnOk = (groupName ?? "").trim().length > 0;
-      const tOk = (title ?? "").trim().length > 0;
-      const ok = dnOk && alOk && gnOk && tOk;
+      const ok = dnOk;
       saveBtn?.setDisabled(!ok);
       return ok;
     };
@@ -282,7 +314,7 @@ export class AddContactModal extends Modal {
       });
 
     new Setting(contentEl)
-      .setName("别名（必填，可多项）")
+      .setName("别名（可选，可多项）")
       .setDesc("aliases：用逗号/换行分隔")
       .addTextArea((t) => {
         const ta = t.inputEl;
@@ -297,10 +329,11 @@ export class AddContactModal extends Modal {
 
     // Group: use datalist (existing folders) + free text
     const groupSetting = new Setting(contentEl)
-      .setName("分组（必填）")
+      .setName("分组（默认 default）")
       .setDesc("group_name：对应 contactsDir 下子目录")
       .addText((t) => {
-        t.setPlaceholder("例如：Work / Personal");
+        t.setPlaceholder("例如：default / Work / Personal");
+        t.setValue(groupName);
         // datalist
         const dlId = `rslatte-contacts-group-${Math.random().toString(16).slice(2)}`;
         const dl = document.createElement("datalist");
@@ -314,9 +347,16 @@ export class AddContactModal extends Modal {
             const contactsDir = normalizePath(String((this.plugin.settings as any)?.contactsModule?.contactsDir ?? "90-Contacts").trim() || "90-Contacts");
             const af = this.app.vault.getAbstractFileByPath(contactsDir);
             const dirs: string[] = [];
+            const blacklist = getGroupBlacklist();
             if (af && af instanceof TFolder) {
               for (const child of af.children) {
-                if (child instanceof TFolder && child.name !== ".attachments" && child.name !== ".rslatte") {
+                const name = String((child as TFolder).name ?? "");
+                if (
+                  child instanceof TFolder &&
+                  name !== ".attachments" &&
+                  name !== ".rslatte" &&
+                  !blacklist.has(name.toLowerCase())
+                ) {
                   dirs.push(child.name);
                 }
               }
@@ -333,7 +373,7 @@ export class AddContactModal extends Modal {
         })();
 
         t.onChange((v) => {
-          groupName = v;
+          groupName = v || "default";
           refreshSaveState();
         });
       });
@@ -341,7 +381,7 @@ export class AddContactModal extends Modal {
     void groupSetting;
 
     new Setting(contentEl)
-      .setName("职务（必填）")
+      .setName("职务（可选）")
       .setDesc("title")
       .addText((t) => {
         t.setPlaceholder("例如：前端负责人");
@@ -554,9 +594,9 @@ export class AddContactModal extends Modal {
       const noteIn = b.createEl("input", { type: "text", placeholder: "note", cls: "rslatte-contacts-search" });
       noteIn.oninput = () => (bNote = noteIn.value);
 
-      // ✅ 是否添加生日备忘开关
+      // ✅ 是否添加生日提醒开关
       const addMemoWrap = b.createDiv({ cls: "rslatte-contact-modal-inline" });
-      addMemoWrap.createSpan({ text: "添加生日备忘" });
+      addMemoWrap.createSpan({ text: "添加生日提醒" });
       const addMemoToggle = new ToggleComponent(addMemoWrap);
       addMemoToggle.setValue(bAddMemo);
       addMemoToggle.onChange((v) => (bAddMemo = v));
@@ -573,14 +613,18 @@ export class AddContactModal extends Modal {
 
     const doSave = async () => {
       if (!refreshSaveState()) {
-        new Notice("请填写必填字段：姓名 / 别名 / 分组 / 职务");
+        new Notice("请填写必填字段：姓名");
         return;
       }
 
       const contactsDir = normalizePath(String((this.plugin.settings as any)?.contactsModule?.contactsDir ?? "90-Contacts").trim() || "90-Contacts");
-      const templatePath = normalizePath(String((this.plugin.settings as any)?.contactsModule?.templatePath ?? "99-Templates/t_contact.md").trim() || "99-Templates/t_contact.md");
-
-      const gn = sanitizeFolderName(groupName);
+      const rawGroup = sanitizeFolderName((groupName ?? "").trim() || "default");
+      const gn = rawGroup || "default";
+      const blacklist = getGroupBlacklist();
+      if (blacklist.has(gn.toLowerCase())) {
+        new Notice(`分组不能使用黑名单目录：${gn}`);
+        return;
+      }
       if (!gn) {
         new Notice("分组不能为空");
         return;
@@ -658,81 +702,6 @@ export class AddContactModal extends Modal {
         extra: {},
       };
 
-      // =========================
-      // Template vars for body placeholders
-      // =========================
-      const status = String(fmObj.status ?? "active");
-      const statusDisplay = status; // keep english to align with existing status field
-      const aliasesInline = (aliases ?? []).join(" / ");
-      const tagsInline = (tags ?? []).join(" / ");
-      const fmtPrimary = (p: boolean) => (p ? " (primary)" : "");
-      const phonesLines = cleanKv(phones)
-        .map((r) => `- ${(r.label || "phone").trim()}: ${(r.value || "").trim()}${fmtPrimary(!!r.primary)}`)
-        .join("\n");
-      const emailsLines = cleanKv(emails)
-        .map((r) => `- ${(r.label || "email").trim()}: ${(r.value || "").trim()}${fmtPrimary(!!r.primary)}`)
-        .join("\n");
-      const imLines = cleanIm(ims)
-        .map((r) => `- ${(r.platform || "im").trim()}: ${(r.handle || "").trim()}${fmtPrimary(!!r.primary)}`)
-        .join("\n");
-
-      const birthdayObj = fmObj.birthday as any | null | undefined;
-      const birthdayType = birthdayObj?.type ? String(birthdayObj.type) : "";
-      const birthdayDisplayType = birthdayType === "lunar" ? "农历" : birthdayType === "solar" ? "阳历" : "";
-      const bMonthV = birthdayObj?.month ? String(birthdayObj.month) : "";
-      const bDayV = birthdayObj?.day ? String(birthdayObj.day) : "";
-      const bLeapV = typeof birthdayObj?.leap_month === "boolean" ? String(birthdayObj.leap_month) : "";
-      const bNoteV = birthdayObj?.note ? String(birthdayObj.note) : "";
-
-      const templateVars: Record<string, string> = {
-        // Common keys
-        display_name: fmObj.display_name,
-        displayName: fmObj.display_name,
-        contact_uid: uid,
-        contactUid: uid,
-        group_name: gn,
-        groupName: gn,
-        title: fmObj.title,
-        status,
-        status_display: statusDisplay,
-        statusDisplay,
-        summary: String(fmObj.summary ?? ""),
-        company: String(fmObj.company ?? ""),
-        department: String(fmObj.department ?? ""),
-        avatar_path: String(fmObj.avatar_path ?? ""),
-
-        // Lists / inline
-        aliases_inline: aliasesInline,
-        tags_inline: tagsInline,
-        phones_lines: phonesLines,
-        emails_lines: emailsLines,
-        im_lines: imLines,
-
-        // Some templates may still reference YAML placeholders
-        aliases: JSON.stringify(aliases ?? []),
-        tags: JSON.stringify(tags ?? []),
-        phones: JSON.stringify(cleanKv(phones)),
-        emails: JSON.stringify(cleanKv(emails)),
-        im: JSON.stringify(cleanIm(ims).map((r) => ({ platform: r.platform, handle: r.handle, primary: !!r.primary }))),
-        cancelled_at: "null",
-        last_interaction_at: "null",
-        created_at: now,
-        updated_at: now,
-
-        // Birthday dot-keys used by the provided template
-        "birthday.type": birthdayType,
-        "birthday.month": bMonthV,
-        "birthday.day": bDayV,
-        "birthday.leap_month": bLeapV,
-        "birthday.note": bNoteV,
-        birthday_display_type: birthdayDisplayType,
-
-        // Extra fields placeholders
-        "extra.note": "",
-        "extra.custom_fields": "{}",
-        custom_fields_lines: "",
-      };
-
       // remove empty fields for nicer yaml
       if (!fmObj.summary) delete fmObj.summary;
       if (!fmObj.company) delete fmObj.company;
@@ -749,8 +718,7 @@ export class AddContactModal extends Modal {
 
       try {
         await ensureFolder(this.app, normalizePath(`${contactsDir}/${gn}`));
-        const tplRaw = await readTemplate(this.app, templatePath);
-        const content = applyFrontmatterToTemplate(tplRaw, fmYaml, templateVars);
+        const content = buildContactFileContent(fmYaml, fmObj);
 
         const exists = await this.app.vault.adapter.exists(filePath);
         if (exists) {
@@ -768,7 +736,6 @@ export class AddContactModal extends Modal {
 
         // Work events: append-only stream for timeline/statistics (best-effort)
         try {
-          const momentFn = moment as any;
           await (this.plugin as any).workEventSvc?.append({
             ts: new Date().toISOString(),
             kind: "contact",
@@ -789,7 +756,7 @@ export class AddContactModal extends Modal {
 
         new Notice("联系人已创建");
 
-        // ✅ 如果启用了生日备忘，创建或更新对应的备忘记录
+        // ✅ 如果启用了生日提醒，创建或更新对应的提醒记录
         if (bAddMemo && fmObj.birthday) {
           try {
             const bMonthNum = parseInt(bMonth, 10);
@@ -804,6 +771,7 @@ export class AddContactModal extends Modal {
                 day: bDayNum,
                 leapMonth: bLeap,
               });
+              // birth_memo_uid/birth_memo_uids 已在 service.createOrUpdateContactBirthdayMemo 内统一回写
               
               // ✅ 刷新索引以便立即在侧边栏显示
               await this.plugin.taskRSLatte.refreshIndexAndSync({ sync: false, noticeOnError: false });

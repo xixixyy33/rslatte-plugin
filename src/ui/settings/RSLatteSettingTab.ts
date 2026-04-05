@@ -6,34 +6,76 @@ import {
   PluginSettingTab,
   Setting,
   TextComponent,
+  TFile,
   normalizePath,
   moment,
 } from "obsidian";
 import type RSLattePlugin from "../../main";
-import type { CheckinItemDef, FinanceCatDef, JournalPanel } from "../../types/rslatteTypes";
+import type { FinanceCatDef, JournalPanel } from "../../types/rslatteTypes";
 import { ResetVaultIdConfirmModal } from "../modals/ResetVaultIdConfirmModal";
 import { ResetVaultIdFinalModal } from "../modals/ResetVaultIdFinalModal";
+import { PluginEnvCheckModal } from "../modals/PluginEnvCheckModal";
 import { AddSpaceModal } from "../modals/AddSpaceModal";
-import { apiTry } from "../../api";
-import { DEFAULT_SETTINGS } from "../../constants/defaults";
+import { apiTry, joinApiUrl } from "../../api";
+import { DEFAULT_SETTINGS, MIN_ARCHIVE_THRESHOLD_DAYS, archiveThresholdFromUserInput } from "../../constants/defaults";
 import { ensureUiHeaderButtonsConfig, setUiHeaderButtonVisibility, getUiHeaderButtonsVisibility } from "../helpers/uiHeaderButtons";
 import { normalizeRunSummaryForUi } from "../helpers/normalizeRunSummaryForUi";
 import { renderCheckinSettings } from "./sections/renderCheckinSettings";
 import { renderFinanceSettings } from "./sections/renderFinanceSettings";
+import { renderHealthSettings } from "./sections/renderHealthSettings";
 import { renderTaskSettings } from "./sections/renderTaskSettings";
 import { renderMemoSettings } from "./sections/renderMemoSettings";
+import { renderScheduleSettings } from "./sections/renderScheduleSettings";
 import { renderProjectSettings } from "./sections/renderProjectSettings";
 import { renderOutputSettings } from "./sections/renderOutputSettings";
+import { renderKnowledgeSettings } from "./sections/renderKnowledgeSettings";
 import { renderContactsSettings } from "./sections/renderContactsSettings";
-import { renderPublishSettings } from "./sections/renderPublishSettings";
 import { renderStatsSettings } from "./sections/renderStatsSettings";
 import { DEFAULT_SPACE_ID } from "../../constants/space";
-import { extractPerSpaceSettings, applyPerSpaceSettings } from "../../services/spaceSettings";
-import { SpacesIndexService } from "../../services/spacesIndexService";
+import { VIEW_TYPE_KNOWLEDGE } from "../../constants/viewTypes";
+import { extractPerSpaceSettings, applyPerSpaceSettings } from "../../services/space/spaceSettings";
+import {
+  buildDefaultRootPrefix,
+  buildSettingsSnapshotForNewSpace,
+  pickNextAvailableSpaceNumberForNewSpace,
+} from "../../services/space/spaceDirectoryDefaults";
+import { ensureSpaceSnapshotAndKnowledgeDirs } from "../../services/space/ensureSpaceVaultDirectories";
+import { SpacesIndexService } from "../../services/space/spacesIndexService";
 import type { RSLatteSpaceConfig } from "../../types/space";
+import type { RSLattePluginSettings } from "../../types/settings";
+
+function rslatteOpenRegisterPage(baseUrl: string): void {
+  const b = String(baseUrl ?? "").trim().replace(/\/+$/, "");
+  if (!b) {
+    new Notice("请先填写有效的 API Base URL");
+    return;
+  }
+  const u = joinApiUrl(b, "/auth/register-page");
+  try {
+    const w: any = window;
+    const e = w.require?.("electron");
+    if (e?.shell?.openExternal) {
+      e.shell.openExternal(u);
+      return;
+    }
+  } catch {
+    /* ignore */
+  }
+  window.open(u, "_blank");
+}
+
+function noticeAndNormalizeArchiveThresholdInput(input: HTMLInputElement): number {
+  const { value: n, notifyBelowMin } = archiveThresholdFromUserInput(input.value);
+  if (notifyBelowMin) {
+    new Notice(`归档阈值不能小于 ${MIN_ARCHIVE_THRESHOLD_DAYS} 天，已改为 ${MIN_ARCHIVE_THRESHOLD_DAYS}。`);
+  }
+  input.value = String(n);
+  return n;
+}
 
 export class RSLatteSettingTab extends PluginSettingTab {
   plugin: RSLattePlugin;
+  private _lastFinanceCategoriesBackupJson = "";
 
   private _conflictCheckinIds = new Set<string>();
   private _conflictFinanceIds = new Set<string>();
@@ -94,19 +136,17 @@ export class RSLatteSettingTab extends PluginSettingTab {
         this.refreshHubView();
         
         // 触发发布侧边栏刷新（如果已打开）
-        this.refreshPublishSidePanel();
+        this.refreshKnowledgeSidePanel();
       }
     } catch (e) {
       console.warn("[RSLatte][Settings] Failed to update current space snapshot:", e);
     }
   }
   
-  /**
-   * 刷新发布侧边栏（如果已打开）
-   */
-  private refreshPublishSidePanel(): void {
+  /** §4：刷新 Knowledge 工作台视图（若已打开） */
+  private refreshKnowledgeSidePanel(): void {
     try {
-      const leaves = this.app.workspace.getLeavesOfType("rslatte-publishpanel");
+      const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_KNOWLEDGE);
       for (const leaf of leaves) {
         const view = leaf.view;
         if (view && typeof (view as any).refresh === "function") {
@@ -116,7 +156,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
         }
       }
     } catch (e) {
-      console.warn("[RSLatte][Settings] Failed to refresh Publish side panel:", e);
+      console.warn("[RSLatte][Settings] Failed to refresh Knowledge view:", e);
     }
   }
 
@@ -439,8 +479,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
         memo: legacyTaskOn,
         project: legacyProjectOn,
         output: legacyOutputOn,
-        publish: true, // 发布模块默认启用
-        mobile: true, // 手机模块默认启用
+        publish: false, // §4：独立发布侧栏已下线
         ...(d || {}),
       };
     } else {
@@ -457,8 +496,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
       if (me2.memo === undefined) me2.memo = legacyTaskOn;
       if (me2.project === undefined) me2.project = legacyProjectOn;
       if (me2.output === undefined) me2.output = legacyOutputOn;
-      if (me2.publish === undefined) me2.publish = true; // 发布模块默认启用
-      if (me2.mobile === undefined) me2.mobile = true; // 手机模块默认启用
+      if (me2.publish === undefined) me2.publish = false; // §4：独立发布侧栏已下线
     }
 
 
@@ -478,11 +516,16 @@ export class RSLatteSettingTab extends PluginSettingTab {
     // 兼容：曾经有过 setMoEnabled 的拼写（避免运行时报错导致设置页渲染中断）
     const setMoEnabled = setModEnabled;
 
-    const isV2Enabled = (k: 'journal' | 'checkin' | 'finance' | 'task' | 'memo' | 'project' | 'output' | 'contacts' | 'mobile' | 'publish') => {
+    const modGateOpen = this.plugin.isPluginEnvInitModuleGateOpen();
+    const isV2Enabled = (
+      k: 'journal' | 'checkin' | 'finance' | 'health' | 'task' | 'memo' | 'project' | 'output' | 'contacts' | 'knowledge',
+    ) => {
+      if (!modGateOpen) return false;
+      if (k === 'knowledge') return true;
       const me2: any = sAny.moduleEnabledV2 ?? {};
       const direct = me2[k];
+      if (k === 'health') return direct === true;
       if (k === 'contacts') return direct === true;
-      if (k === 'mobile') return direct !== false && (direct === true || direct === undefined);
       if (direct !== undefined) return Boolean(direct);
       // fallback to legacy
       if (k === 'checkin' || k === 'finance') return isLegacyEnabled('record');
@@ -495,7 +538,14 @@ export class RSLatteSettingTab extends PluginSettingTab {
     // ===== UI：可折叠设置分组（用于减少长页面滚动） =====
     // - 使用 <details>/<summary>，不引入额外依赖。
     // - 默认：后端信息维护展开，其余模块折叠。
-    const makeCollapsibleSection = (title: string, open: boolean = false, extraCls: string = ""): HTMLElement => {
+    /** 侧栏折叠标题旁标签：与 `SPACE_SCOPED_SETTING_KEYS` 实际是否隔离一致（见空间管理优化方案文档）。 */
+    type SettingsScopeTag = "global" | "space";
+    const makeCollapsibleSection = (
+      title: string,
+      open: boolean = false,
+      extraCls: string = "",
+      scopeTag?: SettingsScopeTag,
+    ): HTMLElement => {
       const cls = ["rslatte-collapsible", extraCls].filter(Boolean).join(" ");
       const details = containerEl.createEl("details", { cls }) as HTMLDetailsElement;
       details.setAttr('data-rslatte-collapsible-key', title);
@@ -503,7 +553,17 @@ export class RSLatteSettingTab extends PluginSettingTab {
 
       // summary 需要可点击；用 rslatte-setting-h2 保持现有视觉风格
       const summary = details.createEl("summary", { cls: "rslatte-collapsible-summary rslatte-setting-h2" });
-      summary.createSpan({ text: title });
+      const head = summary.createDiv({ cls: "rslatte-collapsible-summary-head" });
+      head.createSpan({ text: title });
+      if (scopeTag) {
+        head.createSpan({
+          cls:
+            scopeTag === "global"
+              ? "rslatte-settings-scope-tag rslatte-settings-scope-global"
+              : "rslatte-settings-scope-tag rslatte-settings-scope-space",
+          text: scopeTag === "global" ? "全局" : "空间",
+        });
+      }
 
       const body = details.createDiv({ cls: "rslatte-collapsible-body" });
       return body;
@@ -529,9 +589,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
       return body;
     };
 
-    const makeModuleWrap = (k: 'journal' | 'checkin' | 'finance' | 'task' | 'memo' | 'project' | 'output' | 'contacts' | 'mobile' | 'publish', title: string) => {
+    const makeModuleWrap = (
+      k: 'journal' | 'checkin' | 'finance' | 'health' | 'task' | 'memo' | 'project' | 'output' | 'contacts' | 'knowledge',
+      title: string,
+      scopeTag: SettingsScopeTag = "space",
+    ) => {
       // 模块分组默认折叠
-      const body = makeCollapsibleSection(title, false, 'rslatte-module-wrap');
+      const body = makeCollapsibleSection(title, false, "rslatte-module-wrap", scopeTag);
       const details = body.parentElement as HTMLDetailsElement | null;
       if (details && !isV2Enabled(k)) details.addClass('is-disabled');
       return body;
@@ -585,7 +649,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
     // 说明：以下配置为全局配置，所有空间共用，不应按空间隔离。
     // 包括：Vault ID、DB 同步批量大小、Reconcile 安全门、索引目录、自动刷新索引、自动刷新频率、Debug Log
     // =========================
-    const globalConfigWrap = makeCollapsibleSection("全局配置", true, "rslatte-global-config-wrap");
+    const globalConfigWrap = makeCollapsibleSection("全局配置", true, "rslatte-global-config-wrap", "global");
 
     // ===== DB 初始化检查（受 API Base URL 约束）：只触发一次，完成后重绘一次 =====
     // - API Base URL 为空：视为不可用，但不主动 fetch（避免 Failed to fetch 噪声）
@@ -616,7 +680,11 @@ export class RSLatteSettingTab extends PluginSettingTab {
       // legacy 聚合字段仅作为兜底（避免旧配置迁移前误判）
       const legacyRecord = !!(s?.rslattePanelEnableDbSync);
       const legacyTask = !!(s?.taskPanel?.enableDbSync);
-      return chk || fin || tsk || mem || cts || prj || out || legacyRecord || legacyTask;
+      const wev = !!(s?.workEventDbSyncEnabled);
+      const kn = !!(s?.knowledgePanel?.enableDbSync);
+      const hlth = !!(s?.healthPanel?.enableDbSync);
+      const schDb = !!(s?.scheduleModule?.enableDbSync);
+      return chk || fin || tsk || mem || cts || prj || out || legacyRecord || legacyTask || wev || kn || hlth || schDb;
     })();
     const shouldTouchBackendNow = urlCheckable && anyDbSyncEnabled;
     const lastCheckedUrl = (this as any)._rslatteDbCheckUrl as string | undefined;
@@ -723,10 +791,10 @@ export class RSLatteSettingTab extends PluginSettingTab {
         });
       });
 
-    // Vault 信息同步：将当前知识库名称与空间列表写入后端 vault / vault_space，便于手机端 PWA 按名称查找
+    // Vault 信息同步：将当前知识库名称与空间列表写入后端 vault / vault_space
     new Setting(globalConfigWrap)
       .setName("Vault 信息同步")
-      .setDesc("将当前知识库名称与空间列表同步到后端，便于手机端 PWA 按知识库名称连接。需已配置 API 且至少开启一项 DB 同步。")
+      .setDesc("将当前知识库名称与空间列表同步到后端。需已配置 API 且至少开启一项 DB 同步。")
       .addButton(btn => {
         btn.setButtonText("同步到后端");
         btn.onClick(async () => {
@@ -743,6 +811,20 @@ export class RSLatteSettingTab extends PluginSettingTab {
         });
       });
 
+    new Setting(globalConfigWrap)
+      .setName("插件初始化环境检查")
+      .setDesc(
+        "首次使用前须在此完成强制项（含 Obsidian、目录、模板）并通过后点击「完成初始化（启用模块）」，业务模块才会按「模块管理」中的开关运行。另含推荐第三方插件建议项。支持一键补齐目录与模板。详见《空间管理优化方案》§8。",
+      )
+      .addButton((btn) => {
+        btn.setButtonText("打开检查…");
+        btn.onClick(() => {
+          new PluginEnvCheckModal(this.app, this.plugin, () => {
+            this.display();
+          }).open();
+        });
+      });
+
     // ===== 高级同步参数（v2，公用） =====
     // 这些是“后端同步/一致性”策略，放在「后端信息维护」里更符合用户心智。
     // 注意：仅做 UI 归位，不改变任何业务逻辑与设置存储字段。
@@ -755,14 +837,8 @@ export class RSLatteSettingTab extends PluginSettingTab {
         taskFolders: [],
         includeTags: [],
         excludeTags: [],
-        builtinLists: {
-          todayTodo: { enabled: true, maxItems: 20, sortField: "due", sortOrder: "asc" },
-          weekTodo: { enabled: true, maxItems: 20, sortField: "due", sortOrder: "asc" },
-          inProgress: { enabled: true, maxItems: 20, sortField: "start", sortOrder: "asc" },
-          overdue: { enabled: true, maxItems: 20, sortField: "due", sortOrder: "asc" },
-          todayDone: { enabled: true, maxItems: 20, sortField: "done", sortOrder: "desc" },
-        },
-        // categories: [] // legacy
+        overdueWithinDays: 3,
+        closedTaskWindowDays: 7,
       };
     }
 
@@ -795,7 +871,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
 
     new Setting(globalConfigWrap)
       .setName("Reconcile 安全门：仅对干净文件执行")
-      .setDesc("开启后：仅对本次扫描结果中“无 uidMissing（每条任务/备忘都具备 uid）”的文件执行 reconcile，避免部分文件未补齐 uid 时误删。")
+      .setDesc("开启后：仅对本次扫描结果中“无 uidMissing（每条任务/提醒都具备 uid）”的文件执行 reconcile，避免部分文件未补齐 uid 时误删。")
       .addToggle((tog) =>
         tog.setValue(tp.reconcileRequireFileClean ?? true)
           .onChange(async (v) => {
@@ -811,13 +887,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
 
     new Setting(globalConfigWrap)
       .setName("索引目录")
-      .setDesc("存放中央索引/队列/索引归档，建议放在隐藏目录（如：95-Tasks/.rslatte）。")
+      .setDesc("存放中央索引、同步队列，以及各模块「索引归档」JSON（archive/ 子目录）。与「笔记归档」（移动 Vault 笔记/文件夹）及「日记按月」不同。V2 默认：00-System/.rslatte。")
       .addText(t => {
         const s: any = this.plugin.settings as any;
-        t.setPlaceholder("95-Tasks/.rslatte");
-        t.setValue(String(s.centralIndexDir ?? "95-Tasks/.rslatte"));
+        t.setPlaceholder("00-System/.rslatte");
+        t.setValue(String(s.centralIndexDir ?? "00-System/.rslatte"));
         t.onChange(async (v) => {
-          const dir = (v ?? "").trim() || "95-Tasks/.rslatte";
+          const dir = (v ?? "").trim() || "00-System/.rslatte";
           s.centralIndexDir = dir;
 
           // 写回旧字段，保证各模块读到一致的目录
@@ -836,7 +912,30 @@ export class RSLatteSettingTab extends PluginSettingTab {
         });
       });
 
-
+    // V2 知识库目录（00/10/20/30/90）
+    new Setting(globalConfigWrap)
+      .setName("启用 V2 知识库目录")
+      .setDesc("开启后可使用 00-System/10-Personal/20-Work/30-Knowledge/90-Archive 结构；新内容写入路径可后续接轨。")
+      .addToggle(t => {
+        const s: any = this.plugin.settings as any;
+        t.setValue(!!s.useV2DirectoryStructure);
+        t.onChange(async (v) => {
+          s.useV2DirectoryStructure = !!v;
+          await this.plugin.saveSettings();
+        });
+      });
+    new Setting(globalConfigWrap)
+      .setName("V2 目录根路径")
+      .setDesc("相对 vault 的根路径，为空则使用 vault 根。仅当启用 V2 知识库目录时生效。")
+      .addText(t => {
+        const s: any = this.plugin.settings as any;
+        t.setPlaceholder("（留空=vault 根）");
+        t.setValue(String(s.v2DirectoryRoot ?? ""));
+        t.onChange(async (v) => {
+          s.v2DirectoryRoot = (v ?? "").trim();
+          await this.plugin.saveSettings();
+        });
+      });
 
     new Setting(globalConfigWrap)
       .setName("自动刷新索引")
@@ -891,6 +990,9 @@ export class RSLatteSettingTab extends PluginSettingTab {
     // 状态提示（原来在“后端信息维护”顶部的红色提示框）
     {
       const box = dbSyncWrap.createDiv({ cls: "rslatte-db-status-box" });
+      const touch: any = (this.plugin as any)?.vaultSvc?.shouldTouchBackendNow?.() ?? { ok: false, reason: "", baseUrl: "" };
+      const shouldTouch = !!touch.ok;
+
       const reason = this._dbReason ? `（${this._dbReason}）` : "";
       let text = "";
       if (!hasApiBaseUrl) {
@@ -910,15 +1012,38 @@ export class RSLatteSettingTab extends PluginSettingTab {
       } else {
         text = "数据库已就绪：可开启模块同步。";
       }
+      const sAny: any = this.plugin.settings as any;
+      const hasTok = !!String(sAny?.apiAuthAccessToken ?? "").trim();
+      if (shouldTouch && this._authRequired === true && !hasTok) {
+        text += " 后端已启用账号鉴权：请填写账号密码并点击「登录并保存」。";
+      } else if (shouldTouch && this._authRequired === true && hasTok) {
+        const hasPass = !!String(sAny?.apiBackendPassword ?? "").trim();
+        text += hasPass
+          ? " 令牌会在临近过期或鉴权失败时自动续期（凭据已保存在本库配置，请勿分享 vault）。"
+          : " 已保存登录令牌；为支持自动续期，请再执行一次「登录并保存」（将把账号密码写入本机配置）。";
+      }
       box.setText(text);
-
-      const touch: any = (this.plugin as any)?.vaultSvc?.shouldTouchBackendNow?.() ?? { ok: false, reason: "", baseUrl: "" };
-      const shouldTouch = !!touch.ok;
 
       box.toggleClass("is-ok", shouldTouch && this._dbReady === true);
       box.toggleClass("is-warn", shouldTouch && this._dbReady === false);
       box.toggleClass("is-neutral", !shouldTouch || this._dbReady === null);
     }
+
+    new Setting(dbSyncWrap)
+      .setName("WorkEvent 同步到数据库")
+      .setDesc(
+        "与本地 JSONL 双写；随「自动刷新索引」定时批量上传（非实时）。手机端 plugin_date 仅含摘要列表 work_events_recent。"
+      )
+      .addToggle((cb) => {
+        const sAny: any = this.plugin.settings as any;
+        cb.setValue(!!sAny.workEventDbSyncEnabled);
+        cb.onChange(async (v) => {
+          sAny.workEventDbSyncEnabled = !!v;
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        });
+      });
 
     // API Base URL（填写完成后点击“确认”才保存并检查连接；不再使用 600ms 防抖机制）
     {
@@ -951,11 +1076,16 @@ export class RSLatteSettingTab extends PluginSettingTab {
         const fin = !!(s?.financePanel?.enableDbSync);
         const tsk = !!(s?.taskModule?.enableDbSync);
         const mem = !!(s?.memoModule?.enableDbSync);
+        const cts = !!(s?.contactsModule?.enableDbSync);
         const prj = !!(s?.projectEnableDbSync);
         const out = !!(s?.outputPanel?.enableDbSync);
         const legacyRecord = !!(s?.rslattePanelEnableDbSync);
         const legacyTask = !!(s?.taskPanel?.enableDbSync);
-        return chk || fin || tsk || mem || prj || out || legacyRecord || legacyTask;
+        const wev = !!(s?.workEventDbSyncEnabled);
+        const kn = !!(s?.knowledgePanel?.enableDbSync);
+        const hlth = !!(s?.healthPanel?.enableDbSync);
+        const schDb = !!(s?.scheduleModule?.enableDbSync);
+        return chk || fin || tsk || mem || cts || prj || out || legacyRecord || legacyTask || wev || kn || hlth || schDb;
       };
 
       const forceAllDbSyncOff = () => {
@@ -965,16 +1095,23 @@ export class RSLatteSettingTab extends PluginSettingTab {
         if (!sAny2.taskModule) sAny2.taskModule = {};
         if (!sAny2.memoModule) sAny2.memoModule = {};
         if (!sAny2.outputPanel) sAny2.outputPanel = {};
+        if (!sAny2.contactsModule) sAny2.contactsModule = {};
         sAny2.checkinPanel.enableDbSync = false;
         sAny2.financePanel.enableDbSync = false;
         sAny2.taskModule.enableDbSync = false;
         sAny2.memoModule.enableDbSync = false;
+        sAny2.contactsModule.enableDbSync = false;
         sAny2.projectEnableDbSync = false;
         sAny2.outputPanel.enableDbSync = false;
         // legacy 聚合字段也一并关闭
         sAny2.rslattePanelEnableDbSync = false;
         if (!sAny2.taskPanel) sAny2.taskPanel = {};
         sAny2.taskPanel.enableDbSync = false;
+        sAny2.workEventDbSyncEnabled = false;
+        if (sAny2.knowledgePanel) sAny2.knowledgePanel.enableDbSync = false;
+        if (sAny2.healthPanel) sAny2.healthPanel.enableDbSync = false;
+        if (!sAny2.scheduleModule) sAny2.scheduleModule = {};
+        sAny2.scheduleModule.enableDbSync = false;
       };
 
       const commitConfirmed = async () => {
@@ -982,10 +1119,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
         const trimmed = String(raw ?? "").trim();
         const prev = String(this.plugin.settings.apiBaseUrl ?? "").trim();
 
-        // 写入 settings + API client baseUrl
+        // 写入 settings + API client baseUrl（URL 变更则清除令牌，避免误用旧站点的 JWT）
         if (trimmed !== prev) {
           this.plugin.settings.apiBaseUrl = trimmed;
           this.plugin.api?.setBaseUrl(this.plugin.settings.apiBaseUrl);
+          (this.plugin.settings as any).apiAuthAccessToken = "";
+          (this.plugin.settings as any).apiBackendPassword = "";
+          this.plugin.api?.setAuthToken(null);
         }
 
         // URL 为空/不合法：强制视为 OFF（UI 显示 OFF 且禁用）
@@ -1042,7 +1182,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
           text.inputEl.style.minWidth = "420px";
         } catch { }
 
-        // red border: 仅当 URL 已完整（http(s)）且 DB 检查确认不可用时置红（且至少一个模块开 DB sync）
+        // red border：已保存合法 URL、至少一项 DB 同步开启、且 DB 就绪检查未通过（含未初始化）
         const saved = String(this.plugin.settings.apiBaseUrl ?? "").trim();
         const savedCheckable = isUrlCheckableLocal(saved);
         if (savedCheckable && isAnyDbSyncEnabledNow() && this._dbReady === false) {
@@ -1066,12 +1206,135 @@ export class RSLatteSettingTab extends PluginSettingTab {
       });
     }
 
+    // 后端账号（JWT_SECRET 启用时必填；登录成功后密码写入 data.json 供静默续期，请勿分享 vault）
+    {
+      let userRef: TextComponent | null = null;
+      let passRef: TextComponent | null = null;
+      const sAuthAny: any = this.plugin.settings as any;
+      const hasAuthToken = !!String(sAuthAny.apiAuthAccessToken ?? "").trim();
+      const hasSavedPassword = !!String(sAuthAny.apiBackendPassword ?? "");
+      /** 令牌与密码均已保存：视为完整登录，隐藏「登录并保存」以免重复点击 */
+      const authSessionSaved = hasAuthToken && hasSavedPassword;
+
+      const stAuth = new Setting(dbSyncWrap).setName("后端账号");
+      try {
+        stAuth.descEl.remove();
+      } catch {
+        /* ignore */
+      }
+      stAuth.settingEl.addClass("rslatte-backend-auth");
+      try {
+        stAuth.controlEl.empty();
+      } catch {
+        /* ignore */
+      }
+      const fieldsRow = stAuth.controlEl.createDiv({ cls: "rslatte-backend-auth-fields" });
+      const actionsRow = stAuth.controlEl.createDiv({ cls: "rslatte-backend-auth-actions" });
+
+      userRef = new TextComponent(fieldsRow)
+        .setPlaceholder("账号名")
+        .setValue(String(sAuthAny.apiBackendUserName ?? ""));
+      try {
+        userRef.inputEl.style.minWidth = "200px";
+      } catch {
+        /* ignore */
+      }
+      if (authSessionSaved) {
+        try {
+          userRef.setDisabled(true);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      passRef = new TextComponent(fieldsRow);
+      passRef.inputEl.type = "password";
+      passRef.setPlaceholder(authSessionSaved ? "已保存（清除登录后可重填）" : "密码");
+      try {
+        passRef.inputEl.style.minWidth = "160px";
+      } catch {
+        /* ignore */
+      }
+      if (authSessionSaved) {
+        try {
+          passRef.setValue("");
+          passRef.setDisabled(true);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      if (authSessionSaved) {
+        const savedStateBtn = new ButtonComponent(fieldsRow)
+          .setButtonText("已登录 · 令牌已保存")
+          .setDisabled(true);
+        try {
+          savedStateBtn.buttonEl.setAttr("aria-disabled", "true");
+        } catch {
+          /* ignore */
+        }
+      } else {
+        new ButtonComponent(fieldsRow)
+          .setButtonText("登录并保存")
+          .setCta()
+          .onClick(async () => {
+            const base = String(this.plugin.settings.apiBaseUrl ?? "").trim();
+            if (!base) {
+              new Notice("请先填写并确认 API Base URL");
+              return;
+            }
+            const user = String(userRef?.getValue() ?? "").trim();
+            const pass = String(passRef?.getValue() ?? "");
+            if (!user || !pass) {
+              new Notice("请填写账号名和密码");
+              return;
+            }
+            this.plugin.api.setBaseUrl(base);
+            try {
+              const r = await this.plugin.api.authLogin(user, pass);
+              (this.plugin.settings as any).apiBackendUserName = user;
+              (this.plugin.settings as any).apiBackendPassword = pass;
+              (this.plugin.settings as any).apiAuthAccessToken = r.access_token;
+              this.plugin.api.setAuthToken(r.access_token);
+              await this.plugin.saveSettings();
+              try {
+                passRef?.setValue("");
+              } catch {
+                /* ignore */
+              }
+              await this.refreshAuthRequiredFlag();
+              new Notice("登录成功");
+              this.display();
+            } catch (e: any) {
+              const m = String(e?.message ?? e ?? "未知错误");
+              new Notice("鉴权失败：" + m);
+            }
+          });
+      }
+
+      new ButtonComponent(actionsRow)
+        .setButtonText("申请新账号")
+        .onClick(() => {
+          rslatteOpenRegisterPage(String(this.plugin.settings.apiBaseUrl ?? "").trim());
+        });
+      new ButtonComponent(actionsRow)
+        .setButtonText("清除登录")
+        .onClick(async () => {
+          (this.plugin.settings as any).apiAuthAccessToken = "";
+          (this.plugin.settings as any).apiBackendPassword = "";
+          this.plugin.api?.setAuthToken(null);
+          await this.plugin.saveSettings();
+          new Notice("已清除保存的登录令牌");
+          this.display();
+        });
+    }
+
     // =========================
     // 空间管理（可折叠，顶层）
     // - 维护 space 清单（新增/复制/删除/重命名）
     // - 切换 space 后，本页其余“模块管理/各模块设置”即代表该 space 的配置
     // =========================
-    const spaceMgmtWrap = makeCollapsibleSection("空间管理", true, "rslatte-space-mgmt-wrap");
+    const spaceMgmtWrap = makeCollapsibleSection("空间管理", true, "rslatte-space-mgmt-wrap", "global");
 
     const getCurSpaceId = () => {
       try {
@@ -1130,8 +1393,21 @@ export class RSLatteSettingTab extends PluginSettingTab {
     };
 
     const addSpace = async () => {
-      const idx = Object.keys(ensureSpacesMap()).length + 1;
-      const modal = new AddSpaceModal(this.app, this.plugin, `空间 ${idx}`, "");
+      const spacesMap = ensureSpacesMap();
+      const spaceList = Object.values(spacesMap).filter(Boolean) as RSLatteSpaceConfig[];
+      if (spaceList.length >= 7) {
+        new Notice("当前已维护 7 个空间，建议整理并删除或合并不再使用的空间后再新增。");
+        return;
+      }
+      const nextNum = pickNextAvailableSpaceNumberForNewSpace(spaceList);
+      if (nextNum == null) {
+        new Notice("当前已维护 7 个空间，建议整理并删除或合并不再使用的空间后再新增。");
+        return;
+      }
+      const idx = spaceList.length + 1;
+      const modal = new AddSpaceModal(this.app, this.plugin, `空间 ${idx}`, {
+        rootPrefix: buildDefaultRootPrefix(nextNum),
+      });
       const result = await modal.waitForResult();
       if (!result) return;
 
@@ -1143,49 +1419,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
         return;
       }
 
-      // 根据默认根目录生成各模块的默认配置
       const rootDir = normalizePath(result.defaultRootDir.trim());
-      const snapshot: any = extractPerSpaceSettings(DEFAULT_SETTINGS as any);
-      
-      // 日记管理-日记路径
-      snapshot.diaryPath = `${rootDir}/diary`;
-      
-      // 任务管理-任务/备忘数据目录（使用 taskPanel.taskFolders 数组）
-      if (!snapshot.taskPanel) snapshot.taskPanel = {};
-      snapshot.taskPanel.taskFolders = [`${rootDir}/diary`];
-      
-      // 项目管理-项目目录
-      snapshot.projectRootDir = `${rootDir}/projects`;
-      // 项目管理-项目归档目录
-      snapshot.projectArchiveDir = `${rootDir}/projects/_archived`;
-      
-      // 输出管理-归档目录
-      if (!snapshot.outputPanel) snapshot.outputPanel = {};
-      snapshot.outputPanel.archiveRootDir = `${rootDir}/archived`;
-      // 输出管理-输出文档存档目录（使用 outputPanel.archiveRoots 数组）
-      snapshot.outputPanel.archiveRoots = [`${rootDir}/output`];
-      
-      // 联系人管理-联系人目录
-      if (!snapshot.contactsModule) snapshot.contactsModule = {};
-      snapshot.contactsModule.contactsDir = `${rootDir}/contacts`;
-      // 联系人管理-联系人归档目录
-      snapshot.contactsModule.archiveDir = `${rootDir}/contacts/_archived`;
-      // 联系人管理-模板路径
-      snapshot.contactsModule.templatePath = "91-Templates/t_contact.md";
-      
-      // 日记管理-日记模板
-      snapshot.diaryTemplate = "91-Templates/t_daily.md";
-      
-      // 项目管理-项目任务清单模板
-      snapshot.projectTasklistTemplatePath = "91-Templates/t_project_tasklist.md";
-      // 项目管理-项目信息模板
-      snapshot.projectInfoTemplatePath = "91-Templates/t_project_info.md";
-      // 项目管理-项目分析图模板
-      snapshot.projectAnalysisTemplatePath = "91-Templates/t_project_excalidraw.excalidraw";
+      const snapshot: any = buildSettingsSnapshotForNewSpace(nextNum, rootDir, DEFAULT_SETTINGS as any);
 
       spaces[sid] = {
         id: sid,
         name: result.name,
+        spaceNumber: nextNum,
         createdAt: now,
         updatedAt: now,
         settingsSnapshot: snapshot,
@@ -1193,6 +1433,11 @@ export class RSLatteSettingTab extends PluginSettingTab {
 
       const ok = await this.plugin.saveSettings();
       if (!ok) return;
+      try {
+        await ensureSpaceSnapshotAndKnowledgeDirs(this.app, this.plugin.settings, snapshot);
+      } catch (e) {
+        console.warn("RSLatte ensureSpaceSnapshotAndKnowledgeDirs failed:", e);
+      }
       // 更新 spaces-index.json
       await this._spacesIndexService?.updateIndex();
       this.display();
@@ -1207,18 +1452,37 @@ export class RSLatteSettingTab extends PluginSettingTab {
         new Notice("未找到要复制的空间。");
         return;
       }
+      const spaceList = Object.values(spaces).filter(Boolean) as RSLatteSpaceConfig[];
+      if (spaceList.length >= 7) {
+        new Notice("当前已维护 7 个空间，无法复制。请先删除或合并不再使用的空间。");
+        return;
+      }
+      const nextNum = pickNextAvailableSpaceNumberForNewSpace(spaceList);
+      if (nextNum == null) {
+        new Notice("当前已维护 7 个空间，无法复制。请先删除或合并不再使用的空间。");
+        return;
+      }
       const now = new Date().toISOString();
       const sid = genUuid();
       const copyName = String(src.name ?? "").trim() || fromId;
+      const dupSnap = JSON.parse(
+        JSON.stringify((src as any).settingsSnapshot ?? extractPerSpaceSettings(this.plugin.settings)),
+      ) as Partial<RSLattePluginSettings>;
       spaces[sid] = {
         id: sid,
         name: `${copyName} - 副本`,
+        spaceNumber: nextNum,
         createdAt: now,
         updatedAt: now,
-        settingsSnapshot: JSON.parse(JSON.stringify((src as any).settingsSnapshot ?? extractPerSpaceSettings(this.plugin.settings))),
+        settingsSnapshot: dupSnap,
       } as any;
       const ok = await this.plugin.saveSettings();
       if (!ok) return;
+      try {
+        await ensureSpaceSnapshotAndKnowledgeDirs(this.app, this.plugin.settings, dupSnap);
+      } catch (e) {
+        console.warn("RSLatte ensureSpaceSnapshotAndKnowledgeDirs (duplicate) failed:", e);
+      }
       // 更新 spaces-index.json
       await this._spacesIndexService?.updateIndex();
       this.display();
@@ -1301,6 +1565,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
       const hr = thead.createEl("tr");
       hr.createEl("th", { text: "" }); // 第一列：当前空间标识
       hr.createEl("th", { text: "空间名称" });
+      hr.createEl("th", { text: "编号" });
       hr.createEl("th", { text: "UUID" });
       hr.createEl("th", { text: "日记路径" });
       hr.createEl("th", { text: "日记格式" });
@@ -1349,6 +1614,12 @@ export class RSLatteSettingTab extends PluginSettingTab {
           await this._spacesIndexService?.updateIndex();
           this.display();
           void this.plugin.vaultSvc?.ensureVaultReadySafe?.("space-edited");
+        });
+
+        const tdNum = tr.createEl("td", { cls: "rslatte-space-num" });
+        tdNum.createEl("span", {
+          cls: "rslatte-muted",
+          text: typeof sp.spaceNumber === "number" ? String(sp.spaceNumber) : "—",
         });
 
         // UUID
@@ -1400,17 +1671,31 @@ export class RSLatteSettingTab extends PluginSettingTab {
     // 说明：与“后端信息维护 / 日志管理 / 打卡管理 ...”同级。
     // =========================
 
-    const moduleMgmtWrap = makeCollapsibleSection("模块管理", false, "rslatte-module-mgmt-wrap");
+    // 模块管理：启用/同步/归档等写入 SPACE_SCOPED_SETTING_KEYS，随空间快照切换；与《空间管理优化方案》§6.2 一致，侧栏标签为「空间」。
+    const moduleMgmtWrap = makeCollapsibleSection("模块管理", false, "rslatte-module-mgmt-wrap", "space");
 
     const modTableWrap = moduleMgmtWrap.createDiv({ cls: "rslatte-section" });
+    modTableWrap.createEl("div", {
+      cls: "rslatte-setting-hint",
+      text: "归档分三类（与《索引优化方案》§9、CODE_MAP §3.11.1 一致）：①笔记归档——在 Vault 内移动 md/文件夹；②索引归档——中央索引条目写入 archive 分片、主索引瘦身；③日记按月——见下方「日记管理」。本表「自动/手动」：任务/提醒/日程/打卡/财务/健康以索引归档为主；输出、项目含笔记搬迁（并常伴随索引更新）；联系人「立即归档」为笔记归档。",
+    });
+    if (!modGateOpen) {
+      modTableWrap.createEl("div", {
+        cls: "rslatte-setting-hint",
+        text: "在全局配置中打开「插件初始化环境检查」，强制项（含模板）全部通过后点击「完成初始化」前，下表模块开关将保持关闭且不可编辑（与运行时一致）。",
+      });
+    }
     const modTable = modTableWrap.createEl("table", { cls: "rslatte-tasklist-table" });
     const modThead = modTable.createEl("thead");
     const modHr = modThead.createEl("tr");
-    ["模块", "启用", "数据库同步", "自动归档（每日一次）", "归档阈值（天）", "手动归档", "扫描重建索引"].forEach((h) => modHr.createEl("th", { text: h }));
+    ["模块", "启用", "数据库同步", "自动归档（索引·每日≤1次）", "归档阈值（天，≥90）", "手动归档", "扫描重建索引"].forEach((h) => modHr.createEl("th", { text: h }));
     const modTbody = modTable.createEl("tbody");
 
     // 数据库同步由关→开时：写入 forceFull 标记并触发 manual_refresh（与旧「模块与数据库同步」逻辑一致）
-    const handleDbSyncToggleOn = (v2Key: 'checkin' | 'finance' | 'task' | 'memo' | 'project' | 'output', label: string) => {
+    const handleDbSyncToggleOn = (
+      v2Key: 'checkin' | 'finance' | 'health' | 'task' | 'memo' | 'schedule' | 'project' | 'output' | 'knowledge',
+      label: string
+    ) => {
       const sAny2: any = this.plugin.settings as any;
       if (!sAny2.dbSyncForceFullNext) sAny2.dbSyncForceFullNext = {};
       sAny2.dbSyncForceFullNext[v2Key] = true;
@@ -1440,15 +1725,18 @@ export class RSLatteSettingTab extends PluginSettingTab {
     // 当模块从“关闭→开启”时，自动触发一次“扫描重建索引”。
     // 目的：避免用户开启模块后侧边栏/索引仍为空，需要再手动点“扫描重建”。
     // 注意：这里复用每个模块的既有“扫描重建”实现，保持业务逻辑一致。
-    const triggerRebuildOnEnable = async (v2Key: 'checkin' | 'finance' | 'task' | 'memo' | 'project' | 'output' | 'publish') => {
+    const triggerRebuildOnEnable = async (
+      v2Key: 'checkin' | 'finance' | 'health' | 'task' | 'memo' | 'schedule' | 'project' | 'output'
+    ) => {
       const labelMap: Record<string, string> = {
         checkin: '打卡',
         finance: '财务',
+        health: '健康',
         task: '任务',
-        memo: '备忘',
+        memo: '提醒',
+        schedule: '日程',
         project: '项目',
         output: '输出',
-        publish: '发布',
       };
       const label = labelMap[v2Key] ?? v2Key;
 
@@ -1532,13 +1820,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl("td");
         const input = td.createEl("input", { type: "number" });
-        (input as HTMLInputElement).min = "1";
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
         (input as HTMLInputElement).max = "3650";
         (input as HTMLInputElement).style.width = "90px";
         (input as HTMLInputElement).value = String(get().archiveThresholdDays ?? 90);
         (input as HTMLInputElement).disabled = !enabled;
         input.onchange = async () => {
-          const n = Math.max(1, Math.min(3650, Math.floor(Number((input as HTMLInputElement).value || 90))));
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
           set({ archiveThresholdDays: n });
           const ok = await this.plugin.saveSettings();
           if (!ok) return;
@@ -1634,7 +1922,8 @@ export class RSLatteSettingTab extends PluginSettingTab {
       const row = modTbody.createEl('tr');
       const me2: any = sAny.moduleEnabledV2;
       const p2: any = sAny[panelKey];
-      const enabled = (me2[v2Key] === undefined ? true : !!me2[v2Key]);
+      const savedEnabled = (me2[v2Key] === undefined ? true : !!me2[v2Key]);
+      const enabled = modGateOpen && savedEnabled;
       if (!enabled) row.addClass('is-disabled');
 
       row.createEl('td', { text: label });
@@ -1643,9 +1932,11 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const cb = td.createEl('input', { type: 'checkbox' });
-        cb.checked = enabled;
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
         cb.onchange = async () => {
-          const wasEnabled = enabled;
+          if (!modGateOpen) return;
+          const wasEnabled = (me2[v2Key] === undefined ? true : !!me2[v2Key]);
           const nowEnabled = !!cb.checked;
           me2[v2Key] = cb.checked;
           if (!cb.checked) {
@@ -1710,14 +2001,14 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const input = td.createEl('input', { type: 'number' });
-        (input as HTMLInputElement).min = '1';
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
         (input as HTMLInputElement).max = '3650';
         (input as HTMLInputElement).style.width = '90px';
         (input as HTMLInputElement).value = String(p2.archiveThresholdDays ?? 90);
         (input as HTMLInputElement).disabled = !enabled;
         if ((input as HTMLInputElement).disabled) td.addClass('is-disabled');
         input.onchange = async () => {
-          const n = Math.max(1, Math.min(3650, Math.floor(Number((input as HTMLInputElement).value || 90))));
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
           p2.archiveThresholdDays = n;
           syncRecordUnifiedFromV2();
           const ok = await this.plugin.saveSettings();
@@ -1786,17 +2077,170 @@ export class RSLatteSettingTab extends PluginSettingTab {
     renderRecordV2Row('打卡', 'checkin', 'checkinPanel');
     renderRecordV2Row('财务', 'finance', 'financePanel');
 
+    const ensureHealthV2Defaults = () => {
+      if (!sAny.healthPanel) sAny.healthPanel = {};
+      const legacyEnableDb = (sAny.rslattePanelEnableDbSync ?? true);
+      const legacyAutoArc = (sAny.rslattePanelAutoArchiveEnabled ?? true);
+      const legacyDays = (sAny.rslattePanelArchiveThresholdDays ?? 90);
+      if (sAny.healthPanel.enableDbSync === undefined) sAny.healthPanel.enableDbSync = legacyEnableDb;
+      if (sAny.healthPanel.autoArchiveEnabled === undefined) sAny.healthPanel.autoArchiveEnabled = legacyAutoArc;
+      if (sAny.healthPanel.archiveThresholdDays === undefined) sAny.healthPanel.archiveThresholdDays = legacyDays;
+    };
 
-    // v6-4：任务/备忘拆分为两行（逐步启用）。
+    const renderHealthV2Row = () => {
+      if (!sAny.moduleEnabledV2) sAny.moduleEnabledV2 = {};
+      if (sAny.moduleEnabledV2.health === undefined) sAny.moduleEnabledV2.health = true;
+      ensureHealthV2Defaults();
+
+      const row = modTbody.createEl("tr");
+      const me2: any = sAny.moduleEnabledV2;
+      const p2: any = sAny.healthPanel;
+      const savedEnabled = me2.health === true;
+      const enabled = modGateOpen && savedEnabled;
+      if (!enabled) row.addClass("is-disabled");
+
+      row.createEl("td", { text: "健康" });
+
+      {
+        const td = row.createEl("td");
+        const cb = td.createEl("input", { type: "checkbox" });
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
+        cb.onchange = async () => {
+          if (!modGateOpen) return;
+          const wasEnabled = me2.health === true;
+          const nowEnabled = !!cb.checked;
+          me2.health = nowEnabled;
+          if (!cb.checked) {
+            p2.enableDbSync = false;
+            p2.autoArchiveEnabled = false;
+          }
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          await this.updateCurrentSpaceSnapshot();
+          this.display();
+          this.plugin.refreshSidePanel();
+          if (!wasEnabled && nowEnabled) {
+            await triggerRebuildOnEnable("health");
+          }
+        };
+      }
+
+      {
+        const td = row.createEl("td");
+        td.setAttribute("data-rslatte-db-sync-td", "1");
+        const cb = td.createEl("input", { type: "checkbox" });
+        cb.checked = !!p2.enableDbSync;
+        cb.disabled = !enabled || !urlCheckable;
+        if (cb.disabled) td.addClass("is-disabled");
+        cb.onchange = async () => {
+          if (!urlCheckable || !enabled) return;
+          const prev = !!p2.enableDbSync;
+          p2.enableDbSync = !!cb.checked;
+          if (prev === false && !!cb.checked) handleDbSyncToggleOn("health", "健康");
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        };
+      }
+
+      {
+        const td = row.createEl("td");
+        const cb = td.createEl("input", { type: "checkbox" });
+        cb.checked = !!p2.autoArchiveEnabled;
+        cb.disabled = !enabled;
+        if (cb.disabled) td.addClass("is-disabled");
+        cb.onchange = async () => {
+          p2.autoArchiveEnabled = cb.checked;
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        };
+      }
+
+      {
+        const td = row.createEl("td");
+        const input = td.createEl("input", { type: "number" });
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
+        (input as HTMLInputElement).max = "3650";
+        (input as HTMLInputElement).style.width = "90px";
+        (input as HTMLInputElement).value = String(p2.archiveThresholdDays ?? 90);
+        (input as HTMLInputElement).disabled = !enabled;
+        if ((input as HTMLInputElement).disabled) td.addClass("is-disabled");
+        input.onchange = async () => {
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
+          p2.archiveThresholdDays = n;
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        };
+      }
+
+      {
+        const td = row.createEl("td");
+        const btn = td.createEl("button", { text: "立即归档" });
+        btn.addClass("mod-cta");
+        btn.disabled = !enabled;
+        btn.onclick = async () => {
+          try {
+            btn.disabled = true;
+            const ctx = this.plugin.getSpaceCtx();
+            const r = await this.plugin.pipelineEngine.runE2(ctx, "health" as any, "manual_archive");
+            if (!r.ok) {
+              new Notice(`归档失败：${r.error.message}`);
+              return;
+            }
+            if (r.data.skipped) return;
+            new Notice("索引归档完成：健康");
+          } catch (e: any) {
+            new Notice(`归档失败：${e?.message ?? String(e)}`);
+          } finally {
+            btn.disabled = !enabled;
+            this.plugin.refreshSidePanel();
+          }
+        };
+      }
+
+      {
+        const td = row.createEl("td");
+        const btn = td.createEl("button", { text: "扫描重建" });
+        btn.addClass("mod-cta");
+        btn.disabled = !enabled;
+        btn.onclick = async () => {
+          try {
+            btn.disabled = true;
+            const ctx = this.plugin.getSpaceCtx();
+            const r = await this.plugin.pipelineEngine.runE2(ctx, "health" as any, "rebuild");
+            if (!r.ok) {
+              new Notice(`扫描重建失败：${r.error.message}`);
+              return;
+            }
+            if (r.data.skipped) return;
+            new Notice("健康已扫描并重建索引");
+          } catch (e: any) {
+            new Notice(`扫描重建失败：${e?.message ?? String(e)}`);
+          } finally {
+            btn.disabled = !enabled;
+            this.plugin.refreshSidePanel();
+          }
+        };
+      }
+    };
+
+    renderHealthV2Row();
+
+    // v6-4：任务/提醒拆分为两行（逐步启用）。
     // 兼容：当前运行仍由 taskPanel 作为统一入口（TaskRSLatteService 合并处理）。
     const ensureTaskMemoV2Defaults = () => {
       if (!sAny.moduleEnabledV2) sAny.moduleEnabledV2 = {};
       if (!sAny.taskModule) sAny.taskModule = {};
       if (!sAny.memoModule) sAny.memoModule = {};
+      if (!sAny.scheduleModule) sAny.scheduleModule = {};
 
       const legacyTaskEnabled = (sAny.moduleEnabled?.task ?? true);
       if (sAny.moduleEnabledV2.task === undefined) sAny.moduleEnabledV2.task = legacyTaskEnabled;
       if (sAny.moduleEnabledV2.memo === undefined) sAny.moduleEnabledV2.memo = legacyTaskEnabled;
+      if (sAny.moduleEnabledV2.schedule === undefined) sAny.moduleEnabledV2.schedule = legacyTaskEnabled;
 
       const legacyEnableDb = (sAny.taskPanel?.enableDbSync ?? true);
       const legacyAutoArc = (sAny.taskPanel?.autoArchiveEnabled ?? true);
@@ -1809,6 +2253,9 @@ export class RSLatteSettingTab extends PluginSettingTab {
       if (sAny.memoModule.enableDbSync === undefined) sAny.memoModule.enableDbSync = legacyEnableDb;
       if (sAny.memoModule.autoArchiveEnabled === undefined) sAny.memoModule.autoArchiveEnabled = legacyAutoArc;
       if (sAny.memoModule.archiveThresholdDays === undefined) sAny.memoModule.archiveThresholdDays = legacyDays;
+      if (sAny.scheduleModule.enableDbSync === undefined) sAny.scheduleModule.enableDbSync = legacyEnableDb;
+      if (sAny.scheduleModule.autoArchiveEnabled === undefined) sAny.scheduleModule.autoArchiveEnabled = legacyAutoArc;
+      if (sAny.scheduleModule.archiveThresholdDays === undefined) sAny.scheduleModule.archiveThresholdDays = legacyDays;
     };
 
     // v6-4 兼容写回：把拆分配置“合并”回 taskPanel 的统一配置，保证当前运行行为仍可控。
@@ -1825,15 +2272,16 @@ export class RSLatteSettingTab extends PluginSettingTab {
 
       const t: any = sAny.taskModule;
       const m: any = sAny.memoModule;
+      const sch: any = sAny.scheduleModule ?? {};
       if (!sAny.taskPanel) sAny.taskPanel = {};
       const tp: any = sAny.taskPanel;
-      tp.enableDbSync = (!!t.enableDbSync) || (!!m.enableDbSync);
+      tp.enableDbSync = (!!t.enableDbSync) || (!!m.enableDbSync) || (!!sch.enableDbSync);
       tp.autoArchiveEnabled = (!!t.autoArchiveEnabled) || (!!m.autoArchiveEnabled);
       tp.archiveThresholdDays = Math.max(Number(t.archiveThresholdDays ?? 90), Number(m.archiveThresholdDays ?? 90));
     };
 
     const renderTaskMemoV2Row = (
-      label: '任务' | '备忘',
+      label: '任务' | '提醒',
       v2Key: 'task' | 'memo',
       panelKey: 'taskModule' | 'memoModule'
     ) => {
@@ -1841,11 +2289,12 @@ export class RSLatteSettingTab extends PluginSettingTab {
       const row = modTbody.createEl('tr');
       const me2: any = sAny.moduleEnabledV2;
       const p2: any = sAny[panelKey];
-      const enabled = (me2[v2Key] === undefined ? true : !!me2[v2Key]);
+      const savedEnabled = (me2[v2Key] === undefined ? true : !!me2[v2Key]);
+      const enabled = modGateOpen && savedEnabled;
       if (!enabled) row.addClass('is-disabled');
 
       // Row-level control disable helper (module disabled => force-close DB sync & auto-archive, disable all controls).
-      // IMPORTANT: keep the "启用" checkbox clickable even when the row is disabled.
+      // 初始化门禁未通过时整行（含「启用」）一并禁用。
       const controls: Array<HTMLInputElement | HTMLButtonElement> = [];
       const setRowDisabled = (disabled: boolean) => {
         if (disabled) row.addClass('is-disabled');
@@ -1870,9 +2319,11 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const cb = td.createEl('input', { type: 'checkbox' });
-        cb.checked = enabled;
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
         cb.onchange = async () => {
-          const wasEnabled = enabled;
+          if (!modGateOpen) return;
+          const wasEnabled = (me2[v2Key] === undefined ? true : !!me2[v2Key]);
           const nowEnabled = !!cb.checked;
           me2[v2Key] = cb.checked;
 
@@ -1941,7 +2392,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const input = td.createEl('input', { type: 'number' });
-        (input as HTMLInputElement).min = '1';
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
         (input as HTMLInputElement).max = '3650';
         (input as HTMLInputElement).style.width = '90px';
         (input as HTMLInputElement).value = String(p2.archiveThresholdDays ?? 90);
@@ -1949,7 +2400,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
         if ((input as HTMLInputElement).disabled) td.addClass('is-disabled');
         controls.push(input as HTMLInputElement);
         input.onchange = async () => {
-          const n = Math.max(1, Math.min(3650, Math.floor(Number((input as HTMLInputElement).value || 90))));
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
           p2.archiveThresholdDays = n;
           syncTaskUnifiedFromV2();
           const ok = await this.plugin.saveSettings();
@@ -2019,13 +2470,154 @@ export class RSLatteSettingTab extends PluginSettingTab {
     syncTaskUnifiedFromV2();
 
     renderTaskMemoV2Row('任务', 'task', 'taskModule');
-    renderTaskMemoV2Row('备忘', 'memo', 'memoModule');
+    renderTaskMemoV2Row('提醒', 'memo', 'memoModule');
+
+    const renderScheduleV2Row = () => {
+      ensureTaskMemoV2Defaults();
+      const row = modTbody.createEl('tr');
+      const me2: any = sAny.moduleEnabledV2;
+      const p2: any = sAny.scheduleModule;
+      const savedEnabled = (me2.schedule === undefined ? true : !!me2.schedule);
+      const enabled = modGateOpen && savedEnabled;
+      if (!enabled) row.addClass('is-disabled');
+
+      const controls: Array<HTMLInputElement | HTMLButtonElement> = [];
+      const setRowDisabled = (disabled: boolean) => {
+        if (disabled) row.addClass('is-disabled');
+        else row.removeClass('is-disabled');
+        for (const el of controls) {
+          el.disabled = disabled;
+          const td = el.closest('td');
+          if (td) {
+            if (disabled) td.addClass('is-disabled');
+            else td.removeClass('is-disabled');
+          }
+        }
+      };
+
+      row.createEl('td', { text: '日程' });
+      {
+        const td = row.createEl('td');
+        const cb = td.createEl('input', { type: 'checkbox' });
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
+        cb.onchange = async () => {
+          if (!modGateOpen) return;
+          const wasEnabled = (me2.schedule === undefined ? true : !!me2.schedule);
+          const nowEnabled = !!cb.checked;
+          me2.schedule = nowEnabled;
+          if (!cb.checked) {
+            p2.enableDbSync = false;
+            p2.autoArchiveEnabled = false;
+          }
+          syncTaskUnifiedFromV2();
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          await this.updateCurrentSpaceSnapshot();
+          this.display();
+          this.plugin.refreshSidePanel();
+          if (!wasEnabled && nowEnabled) {
+            await triggerRebuildOnEnable('schedule');
+          }
+        };
+      }
+      {
+        const td = row.createEl('td');
+        td.setAttribute('data-rslatte-db-sync-td', '1');
+        const cb = td.createEl('input', { type: 'checkbox' });
+        const dbSyncVal = p2.enableDbSync === undefined ? true : !!p2.enableDbSync;
+        cb.checked = dbSyncVal;
+        cb.disabled = !enabled || !urlCheckable;
+        if (cb.disabled) td.addClass('is-disabled');
+        cb.onchange = async () => {
+          if (!urlCheckable || !enabled) return;
+          const prev = p2.enableDbSync === undefined ? true : !!p2.enableDbSync;
+          p2.enableDbSync = !!cb.checked;
+          syncTaskUnifiedFromV2();
+          if (prev === false && !!cb.checked) handleDbSyncToggleOn('schedule', '日程');
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        };
+      }
+      {
+        const td = row.createEl('td');
+        const cb = td.createEl('input', { type: 'checkbox' });
+        cb.checked = !!p2.autoArchiveEnabled;
+        controls.push(cb);
+        cb.onchange = async () => {
+          p2.autoArchiveEnabled = cb.checked;
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        };
+      }
+      {
+        const td = row.createEl('td');
+        const input = td.createEl('input', { type: 'number' });
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
+        (input as HTMLInputElement).max = '3650';
+        (input as HTMLInputElement).style.width = '90px';
+        (input as HTMLInputElement).value = String(p2.archiveThresholdDays ?? 90);
+        controls.push(input as HTMLInputElement);
+        input.onchange = async () => {
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
+          p2.archiveThresholdDays = n;
+          const ok = await this.plugin.saveSettings();
+          if (!ok) return;
+          this.display();
+        };
+      }
+      {
+        const td = row.createEl('td');
+        const btn = td.createEl('button', { text: '立即归档' });
+        btn.addClass('mod-cta');
+        controls.push(btn);
+        btn.onclick = async () => {
+          try {
+            btn.disabled = true;
+            const r = await this.plugin.pipelineEngine.runE2(this.plugin.getSpaceCtx(), "schedule" as any, "manual_archive");
+            if (!r.ok) {
+              new Notice(`日程归档失败：${r.error.message}`);
+              return;
+            }
+            new Notice("日程归档已执行");
+          } finally {
+            btn.disabled = false;
+            this.plugin.refreshSidePanel();
+          }
+        };
+      }
+      {
+        const td = row.createEl('td');
+        const btn = td.createEl('button', { text: '扫描重建' });
+        btn.addClass('mod-cta');
+        controls.push(btn);
+        btn.onclick = async () => {
+          try {
+            btn.disabled = true;
+            const r = await this.plugin.pipelineEngine.runE2(this.plugin.getSpaceCtx(), "schedule" as any, "rebuild");
+            if (!r.ok) {
+              new Notice(`扫描重建失败：${r.error.message}`);
+              return;
+            }
+            new Notice("已扫描并重建索引：日程");
+          } finally {
+            btn.disabled = false;
+            this.plugin.refreshSidePanel();
+          }
+        };
+      }
+      setRowDisabled(!enabled);
+    };
+    renderScheduleV2Row();
 
     // 项目管理（v2：模块开关与侧边栏一致；关闭模块时强制关闭 DB sync / 自动归档）
     const renderProjectV2Row = () => {
       const row = modTbody.createEl('tr');
       const me2: any = sAny.moduleEnabledV2;
-      const enabled = (me2.project === undefined ? true : !!me2.project);
+      const savedEnabled = (me2.project === undefined ? true : !!me2.project);
+      const enabled = modGateOpen && savedEnabled;
       if (!enabled) row.addClass('is-disabled');
 
       const get = () => ({
@@ -2072,15 +2664,21 @@ export class RSLatteSettingTab extends PluginSettingTab {
         }
       };
 
-      row.createEl('td', { text: '项目' });
+      {
+        const nameTd = row.createEl("td", { text: "项目" });
+        nameTd.title =
+          "项目归档顺序：先笔记归档（移动项目文件夹到归档目录），再索引归档（主索引条目迁入 archive 分片）；一次「立即归档」或自动归档会连续做完两步。";
+      }
 
       // 启用（v2）
       {
         const td = row.createEl('td');
         const cb = td.createEl('input', { type: 'checkbox' });
-        cb.checked = enabled;
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
         cb.onchange = async () => {
-          const wasEnabled = enabled;
+          if (!modGateOpen) return;
+          const wasEnabled = (me2.project === undefined ? true : !!me2.project);
           const nowEnabled = !!cb.checked;
           me2.project = cb.checked;
           // B：关闭模块时强制关闭 DB sync / 自动归档
@@ -2143,13 +2741,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const input = td.createEl('input', { type: 'number' });
-        (input as HTMLInputElement).min = '1';
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
         (input as HTMLInputElement).max = '3650';
         (input as HTMLInputElement).style.width = '90px';
         (input as HTMLInputElement).value = String(get().archiveThresholdDays ?? 90);
         (input as HTMLInputElement).disabled = !enabled;
         input.onchange = async () => {
-          const n = Math.max(1, Math.min(3650, Math.floor(Number((input as HTMLInputElement).value || 90))));
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
           set({ archiveThresholdDays: n });
           const ok = await this.plugin.saveSettings();
           if (!ok) return;
@@ -2166,7 +2764,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
         btn.onclick = async () => {
           try {
             btn.disabled = true;
-            new Notice('开始归档：项目…');
+            new Notice("开始项目归档（笔记+索引）…");
             // ✅ 空间隔离：使用当前空间的 SpaceCtx
             const ctx = this.plugin.getSpaceCtx();
             const r = await this.plugin.pipelineEngine.runE2(ctx, 'project' as any, 'manual_archive');
@@ -2232,7 +2830,8 @@ export class RSLatteSettingTab extends PluginSettingTab {
     const renderOutputV2Row = () => {
       const row = modTbody.createEl('tr');
       const me2: any = sAny.moduleEnabledV2;
-      const enabled = (me2.output === undefined ? true : !!me2.output);
+      const savedEnabled = (me2.output === undefined ? true : !!me2.output);
+      const enabled = modGateOpen && savedEnabled;
       if (!enabled) row.addClass('is-disabled');
 
       const get = () => {
@@ -2289,9 +2888,11 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const cb = td.createEl('input', { type: 'checkbox' });
-        cb.checked = enabled;
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
         cb.onchange = async () => {
-          const wasEnabled = enabled;
+          if (!modGateOpen) return;
+          const wasEnabled = (me2.output === undefined ? true : !!me2.output);
           const nowEnabled = !!cb.checked;
           me2.output = cb.checked;
           // B：关闭模块时强制关闭 DB sync / 自动归档
@@ -2356,13 +2957,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const input = td.createEl('input', { type: 'number' });
-        (input as HTMLInputElement).min = '1';
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
         (input as HTMLInputElement).max = '3650';
         (input as HTMLInputElement).style.width = '90px';
         (input as HTMLInputElement).value = String(get().archiveThresholdDays ?? 90);
         (input as HTMLInputElement).disabled = !enabled;
         input.onchange = async () => {
-          const n = Math.max(1, Math.min(3650, Math.floor(Number((input as HTMLInputElement).value || 90))));
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
           set({ archiveThresholdDays: n });
           const ok = await this.plugin.saveSettings();
           if (!ok) return;
@@ -2379,7 +2980,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
         btn.onclick = async () => {
           try {
             btn.disabled = true;
-            new Notice('开始归档：输出…');
+            new Notice("开始输出归档（笔记+索引条目）…");
             // ✅ 空间隔离：使用当前空间的 SpaceCtx
             const ctx = this.plugin.getSpaceCtx();
             const r = await this.plugin.pipelineEngine.runE2(ctx, 'output' as any, 'manual_archive');
@@ -2443,7 +3044,8 @@ export class RSLatteSettingTab extends PluginSettingTab {
     const renderContactsV2Row = () => {
       const row = modTbody.createEl('tr');
       const me2: any = (sAny.moduleEnabledV2 ?? (sAny.moduleEnabledV2 = {}));
-      const enabled = (me2.contacts === true);
+      const savedEnabled = (me2.contacts === true);
+      const enabled = modGateOpen && savedEnabled;
       if (!enabled) row.addClass('is-disabled');
 
       const get = () => {
@@ -2500,9 +3102,11 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const cb = td.createEl('input', { type: 'checkbox' });
-        cb.checked = enabled;
+        cb.checked = modGateOpen ? savedEnabled : false;
+        cb.disabled = !modGateOpen;
         cb.onchange = async () => {
-          const wasEnabled = enabled;
+          if (!modGateOpen) return;
+          const wasEnabled = me2.contacts === true;
           const nowEnabled = !!cb.checked;
           me2.contacts = cb.checked;
 
@@ -2567,13 +3171,13 @@ export class RSLatteSettingTab extends PluginSettingTab {
       {
         const td = row.createEl('td');
         const input = td.createEl('input', { type: 'number' });
-        (input as HTMLInputElement).min = '1';
+        (input as HTMLInputElement).min = String(MIN_ARCHIVE_THRESHOLD_DAYS);
         (input as HTMLInputElement).max = '3650';
         (input as HTMLInputElement).style.width = '90px';
         (input as HTMLInputElement).value = String(get().archiveThresholdDays ?? 90);
         (input as HTMLInputElement).disabled = !enabled;
         input.onchange = async () => {
-          const n = Math.max(1, Math.min(3650, Math.floor(Number((input as HTMLInputElement).value || 90))));
+          const n = noticeAndNormalizeArchiveThresholdInput(input as HTMLInputElement);
           set({ archiveThresholdDays: n });
           const ok = await this.plugin.saveSettings();
           if (!ok) return;
@@ -2590,7 +3194,7 @@ export class RSLatteSettingTab extends PluginSettingTab {
         btn.onclick = async () => {
           try {
             btn.disabled = true;
-            new Notice('开始归档：联系人…');
+            new Notice("开始联系人笔记归档…");
 
             const r = await this.plugin.archiveContactsNow({ reason: 'manual' });
             // archiveContactsNow already shows a notice; here we just refresh UI
@@ -2642,185 +3246,27 @@ export class RSLatteSettingTab extends PluginSettingTab {
 setRowDisabled(!enabled);
     };
 
-    // 手机模块：「启用」= 仅在当前空间启用；vault 默认 + 按空间覆盖同步到后端，PWA 按当前空间读取
-    const renderMobileV2Row = () => {
-      const row = modTbody.createEl('tr');
-      const currentSpaceId = String((sAny.currentSpaceId ?? "").trim() || DEFAULT_SPACE_ID);
-      const bySpace: Record<string, boolean> = sAny.mobileModuleBySpace ?? {};
-      const me2: any = (sAny.moduleEnabledV2 ?? (sAny.moduleEnabledV2 = {}));
-      const vaultDefault = me2.mobile !== false && (me2.mobile === true || me2.mobile === undefined);
-      const currentSpaceEnabled = this.plugin.isMobileModuleEnabledV2(currentSpaceId);
-      if (!currentSpaceEnabled) row.addClass('is-disabled');
-
-      row.createEl('td', { text: '手机' });
-
-      const tdEnable = row.createEl('td');
-      const cb = tdEnable.createEl('input', { type: 'checkbox' });
-      cb.checked = currentSpaceEnabled;
-      const pushMobileConfigToBackend = () => {
-        void this.plugin.api.setVaultMobileModuleConfig({
-          mobile_module_enabled: vaultDefault,
-          space_overrides: { ...(sAny.mobileModuleBySpace ?? {}) },
-        }).catch(() => {});
-      };
-      cb.onchange = async () => {
-        bySpace[currentSpaceId] = !!cb.checked;
-        sAny.mobileModuleBySpace = bySpace;
-        const ok = await this.plugin.saveSettings();
-        if (!ok) return;
-        await this.updateCurrentSpaceSnapshot();
-        this.display();
-        this.plugin.refreshSidePanel();
-        pushMobileConfigToBackend();
-      };
-
-      row.createEl('td', { text: '-' });
-      row.createEl('td', { text: '-' });
-      row.createEl('td', { text: '-' });
-      row.createEl('td', { text: '-' });
-      row.createEl('td', { text: '-' });
-    };
-
-    // 发布管理（v2：仅启用开关和扫描重建索引，无数据库同步和归档逻辑）
-    const renderPublishV2Row = () => {
-      const row = modTbody.createEl('tr');
-      const me2: any = (sAny.moduleEnabledV2 ?? (sAny.moduleEnabledV2 = {}));
-      const enabled = (me2.publish === undefined ? true : !!me2.publish);
-      if (!enabled) row.addClass('is-disabled');
-
-      const setRowDisabled = (disabled: boolean) => {
-        const tds = Array.from(row.children) as HTMLElement[];
-        for (let i = 2; i < tds.length; i++) {
-          // 更新所有控件的 disabled 状态
-          const hasDisabled = tds[i].querySelectorAll('input,button,select,textarea').length > 0;
-          tds[i].querySelectorAll('input,button,select,textarea').forEach((el) => {
-            (el as any).disabled = disabled;
-          });
-          // 为包含 disabled 控件的 td 添加置灰样式
-          if (hasDisabled) {
-            if (disabled) {
-              tds[i].addClass('is-disabled');
-            } else {
-              tds[i].removeClass('is-disabled');
-            }
-          }
-        }
-      };
-
-      row.createEl('td', { text: '发布' });
-
-      // 启用（v2）
-      {
-        const td = row.createEl('td');
-        const cb = td.createEl('input', { type: 'checkbox' });
-        cb.checked = enabled;
-        cb.onchange = async () => {
-          const wasEnabled = enabled;
-          const nowEnabled = !!cb.checked;
-          me2.publish = cb.checked;
-
-          const ok = await this.plugin.saveSettings();
-          if (!ok) return;
-          
-          // 更新当前空间的 settingsSnapshot，确保 Hub 能获取到最新的模块启用状态
-          await this.updateCurrentSpaceSnapshot();
-          
-          this.display();
-          this.plugin.refreshSidePanel();
-
-          // Auto rebuild when module is turned ON
-          if (!wasEnabled && nowEnabled) {
-            await triggerRebuildOnEnable('publish');
-          }
-        };
-      }
-
-      // 数据库同步（跳过，发布模块不支持）
-      row.createEl('td', { text: '-' });
-
-      // 自动归档（跳过，发布模块不支持）
-      row.createEl('td', { text: '-' });
-
-      // 归档阈值（跳过，发布模块不支持）
-      row.createEl('td', { text: '-' });
-
-      // 手动归档（跳过，发布模块不支持）
-      row.createEl('td', { text: '-' });
-
-      // 扫描重建索引
-      {
-        const td = row.createEl('td');
-        const btn = td.createEl('button', { text: '扫描重建' });
-        btn.addClass('mod-cta');
-        btn.disabled = !enabled;
-        btn.onclick = async () => {
-          try {
-            btn.disabled = true;
-            new Notice('开始扫描重建：发布…');
-            // ✅ 空间隔离：使用当前空间的 SpaceCtx
-            const ctx = this.plugin.getSpaceCtx();
-            const r = await this.plugin.pipelineEngine.runE2(ctx, 'publish' as any, 'rebuild');
-            if (!r.ok) {
-              new Notice(`扫描重建失败：${r.error.message}（module=publish, mode=rebuild）`);
-              console.warn('[RSLatte][ui] rebuild failed', { moduleKey: 'publish', mode: 'rebuild', error: r.error });
-              return;
-            }
-            if (r.data.skipped) return;
-
-            const runId = (r.data as any).runId ? ` (${(r.data as any).runId})` : '';
-            new Notice(`已扫描并重建发布索引${runId}`);
-          } catch (e: any) {
-            new Notice(`扫描重建失败：${e?.message ?? String(e)}（module=publish, mode=rebuild）`);
-          } finally {
-            btn.disabled = !enabled;
-            this.plugin.refreshSidePanel();
-          }
-        };
-      }
-
-      setRowDisabled(!enabled);
-    };
-
     try {
       renderContactsV2Row();
     } catch (e: any) {
       console.error('[RSLatte][ui] renderContactsV2Row failed', e);
     }
 
-    try {
-      renderMobileV2Row();
-    } catch (e: any) {
-      console.error('[RSLatte][ui] renderMobileV2Row failed', e);
-    }
-
-    try {
-      renderPublishV2Row();
-    } catch (e: any) {
-      console.error('[RSLatte][ui] renderPublishV2Row failed', e);
-      try {
-        const row = modTbody.createEl('tr');
-        row.addClass('is-disabled');
-        row.createEl('td', { text: '联系人' });
-        const td = row.createEl('td');
-        td.createSpan({ text: '（渲染失败，请看 console）' });
-      } catch { }
-      new Notice(`Contacts 设置渲染失败：${e?.message ?? String(e)}`);
-    }
-
-
 // =========================
     // 日记管理（放在打卡管理之前）
     // =========================
-    const journalWrap = makeModuleWrap('journal', '日志管理');
+    const journalWrap = makeModuleWrap("journal", "日志管理", "space");
 
     // ===== 日志追加清单（按模块） =====
     journalWrap.createEl("h3", { text: "日志追加清单" });
     journalWrap.createEl("div", {
       cls: "rslatte-setting-hint",
-      text: "配置各模块写入今日日记的位置：一级目录（H1）+ 二级目录（H2）。打卡/财务/任务/备忘为强制启用；项目/输出可按需开启。",
+      text: "配置各模块写入今日日记的位置：一级目录（H1）+ 二级目录（H2）。打卡/财务/健康/任务/提醒/日程为强制启用（长期写入日记）；项目/输出可按需开启。",
     });
 
     if (!this.plugin.settings.journalAppendRules) this.plugin.settings.journalAppendRules = [];
+    const journalAppendForceEnabled = new Set(["checkin", "finance", "health", "task", "memo", "schedule"]);
+    let journalAppendForceNeedsPersist = false;
     const ensureRule = (module: any, d: any) => {
       const arr: any[] = this.plugin.settings.journalAppendRules as any;
       let r = arr.find((x) => x.module === module);
@@ -2828,27 +3274,39 @@ setRowDisabled(!enabled);
         arr.push({ module, enabled: d.enabled, h1: d.h1, h2: d.h2 });
         return;
       }
-      if (r.enabled === undefined) r.enabled = d.enabled;
+      if (journalAppendForceEnabled.has(module)) {
+        if (r.enabled !== true) journalAppendForceNeedsPersist = true;
+        r.enabled = true;
+      } else if (r.enabled === undefined) r.enabled = d.enabled;
       if (!r.h1) r.h1 = d.h1;
       if (!r.h2) r.h2 = d.h2;
     };
-    // 补齐 6 个模块
+    // 补齐模块规则
     ensureRule("checkin", { enabled: true, h1: "# 操作日志", h2: "## 打卡记录" });
     ensureRule("finance", { enabled: true, h1: "# 操作日志", h2: "## 财务记录" });
     ensureRule("task", { enabled: true, h1: "# 任务追踪", h2: "## 新增任务" });
-    ensureRule("memo", { enabled: true, h1: "# 任务追踪", h2: "## 新增备忘" });
+    ensureRule("memo", { enabled: true, h1: "# 任务追踪", h2: "## 新增提醒" });
+    ensureRule("schedule", { enabled: true, h1: "# 任务追踪", h2: "## 新增日程" });
     ensureRule("project", { enabled: false, h1: "# 进度更新", h2: "## 项目进度" });
     ensureRule("output", { enabled: false, h1: "# 进度更新", h2: "## 输出进度" });
+
+    if (journalAppendForceNeedsPersist) {
+      void this.plugin.saveSettings().catch((e) => {
+        console.warn("[RSLatte][settings] persist journalAppendRules forced enabled failed", e);
+      });
+    }
 
     const moduleLabel: Record<string, string> = {
       checkin: "打卡",
       finance: "财务记录",
+      health: "健康记录",
       task: "任务",
-      memo: "备忘",
+      memo: "提醒",
+      schedule: "日程",
       project: "项目（进度汇总）",
       output: "输出（当日变更）",
     };
-    const forced = new Set(["checkin", "finance", "task", "memo"]);
+    const forced = journalAppendForceEnabled;
 
     const ruleWrap = journalWrap.createDiv({ cls: "rslatte-section" });
     const ruleTable = ruleWrap.createEl("table", { cls: "rslatte-tasklist-table" });
@@ -2866,7 +3324,7 @@ setRowDisabled(!enabled);
     const rules = (this.plugin.settings.journalAppendRules as any[])
       .slice()
       .sort((a, b) => {
-        const order = ["checkin", "finance", "task", "memo", "project", "output"];
+        const order = ["checkin", "finance", "health", "task", "memo", "schedule", "project", "output"];
         return order.indexOf(a.module) - order.indexOf(b.module);
       });
 
@@ -2915,12 +3373,20 @@ setRowDisabled(!enabled);
     // ===== 日记模板配置（保持不变） =====
     journalWrap.createEl("h3", { text: "日记模板配置" });
     
-    // 辅助函数：检查模板文件是否存在
+    // 辅助函数：检查模板文件是否存在（与 `journalService.readTemplateContent` 一致：无 .md 时补 .md 再测）
     const checkTemplateExists = async (templatePath: string): Promise<boolean> => {
-      if (!templatePath || !templatePath.trim()) return false;
+      const raw = String(templatePath ?? "").trim();
+      if (!raw) return false;
       try {
-        const normalized = normalizePath(templatePath.trim());
-        return await this.app.vault.adapter.exists(normalized);
+        const candidates: string[] = [];
+        candidates.push(normalizePath(raw));
+        if (!/\.md$/i.test(raw)) candidates.push(normalizePath(`${raw}.md`));
+        for (const p of candidates) {
+          if (await this.app.vault.adapter.exists(p)) return true;
+          const af = this.app.vault.getAbstractFileByPath(p);
+          if (af instanceof TFile) return true;
+        }
+        return false;
       } catch {
         return false;
       }
@@ -3092,8 +3558,8 @@ setRowDisabled(!enabled);
       );
 
     new Setting(journalWrap)
-      .setName("月归档目录")
-      .setDesc("用于归档阈值之外的日记文件。填写 moment 格式（如 YYYYMM），归档时将移动到：{{日记路径}}/<月目录>/ 下。")
+      .setName("日记按月 · 月目录名")
+      .setDesc("「日记按月」：超过阈值的日记文件移入子目录。填写 moment 格式（如 YYYYMM），目标路径为：{{日记路径}}/<月目录>/ 下。与任务/记录等「索引归档」无关。")
       .addText((text) =>
         text
           .setPlaceholder("YYYYMM")
@@ -3105,8 +3571,8 @@ setRowDisabled(!enabled);
       );
 
     new Setting(journalWrap)
-      .setName("归档阈值（天）")
-      .setDesc("将 today - N 天 之前的日记移动到月归档目录。<=0 表示不启用。归档由自动刷新触发（每日最多一次）。")
+      .setName("日记按月 · 归档阈值（天）")
+      .setDesc("将 today - N 天之前的日记移入上方「月目录」。<=0 关闭。由自动刷新触发（每日最多一次）。非「索引归档」。")
       .addText((text) => {
         text
           .setPlaceholder("30")
@@ -3119,8 +3585,8 @@ setRowDisabled(!enabled);
       });
 
     new Setting(journalWrap)
-      .setName("手动归档日记")
-      .setDesc("立即执行日记归档操作，将超过归档阈值的日记移动到月归档目录。用于测试和验证归档功能。")
+      .setName("日记按月 · 立即执行")
+      .setDesc("立即将超阈值的日记移入月目录（「日记按月」）。用于测试。不会改写任务/记录等中央索引分片。")
       .addButton((button) => {
         button
           .setButtonText("执行归档")
@@ -3133,15 +3599,15 @@ setRowDisabled(!enabled);
               if (result) {
                 const { moved, scanned, cutoff } = result;
                 if (moved > 0) {
-                  new Notice(`日记归档完成：移动了 ${moved} 个文件（扫描了 ${scanned} 个，截止日期：${cutoff}）`);
+                  new Notice(`日记按月完成：移动了 ${moved} 个文件（扫描了 ${scanned} 个，截止日期：${cutoff}）`);
                 } else {
-                  new Notice(`日记归档完成：未找到需要归档的文件（扫描了 ${scanned} 个，截止日期：${cutoff}）`);
+                  new Notice(`日记按月完成：未移动文件（扫描了 ${scanned} 个，截止日期：${cutoff}）`);
                 }
               } else {
-                new Notice("日记归档功能不可用（归档阈值 <= 0 或日记名称格式包含子目录）");
+                new Notice("日记按月未执行（归档阈值 <= 0 或日记名称格式含子目录）");
               }
             } catch (e: any) {
-              new Notice(`归档失败：${e?.message ?? String(e)}`);
+              new Notice(`日记按月失败：${e?.message ?? String(e)}`);
             } finally {
               button.setDisabled(false);
               button.setButtonText("执行归档");
@@ -3149,12 +3615,157 @@ setRowDisabled(!enabled);
           });
       });
 
-    // ===== 日志子窗口配置（清单不变） =====
+    journalWrap.createEl("h3", { text: "Review · 周期简报" });
+    journalWrap.createEl("div", {
+      cls: "rslatte-setting-hint",
+      text: "开启后，Review「记录」页按顶栏粒度展示对应简报：周→周报、月→月报、季→季报。文件在「日记路径」上一级下 weekly/、monthly/、quarterly/（与日记根同级）。子窗口表在下方分别维护；可关闭各视图下的「显示分区」以隐藏对应块。",
+    });
+
+    new Setting(journalWrap)
+      .setName("在 Review 记录页启用周报")
+      .setDesc("关闭时不在 Review 中展示周报按钮。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.reviewRecordsWeeklyEnabled === true).onChange(async (v) => {
+          this.plugin.settings.reviewRecordsWeeklyEnabled = !!v;
+          await this.saveAndRefreshSidePanelDebounced();
+        }),
+      );
+
+    new Setting(journalWrap)
+      .setName("在 Review 记录页启用月报")
+      .setDesc("关闭时不在 Review 中展示月报按钮。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.reviewRecordsMonthlyEnabled === true).onChange(async (v) => {
+          this.plugin.settings.reviewRecordsMonthlyEnabled = !!v;
+          await this.saveAndRefreshSidePanelDebounced();
+        }),
+      );
+
+    new Setting(journalWrap)
+      .setName("在 Review 记录页启用季报（全局预取）")
+      .setDesc(
+        "开启后，在周/月/季任意视图下加载记录页时都会带上季报路径与字数。关闭时：周/月视图不预取季报；**顶栏「季」+「本季记录」仍会显示「周期季报」分区**（与月视图下「周期月报」对齐）。季视图统计仍会合并任务/提醒/日程/输出归档分片。",
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.reviewRecordsQuarterlyEnabled === true).onChange(async (v) => {
+          this.plugin.settings.reviewRecordsQuarterlyEnabled = !!v;
+          await this.saveAndRefreshSidePanelDebounced();
+        }),
+      );
+
+    const weeklyReportTplUpdate = addTemplateCheck(
+      new Setting(journalWrap)
+        .setName("周报模板路径")
+        .setDesc("创建 weekly/*.md 时复制此模板；支持 {{date}} {{dateKey}} {{weekKey}} {{monthKey}} {{diaryName}}。")
+        .addText((text) => {
+          text
+            .setPlaceholder("00-System/01-Templates/t_weekly.md")
+            .setValue(this.plugin.settings.weeklyReportTemplatePath ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.weeklyReportTemplatePath = (value ?? "").trim();
+              await this.saveAndRefreshSidePanelDebounced();
+              await weeklyReportTplUpdate();
+            });
+        }),
+      () => this.plugin.settings.weeklyReportTemplatePath ?? "",
+    );
+
+    const monthlyReportTplUpdate = addTemplateCheck(
+      new Setting(journalWrap)
+        .setName("月报模板路径")
+        .setDesc("创建 monthly/*.md 时复制此模板；占位符与周报相同。")
+        .addText((text) => {
+          text
+            .setPlaceholder("00-System/01-Templates/t_monthly.md")
+            .setValue(this.plugin.settings.monthlyReportTemplatePath ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.monthlyReportTemplatePath = (value ?? "").trim();
+              await this.saveAndRefreshSidePanelDebounced();
+              await monthlyReportTplUpdate();
+            });
+        }),
+      () => this.plugin.settings.monthlyReportTemplatePath ?? "",
+    );
+
+    const quarterlyReportTplUpdate = addTemplateCheck(
+      new Setting(journalWrap)
+        .setName("季报模板路径")
+        .setDesc("创建 quarterly/*.md 时复制此模板；占位符含 {{quarterKey}}（如 2026-Q1），其余与周报相同。")
+        .addText((text) => {
+          text
+            .setPlaceholder("00-System/01-Templates/t_quarterly.md")
+            .setValue(this.plugin.settings.quarterlyReportTemplatePath ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.quarterlyReportTemplatePath = (value ?? "").trim();
+              await this.saveAndRefreshSidePanelDebounced();
+              await quarterlyReportTplUpdate();
+            });
+        }),
+      () => this.plugin.settings.quarterlyReportTemplatePath ?? "",
+    );
+
+    new Setting(journalWrap)
+      .setName("周视图：显示「周期周报」分区")
+      .setDesc("顶栏选「周」且进入「本周记录」时，是否显示周报按钮与子窗口字数。关闭则周视图下隐藏该块。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.reviewPeriodReportShowWeekly !== false).onChange(async (v) => {
+          this.plugin.settings.reviewPeriodReportShowWeekly = !!v;
+          await this.saveAndRefreshSidePanelDebounced();
+        }),
+      );
+
+    new Setting(journalWrap)
+      .setName("月视图：显示「周期月报」分区")
+      .setDesc("顶栏选「月」且进入「本月记录」时，是否显示月报按钮与子窗口字数。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.reviewPeriodReportShowMonthly !== false).onChange(async (v) => {
+          this.plugin.settings.reviewPeriodReportShowMonthly = !!v;
+          await this.saveAndRefreshSidePanelDebounced();
+        }),
+      );
+
+    new Setting(journalWrap)
+      .setName("季视图：显示「周期季报」分区")
+      .setDesc("顶栏选「季」且进入「本季记录」时，是否显示季报按钮与子窗口字数。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.reviewPeriodReportShowQuarterly !== false).onChange(async (v) => {
+          this.plugin.settings.reviewPeriodReportShowQuarterly = !!v;
+          await this.saveAndRefreshSidePanelDebounced();
+        }),
+      );
+
+    journalWrap.createEl("h3", { text: "Review 周报 · 子窗口" });
+
+    journalWrap.createEl("div", {
+      cls: "rslatte-setting-hint",
+      text: "仅用于 weekly 笔记：按「标题行」匹配 ### 区块统计字数。与今日日记、月报子窗口独立；请在 t_weekly 模板中写入对应标题。",
+    });
+    this.renderJournalPanelsEditor(journalWrap, "weeklyJournalPanels", "+ 新增周报子窗口");
+
+    journalWrap.createEl("h3", { text: "Review 月报 · 子窗口" });
+    journalWrap.createEl("div", {
+      cls: "rslatte-setting-hint",
+      text: "仅用于 monthly 笔记；与今日日记、周报子窗口独立。",
+    });
+    this.renderJournalPanelsEditor(journalWrap, "monthlyJournalPanels", "+ 新增月报子窗口");
+
+    journalWrap.createEl("h3", { text: "Review 季报 · 子窗口" });
+    journalWrap.createEl("div", {
+      cls: "rslatte-setting-hint",
+      text: "仅用于 quarterly 笔记；与今日日记、周报、月报子窗口独立。模板默认 00-System/01-Templates/t_quarterly.md。",
+    });
+    this.renderJournalPanelsEditor(journalWrap, "quarterlyJournalPanels", "+ 新增季报子窗口");
+
+    // ===== 日志子窗口配置（今日日记） =====
     journalWrap.createEl("h3", { text: "日志子窗口配置" });
+    journalWrap.createEl("div", {
+      cls: "rslatte-setting-hint",
+      text: "仅用于按日期打开的日记：侧栏「今日日志」与工作台预览按「标题行」拆块；与上方周报/月报子窗口表无关。",
+    });
 
     new Setting(journalWrap)
       .setName("是否展示日志子窗口")
-      .setDesc("关闭时：侧边栏不展示“今日日志”区域（不影响日志追加/模板）。")
+      .setDesc("关闭时：侧边栏不展示「今日日志」区域（不影响日志追加/日记模板/周报月报）。")
       .addToggle((tog) =>
         tog
           .setValue(this.plugin.settings.showJournalPanels !== false)
@@ -3193,81 +3804,148 @@ setRowDisabled(!enabled);
         }
       });
 
-    const header = journalWrap.createDiv({ cls: "rslatte-panel-table-header" });
-    header.createDiv({ text: "ID", cls: "col col-id" });
-    header.createDiv({ text: "按钮名", cls: "col col-label" });
-    header.createDiv({ text: "标题行", cls: "col col-heading" });
-    header.createDiv({ text: "行数", cls: "col col-lines" });
-    header.createDiv({ text: "操作", cls: "col col-action" });
+    this.renderJournalPanelsEditor(journalWrap, "journalPanels", "+ 新增子窗口");
 
-    const panels = this.plugin.settings.journalPanels ?? [];
-    if (!this.plugin.settings.journalPanels) this.plugin.settings.journalPanels = [];
-
-    panels.forEach((p, idx) => {
-      const row = new Setting(journalWrap).setName("");
-      row.settingEl.addClass("rslatte-panel-table-row");
-
-      row.addText((t) => {
-        t.inputEl.addClass("col", "col-id");
-        t.setPlaceholder("JP_xxx")
-          .setValue(p.id ?? "")
+    // =========================
+    // 快速记录（Capture）：待整理写入路径与文件名格式，按空间配置
+    // =========================
+    const captureWrap = makeCollapsibleSection("快速记录", false, "rslatte-module-wrap", "space");
+    if (!this.plugin.settings.captureModule) {
+      this.plugin.settings.captureModule = {
+        captureInboxDir: "10-Personal/17-Inbox",
+        captureInboxFileNameFormat: "YYYYMMDD",
+        captureArchiveDir: "90-Archive/93-System",
+        captureShowStatuses: { todo: true, done: false, cancelled: false, paused: true },
+        captureTypeRecommendationDict: {
+          scheduleStrong: ["开会", "会议", "复盘", "约见", "面试", "拜访", "会谈", "课程", "值班"],
+          scheduleWeak: ["今天", "明天", "后天", "本周", "下周", "下午", "晚上"],
+          memoStrong: ["提醒我", "记得", "别忘", "不要忘", "到时提醒", "生日", "纪念日"],
+          memoWeak: ["复查", "取快递", "续费", "到期", "过期", "稍后", "晚点"],
+          taskStrong: ["整理", "跟进", "提交", "推进", "完成", "修复", "开发", "实现", "评审"],
+          taskWeak: ["周报", "报销", "合同", "方案", "文档", "待办", "todo"],
+        },
+      };
+    }
+    new Setting(captureWrap)
+      .setName("待整理写入目录")
+      .setDesc("「待整理」条目写入的目录（相对 vault）。默认 10-Personal/17-Inbox。每个空间可单独配置。")
+      .addText((t) => {
+        t.setPlaceholder("10-Personal/17-Inbox")
+          .setValue(this.plugin.settings.captureModule?.captureInboxDir ?? "10-Personal/17-Inbox")
           .onChange(async (v) => {
-            p.id = v.trim();
+            if (!this.plugin.settings.captureModule) this.plugin.settings.captureModule = { captureInboxDir: "", captureInboxFileNameFormat: "YYYYMMDD", captureArchiveDir: "90-Archive/93-System", captureShowStatuses: { todo: true, done: false, cancelled: false, paused: true } };
+            this.plugin.settings.captureModule.captureInboxDir = (v ?? "").trim() || "10-Personal/17-Inbox";
             await this.saveAndRefreshSidePanelDebounced();
           });
       });
-
-      row.addText((t) => {
-        t.inputEl.addClass("col", "col-label");
-        t.setPlaceholder("📝 今日积累")
-          .setValue(p.label ?? "")
+    new Setting(captureWrap)
+      .setName("待整理文件名格式")
+      .setDesc("按日期分文件时使用的 moment 格式（不含扩展名）。如 YYYYMMDD 表示 20260317.md。每个空间可单独配置。")
+      .addText((t) => {
+        t.setPlaceholder("YYYYMMDD")
+          .setValue(this.plugin.settings.captureModule?.captureInboxFileNameFormat ?? "YYYYMMDD")
           .onChange(async (v) => {
-            p.label = v;
+            if (!this.plugin.settings.captureModule) this.plugin.settings.captureModule = { captureInboxDir: "10-Personal/17-Inbox", captureInboxFileNameFormat: "", captureArchiveDir: "90-Archive/93-System", captureShowStatuses: { todo: true, done: false, cancelled: false, paused: true } };
+            this.plugin.settings.captureModule.captureInboxFileNameFormat = (v ?? "").trim() || "YYYYMMDD";
             await this.saveAndRefreshSidePanelDebounced();
           });
       });
-
-      row.addText((t) => {
-        t.inputEl.addClass("col", "col-heading");
-        t.setPlaceholder("### 今日积累")
-          .setValue(p.heading ?? "")
+    new Setting(captureWrap)
+      .setName("待整理笔记归档目录")
+      .setDesc(
+        "「笔记归档」：仅当 Inbox 文件名日期 **早于今天**（与任务「今日」一致）且其中快速记录 **全部为已整理/已取消**（无待办、无暂不处理）时，整份 Inbox 文件移入此目录；**当天 Inbox 不归档**。非中央索引分片。默认 90-Archive/93-System。"
+      )
+      .addText((t) => {
+        t.setPlaceholder("90-Archive/93-System")
+          .setValue(this.plugin.settings.captureModule?.captureArchiveDir ?? "90-Archive/93-System")
           .onChange(async (v) => {
-            p.heading = v;
+            if (!this.plugin.settings.captureModule) this.plugin.settings.captureModule = { captureInboxDir: "10-Personal/17-Inbox", captureInboxFileNameFormat: "YYYYMMDD", captureArchiveDir: "", captureShowStatuses: { todo: true, done: false, cancelled: false, paused: true } };
+            this.plugin.settings.captureModule.captureArchiveDir = (v ?? "").trim() || "90-Archive/93-System";
             await this.saveAndRefreshSidePanelDebounced();
           });
       });
-
-      row.addText((t) => {
-        t.inputEl.addClass("col", "col-lines");
-        t.setPlaceholder("20")
-          .setValue(String(p.maxLines ?? 20))
-          .onChange(async (v) => {
-            const n = Number(v);
-            if (!isNaN(n)) p.maxLines = Math.min(Math.max(n, 1), 30);
-            await this.saveAndRefreshSidePanelDebounced();
-          });
-      });
-
-      row.addButton((btn) => {
-        btn.buttonEl.addClass("col", "col-action");
-        btn.setButtonText("删除").setCta().onClick(async () => {
-          this.plugin.settings.journalPanels.splice(idx, 1);
-          await this.saveAndRerender();
+    new Setting(captureWrap)
+      .setName("即时计时显示样式")
+      .setDesc("digital：数字时钟（默认）；clock：钟表形式（含数字时间）。")
+      .addDropdown((d) => {
+        d.addOption("digital", "数字时钟（时:分:秒）");
+        d.addOption("clock", "钟表形式");
+        d.setValue(String((this.plugin.settings.captureModule as any)?.captureTimerDisplayMode ?? "digital"));
+        d.onChange(async (v) => {
+          if (!this.plugin.settings.captureModule) this.plugin.settings.captureModule = {
+            captureInboxDir: "10-Personal/17-Inbox",
+            captureInboxFileNameFormat: "YYYYMMDD",
+            captureArchiveDir: "90-Archive/93-System",
+            captureShowStatuses: { todo: true, done: false, cancelled: false, paused: true },
+          } as any;
+          (this.plugin.settings.captureModule as any).captureTimerDisplayMode = v === "clock" ? "clock" : "digital";
+          await this.saveAndRefreshSidePanelDebounced();
         });
+      });
+    const showStatuses = this.plugin.settings.captureModule?.captureShowStatuses ?? { todo: true, done: false, cancelled: false, paused: true };
+    captureWrap.createEl("h4", { text: "时间轴展示状态", cls: "rslatte-setting-h4" });
+    const statusDesc = captureWrap.createDiv({ cls: "rslatte-muted", text: "勾选后，待整理时间轴中会显示对应状态的条目。默认仅显示「待处理」「暂不处理」。" });
+    statusDesc.style.marginBottom = "8px";
+    const statusWrap = captureWrap.createDiv({ cls: "rslatte-capture-status-checkboxes" });
+    const labels: Array<{ key: keyof typeof showStatuses; label: string }> = [
+      { key: "todo", label: "待处理" },
+      { key: "paused", label: "暂不处理" },
+      { key: "done", label: "已整理" },
+      { key: "cancelled", label: "取消" },
+    ];
+    for (const { key, label } of labels) {
+      const row = statusWrap.createDiv({ cls: "rslatte-capture-status-row" });
+      const cb = row.createEl("input", { type: "checkbox" });
+      cb.checked = !!showStatuses[key];
+      cb.onchange = async () => {
+        if (!this.plugin.settings.captureModule) this.plugin.settings.captureModule = { captureInboxDir: "10-Personal/17-Inbox", captureInboxFileNameFormat: "YYYYMMDD", captureArchiveDir: "90-Archive/93-System", captureShowStatuses: {} };
+        if (!this.plugin.settings.captureModule.captureShowStatuses) this.plugin.settings.captureModule.captureShowStatuses = {};
+        this.plugin.settings.captureModule.captureShowStatuses[key] = cb.checked;
+        await this.saveAndRefreshSidePanelDebounced();
+      };
+      row.createSpan({ text: label });
+    }
+
+    captureWrap.createEl("h4", { text: "类型推荐词典（高级）", cls: "rslatte-setting-h4" });
+    const dictDesc = captureWrap.createDiv({
+      cls: "rslatte-muted",
+      text: "用于“🗃️整理”时的类型推荐。支持配置六组关键词：schedule/memo/task 的 strong/weak。建议直接编辑 JSON。"
+    });
+    dictDesc.style.marginBottom = "8px";
+    const defaultDict = {
+      scheduleStrong: ["开会", "会议", "复盘", "约见", "面试", "拜访", "会谈", "课程", "值班"],
+      scheduleWeak: ["今天", "明天", "后天", "本周", "下周", "下午", "晚上"],
+      memoStrong: ["提醒我", "记得", "别忘", "不要忘", "到时提醒", "生日", "纪念日"],
+      memoWeak: ["复查", "取快递", "续费", "到期", "过期", "稍后", "晚点"],
+      taskStrong: ["整理", "跟进", "提交", "推进", "完成", "修复", "开发", "实现", "评审"],
+      taskWeak: ["周报", "报销", "合同", "方案", "文档", "待办", "todo"],
+    };
+    const dictSetting = new Setting(captureWrap).setName("推荐词典 JSON");
+    dictSetting.setDesc("保存时会做 JSON 校验。格式错误不会写入设置。");
+    dictSetting.addTextArea((ta) => {
+      const current = (this.plugin.settings.captureModule as any)?.captureTypeRecommendationDict ?? defaultDict;
+      ta.setValue(JSON.stringify(current, null, 2));
+      ta.inputEl.rows = 10;
+      ta.inputEl.style.width = "100%";
+      ta.onChange(async (v) => {
+        try {
+          const parsed = JSON.parse(String(v ?? "{}"));
+          if (!this.plugin.settings.captureModule) {
+            this.plugin.settings.captureModule = {
+              captureInboxDir: "10-Personal/17-Inbox",
+              captureInboxFileNameFormat: "YYYYMMDD",
+              captureArchiveDir: "90-Archive/93-System",
+              captureShowStatuses: { todo: true, done: false, cancelled: false, paused: true },
+            } as any;
+          }
+          (this.plugin.settings.captureModule as any).captureTypeRecommendationDict = parsed;
+          ta.inputEl.classList.remove("is-invalid");
+          await this.saveAndRefreshSidePanelDebounced();
+        } catch {
+          ta.inputEl.classList.add("is-invalid");
+        }
       });
     });
-
-    new Setting(journalWrap).addButton((btn) =>
-      btn.setButtonText("+ 新增子窗口").setCta().onClick(async () => {
-        this.plugin.settings.journalPanels.push({
-          id: this.genPanelId(),
-          label: "新子窗口",
-          heading: "### 新标题",
-          maxLines: 20,
-        });
-        await this.saveAndRerender();
-      })
-    );
 
         // =========================
     // 打卡管理
@@ -3276,11 +3954,32 @@ setRowDisabled(!enabled);
     // ===== Side Panel 1~7：各模块设置（拆分到独立文件，避免单文件过长/异常导致设置页截断）
     try { renderCheckinSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
     try { renderFinanceSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
+    try {
+      renderHealthSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting });
+    } catch (e) {
+      console.error(e);
+    }
     try { renderTaskSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
     try { renderMemoSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
+    try { renderScheduleSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
     try { renderProjectSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
     try { renderOutputSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
-    try { renderPublishSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
+    const afterKnowledgeDbSyncChange = async () => {
+      await this.updateCurrentSpaceSnapshot();
+      this.display();
+      this.plugin.refreshSidePanel();
+    };
+    try {
+      renderKnowledgeSettings({
+        tab: this as any,
+        makeModuleWrap,
+        urlCheckable,
+        onDbSyncTurnedOn: () => handleDbSyncToggleOn("knowledge", "知识管理"),
+        afterKnowledgeDbSyncChange,
+      });
+    } catch (e) {
+      console.error(e);
+    }
     try { renderContactsSettings({ tab: this as any, makeModuleWrap, addHeaderButtonsVisibilitySetting, addUiHeaderButtonsVisibilitySetting }); } catch (e) { console.error(e); }
 
     // =========================
@@ -3453,6 +4152,90 @@ setRowDisabled(!enabled);
     return `JP_${rand}`;
   }
 
+  /** 子窗口表：今日日记 / 周报 / 月报 各用独立数组 */
+  private renderJournalPanelsEditor(
+    host: HTMLElement,
+    storageKey: "journalPanels" | "weeklyJournalPanels" | "monthlyJournalPanels" | "quarterlyJournalPanels",
+    addButtonText: string,
+  ): void {
+    const s = this.plugin.settings as Record<string, unknown>;
+    if (!Array.isArray(s[storageKey])) s[storageKey] = [];
+    const panels = s[storageKey] as JournalPanel[];
+
+    const header = host.createDiv({ cls: "rslatte-panel-table-header" });
+    header.createDiv({ text: "ID", cls: "col col-id" });
+    header.createDiv({ text: "按钮名", cls: "col col-label" });
+    header.createDiv({ text: "标题行", cls: "col col-heading" });
+    header.createDiv({ text: "行数", cls: "col col-lines" });
+    header.createDiv({ text: "操作", cls: "col col-action" });
+
+    panels.forEach((p, idx) => {
+      const row = new Setting(host).setName("");
+      row.settingEl.addClass("rslatte-panel-table-row");
+
+      row.addText((t) => {
+        t.inputEl.addClass("col", "col-id");
+        t.setPlaceholder("JP_xxx")
+          .setValue(p.id ?? "")
+          .onChange(async (v) => {
+            p.id = v.trim();
+            await this.saveAndRefreshSidePanelDebounced();
+          });
+      });
+
+      row.addText((t) => {
+        t.inputEl.addClass("col", "col-label");
+        t.setPlaceholder("📝 今日积累")
+          .setValue(p.label ?? "")
+          .onChange(async (v) => {
+            p.label = v;
+            await this.saveAndRefreshSidePanelDebounced();
+          });
+      });
+
+      row.addText((t) => {
+        t.inputEl.addClass("col", "col-heading");
+        t.setPlaceholder("### 今日积累")
+          .setValue(p.heading ?? "")
+          .onChange(async (v) => {
+            p.heading = v;
+            await this.saveAndRefreshSidePanelDebounced();
+          });
+      });
+
+      row.addText((t) => {
+        t.inputEl.addClass("col", "col-lines");
+        t.setPlaceholder("20")
+          .setValue(String(p.maxLines ?? 20))
+          .onChange(async (v) => {
+            const n = Number(v);
+            if (!isNaN(n)) p.maxLines = Math.min(Math.max(n, 1), 30);
+            await this.saveAndRefreshSidePanelDebounced();
+          });
+      });
+
+      row.addButton((btn) => {
+        btn.buttonEl.addClass("col", "col-action");
+        btn.setButtonText("删除").setCta().onClick(async () => {
+          panels.splice(idx, 1);
+          await this.saveAndRerender();
+        });
+      });
+    });
+
+    new Setting(host).addButton((btn) =>
+      btn.setButtonText(addButtonText).setCta().onClick(async () => {
+        panels.push({
+          id: this.genPanelId(),
+          label: "新子窗口",
+          heading: "### 新标题",
+          maxLines: 20,
+        });
+        await this.saveAndRerender();
+      }),
+    );
+  }
+
   private genTaskCatId(): string {
     const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
     return `TC_${rand}`;
@@ -3460,6 +4243,7 @@ setRowDisabled(!enabled);
 
   private async saveAndRerender() {
     await this.plugin.saveSettings();
+    await this.backupFinanceCategoriesToSpaceConfig();
     // ✅ 在重新渲染前保存焦点（如果用户正在编辑）
     this.saveFocusBeforeRerender();
     this.display();
@@ -3471,11 +4255,60 @@ setRowDisabled(!enabled);
   private async saveAndRefreshSidePanelDebounced() {
     // ✅ 不阻止落盘，让用户输入可持久化
     await this.plugin.saveSettings();
+    await this.backupFinanceCategoriesToSpaceConfig();
 
     if (this._refreshTimer) window.clearTimeout(this._refreshTimer);
     this._refreshTimer = window.setTimeout(() => {
       this.plugin.refreshSidePanel();
     }, 150);
+  }
+
+  /**
+   * 仅做“额外备份”：
+   * - 仍以 settings.financeCategories 作为唯一读写来源
+   * - 另外写一份到 index/finance-config/finance-categories.json，方便后续统一从 finance-config 读取入库
+   */
+  private async backupFinanceCategoriesToSpaceConfig() {
+    try {
+      const spaceRoot = String(this.plugin.getSpaceIndexDir?.() ?? "").trim();
+      if (!spaceRoot) return;
+      const cfgDir = normalizePath(`${spaceRoot}/finance-config`);
+      const cfgPath = normalizePath(`${cfgDir}/finance-categories.json`);
+
+      const items = (this.plugin.settings.financeCategories ?? []).map((x: FinanceCatDef) => ({
+        id: String(x.id ?? "").trim(),
+        name: String(x.name ?? "").trim(),
+        type: x.type === "income" ? "income" : "expense",
+        active: !!x.active,
+        subCategories: Array.isArray(x.subCategories)
+          ? Array.from(new Set(x.subCategories.map((s) => String(s ?? "").trim()).filter(Boolean)))
+          : [],
+        institutionNames: Array.isArray((x as any).institutionNames)
+          ? Array.from(
+            new Set(
+              ((x as any).institutionNames as any[])
+                .map((s) => String(s ?? "").trim().replace(/\s+/g, " "))
+                .filter(Boolean)
+            )
+          )
+          : [],
+      }));
+      const payload = {
+        schema_version: 1,
+        updated_at: new Date().toISOString(),
+        items,
+      };
+      const json = JSON.stringify(payload, null, 2);
+      if (json === this._lastFinanceCategoriesBackupJson) return;
+
+      const adapter = this.plugin.app.vault.adapter;
+      const dirExists = await adapter.exists(cfgDir);
+      if (!dirExists) await adapter.mkdir(cfgDir);
+      await adapter.write(cfgPath, json);
+      this._lastFinanceCategoriesBackupJson = json;
+    } catch (e) {
+      console.warn("[RSLatte][settings] 备份 finance-categories.json 失败", e);
+    }
   }
 
   private isValidId(id: string): boolean {
@@ -3758,6 +4591,30 @@ setRowDisabled(!enabled);
   private _dbReason: string = "";
   private _dbInitRequired = false;
   private _dbChecking = false;
+  /** null=未知；true=服务端要求 Bearer（GET /auth/status） */
+  private _authRequired: boolean | null = null;
+
+  private async refreshAuthRequiredFlag(): Promise<void> {
+    this._authRequired = null;
+    const base = String(this.plugin.settings.apiBaseUrl ?? "").trim();
+    if (!base) return;
+    const lower = base.toLowerCase();
+    if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return;
+    try {
+      // eslint-disable-next-line no-new
+      new URL(base);
+    } catch {
+      return;
+    }
+    try {
+      this.plugin.api.setBaseUrl(base);
+      const st = await this.plugin.api.authStatus();
+      this._authRequired = !!st.auth_required;
+    } catch {
+      this._authRequired = null;
+    }
+  }
+
   private async checkDbReady(): Promise<boolean> {
   // ✅ D9：后端触达入口统一（内部包含 shouldTouchBackendNow + ensureVaultReadySafe + dbInitialized）
   const r = await (this.plugin as any)?.vaultSvc?.checkDbReadySafe?.("settings.checkDbReady");
@@ -3784,6 +4641,7 @@ setRowDisabled(!enabled);
 
   this._dbReason = this._dbReady ? "" : reason;
 
+  await this.refreshAuthRequiredFlag();
   // setBackendDbReady 已在 VaultService 内统一维护；这里仅保持 UI 状态即可
   return !!r.ok;
 }
@@ -3794,21 +4652,43 @@ setRowDisabled(!enabled);
       apiTry("拉取财务分类清单", () => this.plugin.api.listFinanceCategories(undefined)),
     ]);
 
-    this.plugin.settings.checkinItems = (cks || []).map(x => ({
-      id: x.checkin_id,
-      name: x.checkin_name,
-      active: !!x.status,
-      fromDb: true,
-    }));
+    const prevCk = new Map((this.plugin.settings.checkinItems ?? []).map((it: any) => [String(it?.id ?? ""), it]));
+    this.plugin.settings.checkinItems = (cks || []).map((x) => {
+      const id = String(x.checkin_id ?? "");
+      const prev = prevCk.get(id) as any;
+      return {
+        id: x.checkin_id,
+        name: x.checkin_name,
+        active: !!x.status,
+        fromDb: true,
+        // 后端暂无难度字段：从本地同 ID 条目保留，避免拉清单覆盖为默认
+        checkinDifficulty: prev?.checkinDifficulty,
+      };
+    });
 
-    this.plugin.settings.financeCategories = (fins || []).map(x => ({
-      id: x.category_id,
-      name: x.category_name,
-      type: x.category_type,
-      active: !!x.status,
-      fromDb: true,
-      subCategories: (x as any).sub_categories || (x as any).subCategories || [], // ✅ 同步子分类列表
-    }));
+    this.plugin.settings.financeCategories = (fins || []).map((x) => {
+      const prev = (this.plugin.settings.financeCategories ?? []).find(
+        (it: any) => String(it?.id ?? "") === String(x.category_id ?? "")
+      ) as any;
+      const rawInst = (x as any).institution_names ?? (x as any).institutionNames;
+      const instFromApi = Array.isArray(rawInst)
+        ? rawInst.map((s: string) => String(s ?? "").trim()).filter(Boolean)
+        : null;
+      return {
+        id: x.category_id,
+        name: x.category_name,
+        type: x.category_type,
+        active: !!x.status,
+        fromDb: true,
+        subCategories: (x as any).sub_categories || (x as any).subCategories || [],
+        institutionNames:
+          instFromApi !== null
+            ? instFromApi
+            : Array.isArray(prev?.institutionNames)
+              ? prev.institutionNames
+              : [],
+      };
+    });
 
     await this.plugin.saveSettings();
   }
@@ -3826,7 +4706,10 @@ setRowDisabled(!enabled);
       category_name: x.name.trim(),
       category_type: x.type,
       status: !!x.active,
-      sub_categories: (x.subCategories || []).filter((sc: string) => sc && sc.trim()).map((sc: string) => sc.trim()), // ✅ 同步子分类列表
+      sub_categories: (x.subCategories || []).filter((sc: string) => sc && sc.trim()).map((sc: string) => sc.trim()),
+      institution_names: (Array.isArray((x as any).institutionNames) ? (x as any).institutionNames : [])
+        .map((s: string) => String(s ?? "").trim())
+        .filter(Boolean),
     }));
     await apiTry("保存财务分类清单", () => this.plugin.api.upsertFinanceCategories(finPayload));
   }

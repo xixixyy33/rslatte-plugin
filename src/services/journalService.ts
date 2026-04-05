@@ -60,6 +60,11 @@ export class JournalService {
     return norm;
   }
 
+  /** 当前解析后的日记根目录（含空间 override），用于拼装周报/月报路径 */
+  public getResolvedDiaryDir(): string {
+    return this.getDiaryDir();
+  }
+
   private getDiaryNameBase(dateKey: string): string {
     // 优先使用临时覆盖的格式（用于空间隔离）
     const raw = this._diaryNameFormatOverride ?? this.settings.diaryNameFormat ?? "YYYYMMDD";
@@ -500,6 +505,176 @@ export class JournalService {
   // =========================
 
   /**
+   * 与 readPanelsSectionFullTextForDateKey 相同的标题切片，用于任意 vault 下的 .md。
+   */
+  public async readPanelsSectionFullTextForVaultPath(
+    vaultRelPath: string,
+    panels: JournalPanel[],
+  ): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    try {
+      if (!Array.isArray(panels) || panels.length === 0) return out;
+      const pth = normalizePath(String(vaultRelPath ?? "").trim());
+      if (!pth) return out;
+      const af = this.app.vault.getAbstractFileByPath(pth);
+      if (!af || !(af instanceof TFile)) return out;
+      const raw = await this.app.vault.read(af);
+      const lines = raw.split("\n").map((l) => l.replace(/\r$/, ""));
+      return this.extractPanelFullTextsFromLines(lines, panels);
+    } catch (e) {
+      console.error("[rslatte] readPanelsSectionFullTextForVaultPath failed", e);
+      return out;
+    }
+  }
+
+  /**
+   * 周报/月报子窗口：与 `extractPanelFullTextsFromLines` 相同的标题匹配规则，
+   * 返回该面板「标题下首段内容」所在行的 1-based 行号（跳过标题后的空行）；
+   * 若小节为空则落在标题的下一行。找不到标题时返回 null。
+   */
+  public async getJournalPanelJumpLine1Based(
+    vaultRelPath: string,
+    panelHeadingRaw: string,
+  ): Promise<number | null> {
+    const pth = normalizePath(String(vaultRelPath ?? "").trim());
+    if (!pth) return null;
+    const wantedText = normalizeHeadingText(panelHeadingRaw);
+    const wantedKey = normalizeHeadingKey(wantedText);
+    if (!wantedKey) return null;
+
+    try {
+      const af = this.app.vault.getAbstractFileByPath(pth);
+      if (!af || !(af instanceof TFile)) return null;
+      const raw = await this.app.vault.read(af);
+      const lines = raw.split("\n").map((l) => l.replace(/\r$/, ""));
+
+      const headings: { idx: number; level: number; key: string }[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^(#+)\s*(.*)$/);
+        if (!m) continue;
+        const level = m[1].length;
+        const text = normalizeHeadingText(lines[i]);
+        const key = normalizeHeadingKey(text);
+        if (!key) continue;
+        headings.push({ idx: i, level, key });
+      }
+
+      const found = headings.find((h) => h.key === wantedKey);
+      if (!found) return null;
+
+      let start = found.idx + 1;
+      while (start < lines.length && lines[start].trim() === "") start++;
+
+      if (start < lines.length) {
+        const hm = lines[start].match(/^(#+)\s+/);
+        if (hm && hm[1].length <= found.level) {
+          return found.idx + 2;
+        }
+        return start + 1;
+      }
+      return found.idx + 2;
+    } catch (e) {
+      console.error("[rslatte] getJournalPanelJumpLine1Based failed", e);
+      return null;
+    }
+  }
+
+  /**
+   * 周报/月报不存在时：按模板创建（模板留空则创建空文件）。
+   * 占位符：`{{date}}` `{{dateKey}}` `{{weekKey}}` `{{monthKey}}` `{{quarterKey}}` `{{diaryName}}` / `{{diaryFileName}}`（文件名不含 .md）
+   */
+  public async ensureWeeklyOrMonthlyReportFile(params: {
+    vaultPath: string;
+    templatePath: string;
+    anchorYmd: string;
+    weekKey: string;
+    monthKey: string;
+    /** 历季键，如 2026-Q1（季报模板用） */
+    quarterKey?: string;
+  }): Promise<TFile> {
+    const norm = normalizePath(String(params.vaultPath ?? "").trim());
+    const existed = this.app.vault.getAbstractFileByPath(norm);
+    if (existed && existed instanceof TFile) return existed;
+
+    await this.audit.ensureDirForPath(norm);
+
+    const tplPath = String(params.templatePath ?? "").trim();
+    const tpl = tplPath ? await this.readTemplateContent(tplPath) : "";
+
+    const momentFn = moment as any;
+    const d = momentFn(params.anchorYmd, "YYYY-MM-DD");
+    const baseName = norm.replace(/\.md$/i, "").split("/").pop() ?? "";
+
+    let content = "";
+    if (tpl && tpl.trim()) {
+      content = tpl
+        .replace(/\{\{date\}\}/g, d.isValid() ? d.format("YYYY-MM-DD") : params.anchorYmd)
+        .replace(/\{\{dateKey\}\}/g, d.isValid() ? d.format("YYYY-MM-DD") : params.anchorYmd)
+        .replace(/\{\{weekKey\}\}/g, params.weekKey)
+        .replace(/\{\{monthKey\}\}/g, params.monthKey)
+        .replace(/\{\{quarterKey\}\}/g, String(params.quarterKey ?? "").trim())
+        .replace(/\{\{diaryName\}\}/g, baseName)
+        .replace(/\{\{diaryFileName\}\}/g, baseName);
+    }
+
+    const created = await this.app.vault.create(norm, content);
+    return created;
+  }
+
+  private extractPanelFullTextsFromLines(lines: string[], panels: JournalPanel[]): Record<string, string> {
+    const out: Record<string, string> = {};
+    const headings: { idx: number; level: number; key: string }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^(#+)\s*(.*)$/);
+      if (!m) continue;
+      const level = m[1].length;
+      const text = normalizeHeadingText(lines[i]);
+      const key = normalizeHeadingKey(text);
+      if (!key) continue;
+      headings.push({ idx: i, level, key });
+    }
+
+    for (const p of panels) {
+      const id = (p?.id ?? "").trim();
+      if (!id) continue;
+
+      const wantedText = normalizeHeadingText(p.heading ?? "");
+      const wantedKey = normalizeHeadingKey(wantedText);
+      if (!wantedKey) {
+        out[id] = "";
+        continue;
+      }
+
+      const found = headings.find((h) => h.key === wantedKey);
+      if (!found) {
+        out[id] = "";
+        continue;
+      }
+
+      let start = found.idx + 1;
+      while (start < lines.length && lines[start].trim() === "") start++;
+
+      let end = lines.length;
+      for (let i = start; i < lines.length; i++) {
+        const hm = lines[i].match(/^(#+)\s+/);
+        if (!hm) continue;
+        const level2 = hm[1].length;
+        if (level2 <= found.level) {
+          end = i;
+          break;
+        }
+      }
+
+      let contentLines = lines.slice(start, end);
+      while (contentLines.length && contentLines[0].trim() === "") contentLines.shift();
+
+      out[id] = contentLines.join("\n").trimEnd();
+    }
+
+    return out;
+  }
+
+  /**
    * 一次性读取并解析多个 panel 的预览文本（避免每个按钮重复读文件）。
    * - panel.heading：匹配标题行（忽略 # 级别差异，只比较标题文本）
    * - maxLines：截断到 1..30 行
@@ -578,6 +753,29 @@ export class JournalService {
       return out;
     } catch (e) {
       console.error("[rslatte] readPanelsPreviewForDateKey failed", e);
+      return out;
+    }
+  }
+
+  /**
+   * 与 readPanelsPreviewForDateKey 相同的区块切分，但不截断行数，用于字数统计等。
+   */
+  public async readPanelsSectionFullTextForDateKey(dateKey: string, panels: JournalPanel[]): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    try {
+      if (!Array.isArray(panels) || panels.length === 0) return out;
+
+      const targetPath = await this.findDiaryPathForDateKey(dateKey);
+      if (!targetPath) return out;
+
+      const af = this.app.vault.getAbstractFileByPath(targetPath);
+      if (!af || !(af instanceof TFile)) return out;
+
+      const raw = await this.app.vault.read(af);
+      const lines = raw.split("\n").map((l) => l.replace(/\r$/, ""));
+      return this.extractPanelFullTextsFromLines(lines, panels);
+    } catch (e) {
+      console.error("[rslatte] readPanelsSectionFullTextForDateKey failed", e);
       return out;
     }
   }

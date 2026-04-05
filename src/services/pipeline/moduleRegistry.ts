@@ -1,10 +1,15 @@
 /**
  * ModuleRegistry (A2)
  *
- * 目标：管理 7 个模块的 ModuleSpec（task/memo/checkin/finance/project/output/contacts），
+ * 目标：管理模块 ModuleSpec（含 knowledge 等），
  * 支持注册与枚举，供后续 coordinator 编排。
  *
- * ⚠️ 本文件仅提供注册表能力与默认 registry（占位 spec）：不接入现有逻辑，不改任何调用点。
+ * **[X-Pipeline]（E2 vs LEGACY）**
+ * - 各模块可同时挂 **`legacy`**（`engine.run` → `incrementalRefresh` 等）与 **`atomic`**（`engine.runE2`）。
+ * - **自动刷新 tick** 由 **`coordinator`** 调用 **`engine.runE2`（单轨）**；**`task` / `memo` / `schedule`** 等均依赖各自 **Atomic** spec（`schedule` 见 `scheduleSpecAtomic.ts`；legacy 槽在 `pipelineManager` 内为占位，**自动调度不经过**）。
+ * - 手动侧栏 🔄 等入口亦以 **`runE2`** 为主（与 CODE_MAP §3.11 入口约束一致）。
+ *
+ * ⚠️ 本文件仅提供注册表能力与默认 registry（占位 spec）：运行时由 `pipelineManager.createPipelineEngine` 注入 overrides。
  */
 
 import type { RSLatteModuleKey } from "./types";
@@ -105,17 +110,18 @@ export class ModuleRegistry {
 export const DEFAULT_MODULE_KEYS: RSLatteModuleKey[] = [
   "task",
   "memo",
+  "schedule",
   "checkin",
   "finance",
+  "health",
   "project",
   "output",
   "contacts",
-  "publish",
 ];
 
 /**
  * 创建默认 registry：
- * - 注册 8 个模块的 placeholder spec（接口齐全，便于后续逐步 bridge 到旧逻辑）
+ * - 注册模块 placeholder spec（接口齐全，便于后续逐步 bridge 到旧逻辑）
  */
 export function createDefaultModuleRegistry(
   overrides?: Partial<Record<RSLatteModuleKey, ModuleSpecAny>>
@@ -131,12 +137,14 @@ export function createDefaultModuleRegistry(
 
   regOne("task", "Task");
   regOne("memo", "Memo");
+  regOne("schedule", "Schedule");
   regOne("checkin", "Checkin");
   regOne("finance", "Finance");
+  regOne("health", "Health");
   regOne("project", "Project");
   regOne("output", "Output");
   regOne("contacts", "Contacts");
-  regOne("publish", "Publish");
+  regOne("knowledge", "Knowledge");
 
   return reg;
 }

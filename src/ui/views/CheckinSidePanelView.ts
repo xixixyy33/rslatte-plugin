@@ -4,6 +4,7 @@ import { VIEW_TYPE_CHECKIN } from "../../constants/viewTypes";
 import { AddCheckinRecordModal } from "../modals/AddCheckinRecordModal";
 import { RSLATTE_EVENT_SPACE_CHANGED } from "../../constants/space";
 import { getUiHeaderButtonsVisibility } from "../helpers/uiHeaderButtons";
+import { formatCheckinDifficultyBadge } from "../../types/rslatteTypes";
 
 const momentFn = moment as any;
 
@@ -15,6 +16,8 @@ export class CheckinSidePanelView extends ItemView {
   private _selectedYear: string = ""; // YYYY 格式
   private _selectedCheckinIds: Set<string> = new Set(); // 选中的打卡项ID
   private _checkinSelectionCollapsed: boolean = false;
+  /** 渲染完成后定位热力图格子（expectSeq 与本次 render 序号对齐，避免并发 render 错消费） */
+  private _pendingCheckinNavFlash: { recordDate: string; checkinId: string; expectSeq: number } | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: RSLattePlugin) {
     super(leaf);
@@ -47,6 +50,60 @@ export class CheckinSidePanelView extends ItemView {
 
   async onClose() { }
 
+  /**
+   * 外部跳转：切到月份视图、选中对应打卡项、高亮 recordDate 所在格。
+   */
+  applyNavFocus(opts: { recordDate: string; checkinId: string }): void {
+    const recordDate = String(opts.recordDate ?? "").trim();
+    const checkinId = String(opts.checkinId ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(recordDate) || !checkinId) return;
+    this._viewMode = "month";
+    this._selectedMonth = recordDate.slice(0, 7);
+    this._selectedCheckinIds.add(checkinId);
+    this._pendingCheckinNavFlash = {
+      recordDate,
+      checkinId,
+      expectSeq: this._renderSeq + 1,
+    };
+    void this.render();
+  }
+
+  private escapeForSelector(s: string): string {
+    const esc = (globalThis as any).CSS?.escape as ((x: string) => string) | undefined;
+    return typeof esc === "function" ? esc(s) : s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  private maybeRunCheckinNavFlash(seq: number): void {
+    const p = this._pendingCheckinNavFlash;
+    if (!p || p.expectSeq !== seq || seq !== this._renderSeq) return;
+    this._pendingCheckinNavFlash = null;
+    const key = { recordDate: p.recordDate, checkinId: p.checkinId };
+    window.requestAnimationFrame(() => {
+      window.setTimeout(() => {
+        if (seq !== this._renderSeq) return;
+        const root = this.containerEl.children[1] as HTMLElement | undefined;
+        if (!root) return;
+        const idEsc = this.escapeForSelector(key.checkinId);
+        const dateEsc = this.escapeForSelector(key.recordDate);
+        const block = root.querySelector(
+          `.rslatte-stats-checkin-heatmap-item[data-checkin-id="${idEsc}"]`,
+        ) as HTMLElement | null;
+        const cell =
+          (block &&
+            (block.querySelector(
+              `.rslatte-stats-heatmap-cell[data-date="${dateEsc}"]`,
+            ) as HTMLElement | null)) ||
+          (root.querySelector(
+            `.rslatte-stats-checkin-heatmap-item[data-checkin-id="${idEsc}"] .rslatte-stats-heatmap-cell[data-date="${dateEsc}"]`,
+          ) as HTMLElement | null);
+        if (!cell) return;
+        cell.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        cell.addClass("rslatte-stats-heatmap-cell--nav-flash");
+        window.setTimeout(() => cell.removeClass("rslatte-stats-heatmap-cell--nav-flash"), 2600);
+      }, 120);
+    });
+  }
+
   private async render() {
     const seq = ++this._renderSeq;
     const container = this.containerEl.children[1];
@@ -56,6 +113,7 @@ export class CheckinSidePanelView extends ItemView {
     const checkinEnabled = this.plugin.isPipelineModuleEnabled("checkin");
     if (!checkinEnabled) {
       container.createDiv({ cls: "rslatte-muted", text: "打卡模块未启用" });
+      this.maybeRunCheckinNavFlash(seq);
       return;
     }
 
@@ -248,7 +306,7 @@ export class CheckinSidePanelView extends ItemView {
           }
           void this.render();
         };
-        label.createSpan({ text: item.name });
+        label.createSpan({ text: item.name + formatCheckinDifficultyBadge((item as any).checkinDifficulty) });
       }
     }
 
@@ -260,6 +318,7 @@ export class CheckinSidePanelView extends ItemView {
 
     if (this._selectedCheckinIds.size === 0) {
       heatmapSection.createDiv({ cls: "rslatte-muted", text: "请至少选择一个打卡项" });
+      this.maybeRunCheckinNavFlash(seq);
       return;
     }
 
@@ -268,6 +327,7 @@ export class CheckinSidePanelView extends ItemView {
       const recordRSLatte = (this.plugin as any).recordRSLatte;
       if (!recordRSLatte || typeof recordRSLatte.getCheckinStatsCache !== "function") {
         heatmapSection.createDiv({ cls: "rslatte-stats-error", text: "打卡统计缓存服务未初始化" });
+        this.maybeRunCheckinNavFlash(seq);
         return;
       }
 
@@ -329,6 +389,7 @@ export class CheckinSidePanelView extends ItemView {
           const items = itemsByCheckinId.get(checkinId)!;
 
           const heatmapItem = heatmapsContainer.createDiv({ cls: "rslatte-stats-checkin-heatmap-item" });
+          heatmapItem.dataset.checkinId = checkinId;
           heatmapItem.createEl("h6", { text: checkinName });
 
           // 渲染热力图（月度或年度），传入打卡项ID和名称以便点击时使用
@@ -345,6 +406,7 @@ export class CheckinSidePanelView extends ItemView {
       console.error("[CheckinPanel] Failed to render heatmaps:", e);
       heatmapSection.createDiv({ cls: "rslatte-stats-error", text: `渲染失败：${e instanceof Error ? e.message : String(e)}` });
     }
+    this.maybeRunCheckinNavFlash(seq);
   }
 
   /** 生成打卡项月度热力图（使用 HTML/CSS 渲染） */
@@ -639,6 +701,7 @@ export class CheckinSidePanelView extends ItemView {
 
     new Notice(`打卡索引已重建`);
     try { await this.plugin.hydrateTodayFromRecordIndex(); } catch { }
+    try { await this.plugin.recomputeCheckinContinuousDaysFromIndex?.(); } catch { }
     void this.render();
   }
 
@@ -655,6 +718,8 @@ export class CheckinSidePanelView extends ItemView {
 
     new Notice(`打卡已刷新`);
     try { await this.plugin.hydrateTodayFromRecordIndex(); } catch { }
+    // 与重建一致：按索引内全部有效日期重算连续天（补打卡后 normalize 会「昨日有则跳过」导致 streak 不准）
+    try { await this.plugin.recomputeCheckinContinuousDaysFromIndex?.(); } catch { }
     void this.render();
   }
 

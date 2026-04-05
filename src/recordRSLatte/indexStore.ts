@@ -1,92 +1,26 @@
-import { App, TFile, TFolder, normalizePath } from "obsidian";
-import type { CheckinRecordIndexFile, FinanceRecordIndexFile, RSLatteListsIndexFile, FinanceStatsCacheFile, CheckinStatsCacheFile, TaskStatsCacheFile } from "../types/recordIndexTypes";
+import { App, normalizePath } from "obsidian";
+import { ensureFolderChain, readJsonVaultFirst, writeJsonRaceSafe } from "../internal/indexJsonIo";
+import type {
+  CheckinRecordIndexFile,
+  FinanceRecordIndexFile,
+  HealthRecordIndexFile,
+  RSLatteListsIndexFile,
+  FinanceStatsCacheFile,
+  CheckinStatsCacheFile,
+  TaskStatsCacheFile,
+} from "../types/recordIndexTypes";
+
+const INDEX_JSON_IO_CTX = { label: "RecordIndexStore" } as const;
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-async function ensureFolder(app: App, path: string) {
-  const norm = normalizePath(path).replace(/\/+$/g, "");
-  if (!norm) return;
-
-  const parts = norm.split("/").filter(Boolean);
-  let cur = "";
-  for (const p of parts) {
-    cur = cur ? `${cur}/${p}` : p;
-    const af = app.vault.getAbstractFileByPath(cur);
-    if (af && af instanceof TFile) {
-      throw new Error(`RecordIndexStore: path conflicts with an existing file: ${cur}`);
-    }
-    if (!af) {
-      try {
-        await app.vault.createFolder(cur);
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
-        if (msg.includes("Folder already exists") || msg.includes("EEXIST")) continue;
-        throw e;
-      }
-    }
-  }
-}
-
-async function readJsonFile<T>(app: App, path: string, fallback: T): Promise<T> {
-  const norm = normalizePath(path);
-  const af = app.vault.getAbstractFileByPath(norm);
-  if (af instanceof TFile) {
-    try {
-      const raw = await app.vault.read(af);
-      return raw ? (JSON.parse(raw) as T) : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-  try {
-    const exists = await app.vault.adapter.exists(norm);
-    if (!exists) return fallback;
-    const raw = await app.vault.adapter.read(norm);
-    return raw ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJsonFile(app: App, path: string, obj: any): Promise<void> {
-  const norm = normalizePath(path);
-  await ensureFolder(app, norm.split("/").slice(0, -1).join("/"));
-
-  const content = JSON.stringify(obj, null, 2);
-  const existing = app.vault.getAbstractFileByPath(norm);
-
-  if (existing instanceof TFile) {
-    await app.vault.modify(existing, content);
-    return;
-  }
-  if (existing instanceof TFolder) {
-    throw new Error(`RecordIndexStore: file path conflicts with an existing folder: ${norm}`);
-  }
-
-  try {
-    await app.vault.create(norm, content);
-  } catch (e: any) {
-    const msg = String(e?.message ?? e);
-    if (msg.includes("File already exists") || msg.includes("EEXIST")) {
-      const af2 = app.vault.getAbstractFileByPath(norm);
-      if (af2 instanceof TFile) {
-        await app.vault.modify(af2, content);
-        return;
-      }
-      await app.vault.adapter.write(norm, content);
-      return;
-    }
-    throw e;
-  }
 }
 
 export class RecordIndexStore {
   constructor(private app: App, private baseDir: string) {}
 
   public getBaseDir(): string {
-    return normalizePath((this.baseDir ?? "").trim() || "95-Tasks/.rslatte");
+    return normalizePath((this.baseDir ?? "").trim() || "00-System/.rslatte");
   }
 
   /**
@@ -106,8 +40,8 @@ export class RecordIndexStore {
 
   public async ensureLayout(): Promise<void> {
     const dir = this.getBaseDir();
-    await ensureFolder(this.app, dir);
-    await ensureFolder(this.app, normalizePath(`${dir}/archive`));
+    await ensureFolderChain(this.app, dir, INDEX_JSON_IO_CTX);
+    await ensureFolderChain(this.app, normalizePath(`${dir}/archive`), INDEX_JSON_IO_CTX);
   }
 
   private checkinIndexPath(archived: boolean): string {
@@ -118,6 +52,11 @@ export class RecordIndexStore {
   private financeIndexPath(archived: boolean): string {
     const dir = this.getBaseDir();
     return normalizePath(`${dir}/${archived ? "archive/" : ""}finance-record-index.json`);
+  }
+
+  private healthIndexPath(archived: boolean): string {
+    const dir = this.getBaseDir();
+    return normalizePath(`${dir}/${archived ? "archive/" : ""}health-record-index.json`);
   }
 
   private listsIndexPath(archived: boolean): string {
@@ -146,7 +85,7 @@ export class RecordIndexStore {
    * @param settings 插件设置（用于解析索引目录）
    */
   public static getCheckinStatsCachePathForSpace(spaceId: string, settings: any, app: App): string {
-    const { resolveSpaceIndexDir } = require("../services/spaceContext");
+    const { resolveSpaceIndexDir } = require("../services/space/spaceContext");
     const indexDir = resolveSpaceIndexDir(settings, spaceId, [settings?.rslattePanelIndexDir]);
     return normalizePath(`${indexDir}/checkin-stats-cache.json`);
   }
@@ -155,7 +94,7 @@ export class RecordIndexStore {
     const p = this.checkinIndexPath(archived);
     const fallback: CheckinRecordIndexFile = { version: 1, updatedAt: nowIso(), items: [] };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -164,7 +103,7 @@ export class RecordIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/${archived ? "archive/" : ""}checkin-record-index.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -175,14 +114,14 @@ export class RecordIndexStore {
   public async writeCheckinIndex(archived: boolean, file: CheckinRecordIndexFile): Promise<void> {
     const p = this.checkinIndexPath(archived);
     const out: CheckinRecordIndexFile = { version: 1, updatedAt: nowIso(), items: file.items ?? [] };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   public async readFinanceIndex(archived: boolean): Promise<FinanceRecordIndexFile> {
     const p = this.financeIndexPath(archived);
     const fallback: FinanceRecordIndexFile = { version: 1, updatedAt: nowIso(), items: [] };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -191,7 +130,7 @@ export class RecordIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/${archived ? "archive/" : ""}finance-record-index.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -202,7 +141,42 @@ export class RecordIndexStore {
   public async writeFinanceIndex(archived: boolean, file: FinanceRecordIndexFile): Promise<void> {
     const p = this.financeIndexPath(archived);
     const out: FinanceRecordIndexFile = { version: 1, updatedAt: nowIso(), items: file.items ?? [] };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
+  }
+
+  public async readHealthIndex(archived: boolean): Promise<HealthRecordIndexFile> {
+    const p = this.healthIndexPath(archived);
+    const fallback: HealthRecordIndexFile = { version: 1, updatedAt: nowIso(), items: [] };
+    try {
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
+    } catch {
+      // ignore
+    }
+    const legacyRoot = this.getLegacyRootDir();
+    if (legacyRoot) {
+      const legacyPath = normalizePath(`${legacyRoot}/${archived ? "archive/" : ""}health-record-index.json`);
+      try {
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
+      } catch {
+        // ignore
+      }
+    }
+    return fallback;
+  }
+
+  public async writeHealthIndex(archived: boolean, file: HealthRecordIndexFile): Promise<void> {
+    const p = this.healthIndexPath(archived);
+    const out: HealthRecordIndexFile = { version: 1, updatedAt: nowIso(), items: file.items ?? [] };
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
+  }
+
+  /**
+   * 财务管理设置快照（与方案「重建索引时覆盖」）：供多端/入库读取，非全量插件设置。
+   */
+  public async writeFinanceManagementSettingsSnapshot(payload: Record<string, unknown>): Promise<void> {
+    const dir = this.getBaseDir();
+    const p = normalizePath(`${dir}/finance-management-settings.snapshot.json`);
+    await writeJsonRaceSafe(this.app, p, { ...payload, snapshotWrittenAt: nowIso() }, INDEX_JSON_IO_CTX);
   }
 
   public async readListsIndex(archived: boolean): Promise<RSLatteListsIndexFile> {
@@ -217,7 +191,7 @@ export class RecordIndexStore {
       tombstoneFinanceIds: [],
     };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -226,7 +200,7 @@ export class RecordIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/${archived ? "archive/" : ""}rslatte-lists-index.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -245,7 +219,7 @@ export class RecordIndexStore {
       tombstoneCheckinIds: file.tombstoneCheckinIds ?? [],
       tombstoneFinanceIds: file.tombstoneFinanceIds ?? [],
     };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   /**
@@ -257,7 +231,7 @@ export class RecordIndexStore {
     const p = this.financeStatsCachePath();
     const fallback: FinanceStatsCacheFile = { version: 1, updatedAt: nowIso(), items: [] };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -266,7 +240,7 @@ export class RecordIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/finance-stats-cache.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -280,7 +254,7 @@ export class RecordIndexStore {
   public async writeFinanceStatsCache(file: FinanceStatsCacheFile): Promise<void> {
     const p = this.financeStatsCachePath();
     const out: FinanceStatsCacheFile = { version: 1, updatedAt: nowIso(), items: file.items ?? [] };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   /**
@@ -292,7 +266,7 @@ export class RecordIndexStore {
     const p = this.checkinStatsCachePath();
     const fallback: CheckinStatsCacheFile = { version: 1, updatedAt: nowIso(), items: [] };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -301,7 +275,7 @@ export class RecordIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/checkin-stats-cache.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -315,7 +289,7 @@ export class RecordIndexStore {
   public async writeCheckinStatsCache(file: CheckinStatsCacheFile): Promise<void> {
     const p = this.checkinStatsCachePath();
     const out: CheckinStatsCacheFile = { version: 1, updatedAt: nowIso(), items: file.items ?? [] };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   /**
@@ -327,7 +301,7 @@ export class RecordIndexStore {
     const p = this.taskStatsCachePath();
     const fallback: TaskStatsCacheFile = { version: 1, updatedAt: nowIso(), items: [] };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -336,7 +310,7 @@ export class RecordIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/task-stats-cache.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -350,6 +324,6 @@ export class RecordIndexStore {
   public async writeTaskStatsCache(file: TaskStatsCacheFile): Promise<void> {
     const p = this.taskStatsCachePath();
     const out: TaskStatsCacheFile = { version: 1, updatedAt: nowIso(), items: file.items ?? [] };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 }

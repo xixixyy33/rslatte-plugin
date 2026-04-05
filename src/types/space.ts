@@ -10,6 +10,11 @@ export interface RSLatteSpaceConfig {
   id: SpaceId;
   /** 展示名称 */
   name: string;
+  /**
+   * 业务空间编号（1=默认空间；其余为 2/4/5/6/7/8，见《空间管理优化方案》）。
+   * 用于默认根前缀 `{n}0-` 与路径片段拼接，与 id 独立存储。
+   */
+  spaceNumber?: number;
   /** ISO string */
   createdAt?: string;
   /** ISO string */

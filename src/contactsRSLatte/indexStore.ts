@@ -2,46 +2,15 @@ import { App, normalizePath } from "obsidian";
 import type { ContactsIndexFile, ContactsInteractionEntry, ContactsInteractionSourceType, ContactsInteractionsBySourceFile, ContactsInteractionsIndexFile } from "./types";
 import { createEmptyContactsInteractionsIndexFile } from "./types";
 import { fnv1a32, safeJsonParse, toIsoNow } from "../taskRSLatte/utils";
+import { mergeInteractionEventsWithPrevious } from "../services/contacts/contactInteractionEventsMerge";
+import { sortKeyLatestInteractionMs } from "../services/contacts/contactInteractionDisplay";
+import { trimInteractionEventsForContactUid } from "../services/contacts/contactInteractionWindowTrim";
+import { appendContactInteractionOverflowArchive } from "../services/contacts/contactInteractionArchive";
+import { writeContactsInteractionReplicaSnapshot } from "../services/contacts/contactsInteractionReplica";
+import { pathExistsVaultOrAdapter, readTextVaultFirst, writeTextRaceSafe } from "../internal/indexJsonIo";
 
-async function ensureFolder(app: App, path: string): Promise<void> {
-  const p = normalizePath(path);
-  if (!p) return;
-  const exists = await app.vault.adapter.exists(p);
-  if (exists) return;
-
-  const parts = p.split("/");
-  let cur = "";
-  for (const seg of parts) {
-    cur = cur ? `${cur}/${seg}` : seg;
-    const ok = await app.vault.adapter.exists(cur);
-    if (!ok) {
-      try {
-        await app.vault.createFolder(cur);
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
-        if (msg.includes("Folder already exists") || msg.includes("EEXIST")) continue;
-        throw e;
-      }
-    }
-  }
-}
-
-async function readTextFile(app: App, path: string): Promise<string | null> {
-  try {
-    const ok = await app.vault.adapter.exists(path);
-    if (!ok) return null;
-    return await app.vault.adapter.read(path);
-  } catch {
-    return null;
-  }
-}
-
-async function writeTextFile(app: App, path: string, text: string): Promise<void> {
-  await ensureFolder(app, path.split("/").slice(0, -1).join("/"));
-  const ok = await app.vault.adapter.exists(path);
-  if (ok) await app.vault.adapter.write(path, text);
-  else await app.vault.create(path, text);
-}
+const CONTACTS_INDEX_IO_CTX = { label: "ContactsIndexStore" } as const;
+const CONTACTS_INTERACTIONS_IO_CTX = { label: "ContactsInteractionsStore" } as const;
 
 export class ContactsIndexStore {
   private app: App;
@@ -54,7 +23,7 @@ export class ContactsIndexStore {
 
   private getBaseDir(): string {
     // ✅ Use the unified central index dir setting ("索引目录（中央索引/队列/归档）")
-    const base = normalizePath((this.centralIndexDirRef() ?? "").trim() || "95-Tasks/.rslatte");
+    const base = normalizePath((this.centralIndexDirRef() ?? "").trim() || "00-System/.rslatte");
     return base;
   }
 
@@ -83,11 +52,11 @@ export class ContactsIndexStore {
 
   public async readIndex(): Promise<ContactsIndexFile> {
     const p = this.indexPath();
-    let raw = await readTextFile(this.app, p);
+    let raw = await readTextVaultFirst(this.app, p);
     if (!raw) {
       const legacyRoot = this.getLegacyRootDir();
       if (legacyRoot) {
-        raw = await readTextFile(this.app, normalizePath(`${legacyRoot}/contacts-index.json`));
+        raw = await readTextVaultFirst(this.app, normalizePath(`${legacyRoot}/contacts-index.json`));
       }
     }
     const defaultIndex: ContactsIndexFile = { version: 1, updatedAt: toIsoNow(), items: [], parseErrorFiles: [] };
@@ -100,11 +69,11 @@ export class ContactsIndexStore {
 
   public async readArchiveIndex(): Promise<ContactsIndexFile> {
     const p = this.archiveIndexPath();
-    let raw = await readTextFile(this.app, p);
+    let raw = await readTextVaultFirst(this.app, p);
     if (!raw) {
       const legacyRoot = this.getLegacyRootDir();
       if (legacyRoot) {
-        raw = await readTextFile(this.app, normalizePath(`${legacyRoot}/archive/contacts-archive-index.json`));
+        raw = await readTextVaultFirst(this.app, normalizePath(`${legacyRoot}/archive/contacts-archive-index.json`));
       }
     }
     const defaultIndex: ContactsIndexFile = { version: 1, updatedAt: toIsoNow(), items: [], parseErrorFiles: [] };
@@ -123,7 +92,7 @@ export class ContactsIndexStore {
       items: file.items ?? [],
       parseErrorFiles: file.parseErrorFiles ?? [],
     };
-    await writeTextFile(this.app, p, JSON.stringify(out, null, 2));
+    await writeTextRaceSafe(this.app, p, JSON.stringify(out, null, 2), CONTACTS_INDEX_IO_CTX);
   }
 
   public async writeArchiveIndex(file: ContactsIndexFile): Promise<void> {
@@ -134,7 +103,7 @@ export class ContactsIndexStore {
       items: file.items ?? [],
       parseErrorFiles: file.parseErrorFiles ?? [],
     };
-    await writeTextFile(this.app, p, JSON.stringify(out, null, 2));
+    await writeTextRaceSafe(this.app, p, JSON.stringify(out, null, 2), CONTACTS_INDEX_IO_CTX);
   }
 
   public getIndexFilePath(): string {
@@ -146,17 +115,36 @@ export class ContactsIndexStore {
   }
 }
 
+export type ContactsInteractionsContext = {
+  contactsDir: string;
+  trim: { maxPerContact: number; maxPerSource: number };
+  archiveShardMaxBytes: number;
+  /** 主索引落盘后重写联系人笔记内「动态互动」块（与侧栏同源） */
+  refreshContactNoteDynamicBlocksForUids?: (uids: string[]) => Promise<void>;
+  /** 将 `contacts-index.json` 的 `last_interaction_at` 与互动索引中 `interaction_events` 对齐（与侧栏「最后互动」一致） */
+  syncContactsIndexLastInteractionAtForUids?: (uids: string[]) => Promise<void>;
+  /**
+   * 任务/项目任务条目的 interaction_events 由 WorkEvent 重放（§6.2/§6.5）；在 applyFileUpdates 合并快照后调用。
+   */
+  rebuildTaskProjectInteractionEventsFromWork?: (
+    entries: ContactsInteractionEntry[]
+  ) => Promise<ContactsInteractionEntry[]>;
+};
+
 export class ContactsInteractionsStore {
   private app: App;
   private centralIndexDirRef: () => string;
+  /** 为 §6.9：主索引裁剪、溢出归档、首片 `.contacts/<uid>.json` 对齐；未提供则跳过 */
+  private interactionsCtxRef?: () => ContactsInteractionsContext | null;
 
-  constructor(app: App, centralIndexDirRef: () => string) {
+  constructor(app: App, centralIndexDirRef: () => string, interactionsCtxRef?: () => ContactsInteractionsContext | null) {
     this.app = app;
     this.centralIndexDirRef = centralIndexDirRef;
+    this.interactionsCtxRef = interactionsCtxRef;
   }
 
   private getBaseDir(): string {
-    const base = normalizePath((this.centralIndexDirRef() ?? "").trim() || "95-Tasks/.rslatte");
+    const base = normalizePath((this.centralIndexDirRef() ?? "").trim() || "00-System/.rslatte");
     return base;
   }
 
@@ -176,8 +164,7 @@ export class ContactsInteractionsStore {
 
   public async ensureExists(): Promise<void> {
     const p = this.indexPath();
-    const ok = await this.app.vault.adapter.exists(p);
-    if (ok) return;
+    if (await pathExistsVaultOrAdapter(this.app, p)) return;
 
     // F2: if legacy (pre-space) file exists, migrate it forward so we don't
     // accidentally create an empty file that masks the legacy data.
@@ -185,11 +172,10 @@ export class ContactsInteractionsStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/contacts-interactions.json`);
       try {
-        const legacyOk = await this.app.vault.adapter.exists(legacyPath);
-        if (legacyOk) {
-          const raw = await this.app.vault.adapter.read(legacyPath);
+        if (await pathExistsVaultOrAdapter(this.app, legacyPath)) {
+          const raw = await readTextVaultFirst(this.app, legacyPath);
           if (raw && raw.trim()) {
-            await writeTextFile(this.app, p, raw);
+            await writeTextRaceSafe(this.app, p, raw, CONTACTS_INTERACTIONS_IO_CTX);
             return;
           }
         }
@@ -199,19 +185,19 @@ export class ContactsInteractionsStore {
     }
 
     const empty = createEmptyContactsInteractionsIndexFile(toIsoNow());
-    await writeTextFile(this.app, p, JSON.stringify(empty, null, 2));
+    await writeTextRaceSafe(this.app, p, JSON.stringify(empty, null, 2), CONTACTS_INTERACTIONS_IO_CTX);
   }
 
   public async readIndex(): Promise<ContactsInteractionsIndexFile> {
     const p = this.indexPath();
-    let raw = await readTextFile(this.app, p);
+    let raw = await readTextVaultFirst(this.app, p);
     if (!raw) {
       const legacyRoot = this.getLegacyRootDir();
-      if (legacyRoot) raw = await readTextFile(this.app, normalizePath(`${legacyRoot}/contacts-interactions.json`));
+      if (legacyRoot) raw = await readTextVaultFirst(this.app, normalizePath(`${legacyRoot}/contacts-interactions.json`));
     }
     if (!raw) {
       await this.ensureExists();
-      raw = await readTextFile(this.app, p);
+      raw = await readTextVaultFirst(this.app, p);
     }
     const defaultIndex = createEmptyContactsInteractionsIndexFile(toIsoNow());
     const parsed = safeJsonParse(raw ?? "", defaultIndex);
@@ -236,7 +222,7 @@ export class ContactsInteractionsStore {
       by_contact_uid: file.by_contact_uid ?? {},
       by_source_file: file.by_source_file ?? {},
     };
-    await writeTextFile(this.app, p, JSON.stringify(out, null, 2));
+    await writeTextRaceSafe(this.app, p, JSON.stringify(out, null, 2), CONTACTS_INTERACTIONS_IO_CTX);
   }
 
   public getIndexFilePath(): string {
@@ -245,13 +231,16 @@ export class ContactsInteractionsStore {
 
   /**
    * Read-only query helper for UI.
-   * - sorts by updated_at desc (fallback: by_source_file.mtime)
+   * - 默认按条目 updated_at desc（fallback: by_source_file.mtime）
+   * - sortMode `latest_interaction`：§6.6.2 主键为 interaction_events 最大 occurred_at（动态无事件→0）；同键时按 updated_at↓，再 path 稳定序
    * - supports lightweight filtering
    */
   public async queryByContactUid(contactUid: string, opts?: {
     limit?: number;
     incompleteOnly?: boolean;
     sourceType?: ContactsInteractionSourceType | "all";
+    /** 默认按条目 updated_at；侧栏「互动记录」按最后互动时刻（含 interaction_events） */
+    sortMode?: "entry_updated" | "latest_interaction";
   }): Promise<ContactsInteractionEntry[]> {
     const uid = String(contactUid ?? "").trim();
     if (!uid) return [];
@@ -281,11 +270,19 @@ export class ContactsInteractionsStore {
       mtimeByPath[p] = Number((rec as any)?.mtime ?? 0);
     }
 
+    const latestMs = (e: ContactsInteractionEntry): number =>
+      sortKeyLatestInteractionMs(e, mtimeByPath[e.source_path]);
+
+    const sortMode = opts?.sortMode ?? "entry_updated";
     out.sort((a, b) => {
-      const ta = Date.parse(a.updated_at ?? "") || mtimeByPath[a.source_path] || 0;
-      const tb = Date.parse(b.updated_at ?? "") || mtimeByPath[b.source_path] || 0;
+      const ta = sortMode === "latest_interaction" ? latestMs(a) : Date.parse(a.updated_at ?? "") || mtimeByPath[a.source_path] || 0;
+      const tb = sortMode === "latest_interaction" ? latestMs(b) : Date.parse(b.updated_at ?? "") || mtimeByPath[b.source_path] || 0;
       if (tb !== ta) return tb - ta;
-      // stable tie-breaker
+      if (sortMode === "latest_interaction") {
+        const ua = Date.parse(a.updated_at ?? "") || mtimeByPath[a.source_path] || 0;
+        const ub = Date.parse(b.updated_at ?? "") || mtimeByPath[b.source_path] || 0;
+        if (ub !== ua) return ub - ua;
+      }
       const ak = `${a.source_path}|${a.line_no ?? -1}`;
       const bk = `${b.source_path}|${b.line_no ?? -1}`;
       return bk.localeCompare(ak);
@@ -366,25 +363,42 @@ export class ContactsInteractionsStore {
     const idx = await this.readIndex();
     let removedCount = 0;
 
-    // removals
+    const affectedUids = new Set<string>();
+
+    // removals：先记录涉及联系人，再删文件桶
     for (const fp of removals) {
       const path = String(fp ?? "").trim();
       if (!path) continue;
       const old = idx.by_source_file[path];
       if (!old) continue;
+      for (const e of old.entries ?? []) {
+        const cu = String(e.contact_uid ?? "").trim();
+        if (cu) affectedUids.add(cu);
+      }
       this.removeEntriesFromByContactUid(idx, old.entries ?? []);
       delete idx.by_source_file[path];
       removedCount++;
     }
 
     // upserts
+    const nowIso = toIsoNow();
     for (const u of upserts) {
       const path = String(u.source_path ?? "").trim();
       if (!path) continue;
       const old = idx.by_source_file[path];
       if (old) this.removeEntriesFromByContactUid(idx, old.entries ?? []);
 
-      const entries = (u.entries ?? []).filter((e) => !!(e.contact_uid && e.source_path && e.source_type && e.snippet));
+      const raw = u.entries ?? [];
+      const merged = mergeInteractionEventsWithPrevious(old?.entries, raw, nowIso);
+      const ctx = this.interactionsCtxRef?.() ?? null;
+      let entries = merged.filter((e) => !!(e.contact_uid && e.source_path && e.source_type && e.snippet));
+      if (ctx?.rebuildTaskProjectInteractionEventsFromWork) {
+        try {
+          entries = await ctx.rebuildTaskProjectInteractionEventsFromWork(entries);
+        } catch (e) {
+          console.warn("[RSLatte][contacts] rebuildTaskProjectInteractionEventsFromWork failed", e);
+        }
+      }
       const rec: ContactsInteractionsBySourceFile = {
         mtime: Number(u.mtime ?? 0),
         entries_digest: this.computeDigest(entries),
@@ -392,9 +406,62 @@ export class ContactsInteractionsStore {
       };
       idx.by_source_file[path] = rec;
       this.addEntriesIntoByContactUid(idx, entries);
+      for (const e of entries) {
+        const cu = String(e.contact_uid ?? "").trim();
+        if (cu) affectedUids.add(cu);
+      }
+    }
+
+    const ctx = this.interactionsCtxRef?.() ?? null;
+    if (ctx && affectedUids.size > 0) {
+      for (const uid of affectedUids) {
+        const removedEv = trimInteractionEventsForContactUid(idx, uid, ctx.trim, (e) => this.entryKey(e));
+        if (removedEv.length > 0) {
+          try {
+            await appendContactInteractionOverflowArchive(this.app, {
+              contactsDir: ctx.contactsDir,
+              contactUid: uid,
+              records: removedEv,
+              maxShardBytes: ctx.archiveShardMaxBytes,
+            });
+          } catch (e) {
+            console.warn("[RSLatte][contacts][archive] append overflow failed", uid, e);
+          }
+        }
+      }
     }
 
     await this.writeIndex(idx);
+
+    if (ctx?.syncContactsIndexLastInteractionAtForUids && affectedUids.size > 0) {
+      try {
+        await ctx.syncContactsIndexLastInteractionAtForUids([...affectedUids]);
+      } catch (e) {
+        console.warn("[RSLatte][contacts] syncContactsIndexLastInteractionAtForUids failed", e);
+      }
+    }
+
+    if (ctx && affectedUids.size > 0) {
+      for (const uid of affectedUids) {
+        try {
+          await writeContactsInteractionReplicaSnapshot(this.app, {
+            contactsDir: ctx.contactsDir,
+            contactUid: uid,
+            getInteractionsStore: () => this,
+          });
+        } catch (e) {
+          console.warn("[RSLatte][contacts][replica] snapshot failed", uid, e);
+        }
+      }
+      if (ctx.refreshContactNoteDynamicBlocksForUids) {
+        try {
+          await ctx.refreshContactNoteDynamicBlocksForUids([...affectedUids]);
+        } catch (e) {
+          console.warn("[RSLatte][contacts] refresh contact note dynamic blocks failed", e);
+        }
+      }
+    }
+
     return { upserted: upserts.length, removed: removedCount };
   }
 
@@ -436,6 +503,7 @@ export class ContactsInteractionsStore {
 
     const idx = await this.readIndex();
     let updated = 0;
+    const pathRewriteUids = new Set<string>();
 
     for (const p of pairs) {
       const oldRec = idx.by_source_file?.[p.from];
@@ -466,11 +534,23 @@ export class ContactsInteractionsStore {
       };
 
       this.addEntriesIntoByContactUid(idx, merged);
+      for (const e of merged) {
+        const cu = String((e as ContactsInteractionEntry).contact_uid ?? "").trim();
+        if (cu) pathRewriteUids.add(cu);
+      }
       updated++;
     }
 
     if (updated > 0) {
       await this.writeIndex(idx);
+      const ctx = this.interactionsCtxRef?.() ?? null;
+      if (ctx?.syncContactsIndexLastInteractionAtForUids && pathRewriteUids.size > 0) {
+        try {
+          await ctx.syncContactsIndexLastInteractionAtForUids([...pathRewriteUids]);
+        } catch (e) {
+          console.warn("[RSLatte][contacts] syncContactsIndexLastInteractionAtForUids (rewrite paths) failed", e);
+        }
+      }
     }
     return { updated };
   }

@@ -1,7 +1,9 @@
 // Auto-split from RSLatteSettingTab.ts to reduce file size and isolate failures.
 import { Notice, Setting } from "obsidian";
+import { MEMO_CARD_ACTION_CATALOG, MEMO_CLOSED_CARD_ACTION_CATALOG } from "../../../constants/sidePanelCardActions";
+import { renderSidePanelCardMoreChecklist } from "../../helpers/renderSidePanelCardMoreSettings";
 
-export type ModuleWrapFactory = (moduleKey: any, title: string) => HTMLElement;
+export type ModuleWrapFactory = (moduleKey: any, title: string, scopeTag?: "global" | "space") => HTMLElement;
 export type HeaderButtonsVisibilityAdder = (wrap: HTMLElement, moduleKey: any, defaultShow: boolean) => void;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -16,101 +18,60 @@ export function renderMemoSettings(opts: {
   const plugin = tab.plugin;
   const tp = plugin?.settings?.taskPanel as any;
   try {
-    const memoWrap = makeModuleWrap('memo', '备忘管理');
+    const memoWrap = makeModuleWrap('memo', '提醒管理');
     addHeaderButtonsVisibilitySetting(memoWrap, "memo", true);
 
-      new Setting(memoWrap)
-      .setName("重要事项（备忘）展示范围")
-      .setDesc("侧边栏默认展示：今天 + 未来 N 天")
+    new Setting(memoWrap)
+      .setName("即将到期阈值（天）")
+      .setDesc("提醒卡片显示“即将到期”黄色标签的时间窗口，默认 5 天。")
       .addText((t) =>
-        t.setPlaceholder("7")
-          .setValue(String(tp.memoLookaheadDays ?? 7))
+        t.setPlaceholder("5")
+          .setValue(String(tp.reminderUpcomingDays ?? 5))
           .onChange(async (v) => {
             const n = Number(v);
-            tp.memoLookaheadDays = Number.isFinite(n) ? Math.max(0, Math.min(365, Math.floor(n))) : 7;
-            await tab.saveAndRefreshSidePanelDebounced();
-          })
-      );
-
-
-    new Setting(memoWrap)
-      .setName("在 RSLatte 侧边栏显示重要事项")
-      .setDesc("显示位置：Side Panel 1 → 📅 今日日志 下方")
-      .addToggle((tog) =>
-        tog.setValue(tp.showImportantMemosInRSLattePanel ?? true)
-          .onChange(async (v) => {
-            tp.showImportantMemosInRSLattePanel = v;
-            await tab.saveAndRefreshSidePanelDebounced();
-          })
-      );
-
-
-    // ===== v28：全量备忘清单 =====
-    memoWrap.createEl("h5", { text: "全量备忘清单（v28）" });
-
-    new Setting(memoWrap)
-      .setName("启用全量备忘清单")
-      .setDesc("显示在“事项提醒”下方，便于集中管理所有备忘条目。")
-      .addToggle((tog) =>
-        tog.setValue(tp.memoAllEnabled ?? true)
-          .onChange(async (v) => {
-            tp.memoAllEnabled = v;
+            tp.reminderUpcomingDays = Number.isFinite(n) ? Math.max(1, Math.min(30, Math.floor(n))) : 5;
             await tab.saveAndRefreshSidePanelDebounced();
           })
       );
 
     new Setting(memoWrap)
-      .setName("全量备忘清单最大展示条数")
-      .setDesc("侧边栏最多展示多少条（仍会显示过滤后的总数）。")
+      .setName("近期完成/取消/失效窗口（天）")
+      .setDesc("“近期完成/取消/失效”分组展示过去 N 天闭环条目，范围 7-100。")
       .addText((t) =>
-        t.setPlaceholder("50")
-          .setValue(String(tp.memoAllMaxItems ?? 50))
+        t.setPlaceholder("30")
+          .setValue(String(tp.recentClosedMemoWindowDays ?? 30))
           .onChange(async (v) => {
             const n = Number(v);
-            tp.memoAllMaxItems = Number.isFinite(n) ? Math.max(1, Math.min(200, Math.floor(n))) : 50;
+            tp.recentClosedMemoWindowDays = Number.isFinite(n) ? Math.max(7, Math.min(100, Math.floor(n))) : 30;
             await tab.saveAndRefreshSidePanelDebounced();
           })
       );
 
-    const ensureMemoAllStatuses = () => {
-      const arr = Array.isArray(tp.memoAllStatuses) ? tp.memoAllStatuses : ["TODO", "IN_PROGRESS"];
-      const mapped = arr.map((x: any) => String(x || "").trim().toUpperCase());
-      const norm = Array.from<string>(new Set<string>(mapped));
-      const allowed = new Set<string>(["DONE", "CANCELLED", "TODO", "IN_PROGRESS"]);
-      tp.memoAllStatuses = norm.filter((x: string) => allowed.has(x)) as any;
-      if (!tp.memoAllStatuses.length) tp.memoAllStatuses = ["TODO", "IN_PROGRESS"] as any;
-    };
-    ensureMemoAllStatuses();
+    if (!Array.isArray(tp.sidePanelMemoCardActionsInMore)) tp.sidePanelMemoCardActionsInMore = [];
+    if (!Array.isArray(tp.sidePanelMemoClosedCardActionsInMore)) tp.sidePanelMemoClosedCardActionsInMore = [];
+    renderSidePanelCardMoreChecklist(memoWrap, {
+      heading: "侧栏提醒卡片（活跃）：收纳到「⋯」",
+      description:
+        "事项提醒主列表与全量提醒列表中的卡片按钮。勾选后收入「⋯」。显隐仍由条目状态决定。按当前空间独立保存。",
+      catalog: MEMO_CARD_ACTION_CATALOG,
+      getIds: () => tp.sidePanelMemoCardActionsInMore,
+      setIds: (n) => {
+        tp.sidePanelMemoCardActionsInMore = n;
+      },
+      save: () => tab.saveAndRefreshSidePanelDebounced(),
+    });
+    renderSidePanelCardMoreChecklist(memoWrap, {
+      heading: "侧栏「近期闭环」提醒卡片：收纳到「⋯」",
+      description: "近期完成/取消/失效分组中的提醒卡片（通常为「恢复」）。勾选后收入「⋯」。",
+      catalog: MEMO_CLOSED_CARD_ACTION_CATALOG,
+      getIds: () => tp.sidePanelMemoClosedCardActionsInMore,
+      setIds: (n) => {
+        tp.sidePanelMemoClosedCardActionsInMore = n;
+      },
+      save: () => tab.saveAndRefreshSidePanelDebounced(),
+    });
 
-      // 状态过滤（多选）——样式对齐“输出管理”的列表展示状态
-      const statusBox = memoWrap.createDiv({ cls: "rslatte-status-filter" });
-    statusBox.createEl("div", { text: "展示状态：", cls: "setting-item-name" });
-    const statuses = [
-      { key: "TODO" as const, label: "TODO（⏸）" },
-      { key: "IN_PROGRESS" as const, label: "IN_PROGRESS（▶）" },
-      { key: "DONE" as const, label: "DONE（✅）" },
-      { key: "CANCELLED" as const, label: "CANCELLED（⛔）" },
-    ];
-    const stWrap = statusBox.createDiv({ cls: "rslatte-status-filter-wrap" });
-    const setShow = async (st: "DONE" | "CANCELLED" | "TODO" | "IN_PROGRESS", on: boolean) => {
-      ensureMemoAllStatuses();
-      const cur = new Set<string>(((tp.memoAllStatuses ?? ["TODO", "IN_PROGRESS"]) as any).map((x: any) => String(x)));
-      if (on) cur.add(st);
-      else cur.delete(st);
-      tp.memoAllStatuses = Array.from(cur) as any;
-      await tab.saveAndRefreshSidePanelDebounced();
-    };
-    const has = (st: string): boolean => {
-      return ((tp.memoAllStatuses ?? ["TODO", "IN_PROGRESS"]) as any).map((x: any) => String(x)).includes(st);
-    };
-    for (const st of statuses) {
-      const lb = stWrap.createEl("label", { cls: "rslatte-status-filter-item" });
-      const cb = lb.createEl("input");
-      cb.type = "checkbox";
-      cb.checked = has(st.key);
-      cb.addEventListener("change", () => void setShow(st.key, cb.checked));
-      lb.appendText(" " + st.label);
-    }
+    // 全量提醒清单已下线，不再暴露相关配置项。
 
   } catch (e: any) {
     console.error("[RSLatte][settings][renderMemoSettings] render failed", e);

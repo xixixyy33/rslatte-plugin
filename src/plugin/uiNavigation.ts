@@ -1,7 +1,14 @@
 import { Notice, TFile } from "obsidian";
 import type RSLattePlugin from "../main";
-import { VIEW_TYPE_HUB, VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_PUBLISH, VIEW_TYPE_FINANCE, VIEW_TYPE_CHECKIN, VIEW_TYPE_CONTACTS, VIEW_TYPE_DASHBOARD, VIEW_TYPE_MOBILE_OPS } from "../constants/viewTypes";
+import { VIEW_TYPE_HUB, VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_KNOWLEDGE, VIEW_TYPE_FINANCE, VIEW_TYPE_HEALTH, VIEW_TYPE_CHECKIN, VIEW_TYPE_CONTACTS, VIEW_TYPE_CAPTURE, VIEW_TYPE_REVIEW, WORKFLOW_TO_VIEW_TYPE, type WorkflowViewId } from "../constants/viewTypes";
+import { CaptureView } from "../ui/views/CaptureView";
 import { ContactsSidePanelView } from "../ui/views/ContactsSidePanelView";
+import { FinanceSidePanelView } from "../ui/views/FinanceSidePanelView";
+import { HealthSidePanelView } from "../ui/views/HealthSidePanelView";
+import { CheckinSidePanelView } from "../ui/views/CheckinSidePanelView";
+import { RSLatteSidePanelView } from "../ui/views/RSLatteSidePanelView";
+import { ReviewView, markPendingReviewOpen, type ReviewDeepLinkOpts } from "../ui/views/ReviewView";
+import { TaskSidePanelView } from "../ui/views/TaskSidePanelView";
 
 /**
  * UI 导航和视图激活模块
@@ -24,6 +31,28 @@ export function createUiNavigation(plugin: RSLattePlugin) {
     window.setTimeout(() => {
       container.removeClass("rslatte-sidebar-highlight");
     }, 1500);
+  }
+
+  async function openKnowledgeWorkspace() {
+    if (!plugin.app.workspace) return;
+    const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_KNOWLEDGE);
+    let targetLeaf: any = null;
+    if (leaves.length === 0) {
+      const leaf = plugin.app.workspace.getRightLeaf(false);
+      if (leaf) {
+        await leaf.setViewState({
+          type: VIEW_TYPE_KNOWLEDGE,
+          active: true,
+        });
+        targetLeaf = leaf;
+      }
+    } else {
+      plugin.app.workspace.revealLeaf(leaves[0]);
+      targetLeaf = leaves[0];
+    }
+    if (targetLeaf) {
+      window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+    }
   }
 
   return {
@@ -52,7 +81,7 @@ export function createUiNavigation(plugin: RSLattePlugin) {
       }
     },
 
-    async activateRSLatteView() {
+    async activateRSLatteView(opts?: { inspectSection?: "checkin" | "finance" | "health" | "journal" }) {
       if (!plugin.app.workspace) return;
       const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_RSLATTE);
       let targetLeaf: any = null;
@@ -72,10 +101,17 @@ export function createUiNavigation(plugin: RSLattePlugin) {
       if (targetLeaf) {
         // 等待视图渲染完成后再高亮
         window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+        const sec = opts?.inspectSection;
+        if (sec) {
+          window.setTimeout(() => {
+            const v = targetLeaf?.view;
+            if (v instanceof RSLatteSidePanelView) v.scrollToInspectSection(sec);
+          }, 180);
+        }
       }
     },
 
-    async activateTaskView() {
+    async activateTaskView(opts?: { subTab?: "memo" | "schedule" | "task" }) {
       if (!plugin.app.workspace) return;
       const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_TASKS);
       let targetLeaf: any = null;
@@ -93,8 +129,41 @@ export function createUiNavigation(plugin: RSLattePlugin) {
         targetLeaf = leaves[0];
       }
       if (targetLeaf) {
-        // 等待视图渲染完成后再高亮
-        window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+        const sub = opts?.subTab;
+        window.setTimeout(() => {
+          highlightLeaf(targetLeaf);
+          if (sub) {
+            const v = targetLeaf?.view;
+            if (v instanceof TaskSidePanelView) void v.switchToSubTab(sub);
+          }
+        }, 100);
+      }
+    },
+
+    /** V2 Capture：打开侧栏并落在「记录」子页签（供 Today 执行统计等调用） */
+    async activateCaptureView() {
+      if (!plugin.app.workspace) return;
+      const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_CAPTURE);
+      let targetLeaf: any = null;
+      if (leaves.length === 0) {
+        const leaf = plugin.app.workspace.getRightLeaf(false);
+        if (leaf) {
+          await leaf.setViewState({
+            type: VIEW_TYPE_CAPTURE,
+            active: true,
+          });
+          targetLeaf = leaf;
+        }
+      } else {
+        plugin.app.workspace.revealLeaf(leaves[0]);
+        targetLeaf = leaves[0];
+      }
+      if (targetLeaf) {
+        window.setTimeout(() => {
+          highlightLeaf(targetLeaf);
+          const v = targetLeaf?.view;
+          if (v instanceof CaptureView) v.openRecordTabFromExternal();
+        }, 120);
       }
     },
 
@@ -144,29 +213,24 @@ export function createUiNavigation(plugin: RSLattePlugin) {
       }
     },
 
+    /** §4：协议/命令兼容，打开 Knowledge 工作台视图 */
     async activatePublishView() {
-      if (!plugin.app.workspace) return;
-      const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_PUBLISH);
-      let targetLeaf: any = null;
-      if (leaves.length === 0) {
-        const leaf = plugin.app.workspace.getRightLeaf(false);
-        if (leaf) {
-          await leaf.setViewState({
-            type: VIEW_TYPE_PUBLISH,
-            active: true,
-          });
-          targetLeaf = leaf;
-        }
-      } else {
-        plugin.app.workspace.revealLeaf(leaves[0]);
-        targetLeaf = leaves[0];
-      }
-      if (targetLeaf) {
-        window.setTimeout(() => highlightLeaf(targetLeaf), 100);
-      }
+      await openKnowledgeWorkspace();
     },
 
-    async activateFinanceView() {
+    async activateKnowledgeView() {
+      await openKnowledgeWorkspace();
+    },
+
+    async activateKnowledgePanelView() {
+      await openKnowledgeWorkspace();
+    },
+
+    async activateFinanceView(opts?: {
+      contentTab?: "ledger" | "stats";
+      entryId?: string;
+      recordDate?: string;
+    }) {
       if (!plugin.app.workspace) return;
       const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_FINANCE);
       let targetLeaf: any = null;
@@ -184,12 +248,32 @@ export function createUiNavigation(plugin: RSLattePlugin) {
         targetLeaf = leaves[0];
       }
       if (targetLeaf) {
-        // 等待视图渲染完成后再高亮
         window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+        const eid = String(opts?.entryId ?? "").trim();
+        const rd = String(opts?.recordDate ?? "").trim();
+        if (eid && rd) {
+          window.setTimeout(() => {
+            const v = targetLeaf?.view;
+            if (v instanceof FinanceSidePanelView) {
+              v.applyLedgerNavFocus({ entryId: eid, recordDate: rd });
+            }
+          }, 220);
+        } else {
+          const tab = opts?.contentTab;
+          if (tab) {
+            window.setTimeout(() => {
+              const v = targetLeaf?.view;
+              if (v instanceof FinanceSidePanelView) {
+                if (tab === "stats") v.openStatsContentTab();
+                else v.openLedgerContentTab();
+              }
+            }, 180);
+          }
+        }
       }
     },
 
-    async activateCheckinView() {
+    async activateCheckinView(opts?: { recordDate?: string; checkinId?: string }) {
       if (!plugin.app.workspace) return;
       const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_CHECKIN);
       let targetLeaf: any = null;
@@ -207,8 +291,64 @@ export function createUiNavigation(plugin: RSLattePlugin) {
         targetLeaf = leaves[0];
       }
       if (targetLeaf) {
-        // 等待视图渲染完成后再高亮
         window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+        const rd = String(opts?.recordDate ?? "").trim();
+        const cid = String(opts?.checkinId ?? "").trim();
+        if (rd && cid) {
+          window.setTimeout(() => {
+            const v = targetLeaf?.view;
+            if (v instanceof CheckinSidePanelView) {
+              v.applyNavFocus({ recordDate: rd, checkinId: cid });
+            }
+          }, 220);
+        }
+      }
+    },
+
+    async activateHealthView(opts?: {
+      contentTab?: "ledger" | "stats";
+      entryId?: string;
+      recordDate?: string;
+    }) {
+      if (!plugin.app.workspace) return;
+      const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_HEALTH);
+      let targetLeaf: any = null;
+      if (leaves.length === 0) {
+        const leaf = plugin.app.workspace.getRightLeaf(false);
+        if (leaf) {
+          await leaf.setViewState({
+            type: VIEW_TYPE_HEALTH,
+            active: true,
+          });
+          targetLeaf = leaf;
+        }
+      } else {
+        plugin.app.workspace.revealLeaf(leaves[0]);
+        targetLeaf = leaves[0];
+      }
+      if (targetLeaf) {
+        window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+        const eid = String(opts?.entryId ?? "").trim();
+        const rd = String(opts?.recordDate ?? "").trim();
+        if (eid && rd) {
+          window.setTimeout(() => {
+            const v = targetLeaf?.view;
+            if (v instanceof HealthSidePanelView) {
+              v.applyLedgerNavFocus({ entryId: eid, recordDate: rd });
+            }
+          }, 220);
+        } else {
+          const tab = opts?.contentTab;
+          if (tab) {
+            window.setTimeout(() => {
+              const v = targetLeaf?.view;
+              if (v instanceof HealthSidePanelView) {
+                if (tab === "stats") v.openStatsContentTab();
+                else v.openLedgerContentTab();
+              }
+            }, 180);
+          }
+        }
       }
     },
 
@@ -246,17 +386,46 @@ export function createUiNavigation(plugin: RSLattePlugin) {
       }
     },
 
-    async activateMobileOpsView() {
+    /**
+     * Review 侧栏：可选深度参数（与 `Review侧边栏优化方案.md` §4.3 一致）。
+     * 示例：`activateReviewView({ grain: "month", periodKey: "2026-03", subTab: "records" })`
+     */
+    async activateReviewView(opts?: ReviewDeepLinkOpts) {
+      if (opts && Object.keys(opts).length > 0) markPendingReviewOpen(opts);
       if (!plugin.app.workspace) return;
-      const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_MOBILE_OPS);
+      const leaves = plugin.app.workspace.getLeavesOfType(VIEW_TYPE_REVIEW);
       let targetLeaf: any = null;
       if (leaves.length === 0) {
         const leaf = plugin.app.workspace.getRightLeaf(false);
         if (leaf) {
-          await leaf.setViewState({
-            type: VIEW_TYPE_MOBILE_OPS,
-            active: true,
-          });
+          await leaf.setViewState({ type: VIEW_TYPE_REVIEW, active: true });
+          targetLeaf = leaf;
+        }
+      } else {
+        plugin.app.workspace.revealLeaf(leaves[0]);
+        targetLeaf = leaves[0];
+      }
+      if (targetLeaf) {
+        window.setTimeout(() => highlightLeaf(targetLeaf), 100);
+        const v = targetLeaf.view;
+        if (v instanceof ReviewView) v.refresh();
+      }
+    },
+
+    /** V2 工作流：根据工作流 ID 激活对应视图 */
+    async activateWorkflowView(workflowId: WorkflowViewId) {
+      if (workflowId === "worklog") {
+        await plugin.activateTimelineView();
+        return;
+      }
+      const viewType = WORKFLOW_TO_VIEW_TYPE[workflowId];
+      if (!viewType || !plugin.app.workspace) return;
+      const leaves = plugin.app.workspace.getLeavesOfType(viewType);
+      let targetLeaf: any = null;
+      if (leaves.length === 0) {
+        const leaf = plugin.app.workspace.getRightLeaf(false);
+        if (leaf) {
+          await leaf.setViewState({ type: viewType, active: true });
           targetLeaf = leaf;
         }
       } else {

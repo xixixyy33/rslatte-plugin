@@ -2,9 +2,14 @@
 import { Notice, Setting } from "obsidian";
 import { apiTry } from "../../../api";
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-import type { CheckinItemDef } from "../../../types/rslatteTypes";
+import {
+  CHECKIN_DIFFICULTY_LABELS,
+  normalizeCheckinDifficulty,
+  type CheckinDifficulty,
+  type CheckinItemDef,
+} from "../../../types/rslatteTypes";
 
-export type ModuleWrapFactory = (moduleKey: any, title: string) => HTMLElement;
+export type ModuleWrapFactory = (moduleKey: any, title: string, scopeTag?: "global" | "space") => HTMLElement;
 export type HeaderButtonsVisibilityAdder = (wrap: HTMLElement, moduleKey: any, defaultShow: boolean) => void;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -53,8 +58,10 @@ export function renderCheckinSettings(opts: {
     const ckHeader = checkinWrap.createDiv({ cls: "rslatte-checkin-table-header" });
     ckHeader.createDiv({ text: "ID", cls: "col col-id" });
     ckHeader.createDiv({ text: "名称", cls: "col col-name" });
+    ckHeader.createDiv({ text: "难度", cls: "col col-difficulty" });
     ckHeader.createDiv({ text: "色块", cls: "col col-color" });
     ckHeader.createDiv({ text: "启用", cls: "col col-active" });
+    ckHeader.createDiv({ text: "连续", cls: "col col-continuous" });
     ckHeader.createDiv({ text: "", cls: "col col-move" });
     ckHeader.createDiv({ text: "", cls: "col col-move" });
     ckHeader.createDiv({ text: "操作", cls: "col col-action" });
@@ -105,6 +112,20 @@ export function renderCheckinSettings(opts: {
           });
       });
 
+      row.addDropdown((dd) => {
+        dd.selectEl.addClass("col", "col-difficulty");
+        dd.selectEl.title = "打卡难度";
+        const order: CheckinDifficulty[] = ["normal", "high_focus", "light"];
+        for (const k of order) {
+          dd.addOption(k, CHECKIN_DIFFICULTY_LABELS[k]);
+        }
+        dd.setValue(normalizeCheckinDifficulty((item as any).checkinDifficulty));
+        dd.onChange(async (v) => {
+          (item as any).checkinDifficulty = normalizeCheckinDifficulty(v);
+          await tab.saveAndRefreshSidePanelDebounced();
+        });
+      });
+
       // 热力图颜色（打卡日色块）
       row.addText((t) => {
         t.inputEl.addClass("col", "col-color");
@@ -124,6 +145,14 @@ export function renderCheckinSettings(opts: {
           item.active = v;
           await tab.saveAndRerender();
         });
+      });
+
+      // 连续打卡天数（只读，由刷新/打卡时自动更新）
+      row.addText((t) => {
+        t.inputEl.addClass("col", "col-continuous");
+        t.setValue(String(Math.max(0, item.continuousDays ?? 0)));
+        t.setDisabled(true);
+        t.inputEl.title = "已连续打卡天数（由刷新打卡数据与打卡操作自动更新）";
       });
 
       row.addButton((btn) => {
@@ -201,6 +230,7 @@ export function renderCheckinSettings(opts: {
           id: id || tab.genId("DK"),
           name: "新打卡项",
           active: true,
+          checkinDifficulty: "normal",
           fromDb: false,
         });
         await tab.saveAndRerender();

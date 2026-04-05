@@ -1,0 +1,1583 @@
+{
+  "version": 1,
+  "defaults": {
+    "currency": "CNY",
+    "resultPolicy": {
+      "cooldownDays": 0,
+      "dedupeKeyMode": "rule_period_target",
+      "allowPartialPeriod": true
+    },
+    "sceneTagPolicies": {
+      "single_record_default": "exclude_any_tagged",
+      "period_total_default": "include_all",
+      "budget_default": "include_all",
+      "ratio_default": "include_all"
+    }
+  },
+  "assumptions": [
+    {
+      "name": "食材_vs_外卖_结构失衡_总额偏高落地口径",
+      "detail": "“且食物总支出偏高”落地为最近连续3天食物总支出滚动和 > 过去30天3日滚动均值 × 150%"
+    },
+    {
+      "name": "地铁异常缺失_打车显著上升落地口径",
+      "detail": "“且打车显著上升”落地为本周打车金额 > 过去8周周均值 × 180%"
+    },
+    {
+      "name": "兴趣类短期连续消费_本周累计偏高落地口径",
+      "detail": "“且本周累计偏高”落地为本周该类金额 > 过去8周周均值 × 180%"
+    },
+    {
+      "name": "家电同月连续采购_总额较高落地口径",
+      "detail": "“且总额较高”落地为本月家电总额 > 过去6个月月均值 × 150%"
+    }
+  ],
+  "rules": {
+    "RULE_INCOME_FIXED_SALARY_MISSING": {
+      "ruleName": "固定工资未按时到账",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_EXPECTED_MISSING",
+      "severity": "high",
+      "order": 100,
+      "target": {
+        "targetPoolId": "DP_INCOME_FIXED_SALARY"
+      },
+      "params": {
+        "timeGrain": "month",
+        "expectedSourceMode": "fixed_schedule",
+        "graceDays": 3,
+        "lookbackPeriods": 6,
+        "minExpectedHits": 4,
+        "institutionRequired": false
+      },
+      "message": {
+        "title": "固定工资未按时到账",
+        "template": "固定工资未按预期到账，建议确认是否漏记或延迟发放"
+      }
+    },
+
+    "RULE_INCOME_FIXED_SALARY_LOW": {
+      "ruleName": "固定工资金额异常偏低",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 110,
+      "target": {
+        "targetPoolId": "DP_INCOME_FIXED_SALARY"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "median",
+        "compareOperator": "lt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 0.85,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "固定工资金额异常偏低",
+        "template": "固定工资金额低于常规水平，建议核对发放金额"
+      }
+    },
+
+    "RULE_INCOME_FIXED_SALARY_HIGH": {
+      "ruleName": "固定工资金额异常偏高",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 120,
+      "target": {
+        "targetPoolId": "DP_INCOME_FIXED_SALARY"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "median",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.15,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "固定工资金额异常偏高",
+        "template": "固定工资金额高于常规水平，建议确认是否包含补发或其他收入"
+      }
+    },
+
+    "RULE_INCOME_BONUS_SINGLE_HIGH": {
+      "ruleName": "绩效奖励单笔异常偏高",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_PERCENTILE_SPIKE",
+      "severity": "warning",
+      "order": 130,
+      "target": {
+        "targetPoolId": "DP_INCOME_BONUS"
+      },
+      "params": {
+        "timeGrain": "month",
+        "valueScope": "single_record",
+        "lookbackPeriods": 12,
+        "percentile": "p90",
+        "compareOperator": "gt",
+        "thresholdMultiplier": 1.2,
+        "minSampleSize": 6
+      },
+      "message": {
+        "title": "绩效奖励单笔异常偏高",
+        "template": "绩效奖励金额明显高于历史水平，建议确认是否有特殊奖金"
+      }
+    },
+
+    "RULE_INCOME_BONUS_MISSING": {
+      "ruleName": "绩效奖励异常缺失",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_EXPECTED_MISSING",
+      "severity": "warning",
+      "order": 140,
+      "target": {
+        "targetPoolId": "DP_INCOME_BONUS"
+      },
+      "params": {
+        "timeGrain": "month",
+        "expectedSourceMode": "history_inference",
+        "lookbackPeriods": 6,
+        "minExpectedHits": 4,
+        "graceDays": 0,
+        "institutionRequired": false
+      },
+      "message": {
+        "title": "绩效奖励异常缺失",
+        "template": "本月绩效奖励未出现，建议确认是否尚未到账或漏记"
+      }
+    },
+
+    "RULE_INCOME_SIDE_JOB_MONTHLY_DROP": {
+      "ruleName": "副业收入月度骤降",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 150,
+      "target": {
+        "targetPoolId": "DP_INCOME_SIDE_JOB"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 3,
+        "baselineMethod": "mean",
+        "compareOperator": "lt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 0.5,
+        "minSampleSize": 3,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "副业收入月度骤降",
+        "template": "本月副业收入明显下降，建议关注收入波动"
+      }
+    },
+
+    "RULE_INCOME_SIDE_JOB_SINGLE_HIGH": {
+      "ruleName": "副业收入单笔异常偏高",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_PERCENTILE_SPIKE",
+      "severity": "warning",
+      "order": 160,
+      "target": {
+        "targetPoolId": "DP_INCOME_SIDE_JOB"
+      },
+      "params": {
+        "timeGrain": "month",
+        "valueScope": "single_record",
+        "lookbackPeriods": 12,
+        "percentile": "p90",
+        "compareOperator": "gt",
+        "thresholdMultiplier": 1.2,
+        "minSampleSize": 6
+      },
+      "message": {
+        "title": "副业收入单笔异常偏高",
+        "template": "单笔副业收入明显偏高，建议核对来源及金额"
+      }
+    },
+
+    "RULE_INCOME_SIDE_JOB_INTERRUPTION": {
+      "ruleName": "副业收入长期中断",
+      "enabled": true,
+      "ruleGroup": "income",
+      "algorithmId": "ALG_EXPECTED_MISSING",
+      "severity": "notice",
+      "order": 170,
+      "target": {
+        "targetPoolId": "DP_INCOME_SIDE_JOB"
+      },
+      "params": {
+        "timeGrain": "month",
+        "expectedSourceMode": "history_inference",
+        "lookbackPeriods": 3,
+        "minExpectedHits": 3,
+        "graceDays": 0,
+        "institutionRequired": false
+      },
+      "message": {
+        "title": "副业收入长期中断",
+        "template": "本月副业收入暂未出现，建议关注收入连续性"
+      }
+    },
+
+    "RULE_FOOD_TOTAL_DAILY_HIGH": {
+      "ruleName": "食物总支出当日累计偏高",
+      "enabled": true,
+      "ruleGroup": "food",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "notice",
+      "order": 200,
+      "target": {
+        "targetPoolId": "DP_FOOD_TOTAL"
+      },
+      "params": {
+        "timeGrain": "day",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 30,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 2,
+        "minSampleSize": 14,
+        "partialPeriodStrategy": "same_day_progress"
+      },
+      "message": {
+        "title": "食物总支出当日累计偏高",
+        "template": "今日食物支出明显偏高，建议关注当日消费节奏"
+      }
+    },
+
+    "RULE_FOOD_DELIVERY_DAILY_COUNT_HIGH": {
+      "ruleName": "外卖当日频次过高",
+      "enabled": true,
+      "ruleGroup": "food",
+      "algorithmId": "ALG_COUNT_ANOMALY",
+      "severity": "notice",
+      "order": 210,
+      "target": {
+        "targetPoolId": "DP_FOOD_DELIVERY"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "day",
+        "countWindow": "today",
+        "countMode": "fixed_threshold",
+        "countThreshold": 3
+      },
+      "message": {
+        "title": "外卖当日频次过高",
+        "template": "今日外卖次数偏多，建议留意高频消费"
+      }
+    },
+
+    "RULE_FOOD_DELIVERY_WEEKLY_HIGH": {
+      "ruleName": "外卖周度支出异常",
+      "enabled": true,
+      "ruleGroup": "food",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 220,
+      "target": {
+        "targetPoolId": "DP_FOOD_DELIVERY"
+      },
+      "params": {
+        "timeGrain": "week",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 8,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.8,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "same_day_progress"
+      },
+      "message": {
+        "title": "外卖周度支出异常",
+        "template": "本周外卖支出明显高于平时"
+      }
+    },
+
+    "RULE_FOOD_DINE_OUT_SINGLE_HIGH": {
+      "ruleName": "外出就餐单笔偏高",
+      "enabled": true,
+      "ruleGroup": "food",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "notice",
+      "order": 230,
+      "target": {
+        "targetPoolId": "DP_FOOD_DINE_OUT"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "single_max",
+        "lookbackPeriods": 12,
+        "baselineMethod": "median",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 2.5,
+        "minSampleSize": 6,
+        "partialPeriodStrategy": "include_current"
+      },
+      "message": {
+        "title": "外出就餐单笔偏高",
+        "template": "本次外出就餐金额偏高，建议确认是否为多人消费或特殊场景"
+      }
+    },
+
+    "RULE_FOOD_SNACK_WEEKLY_RATIO_HIGH": {
+      "ruleName": "零食周度占比异常",
+      "enabled": true,
+      "ruleGroup": "food",
+      "algorithmId": "ALG_RATIO_ANOMALY",
+      "severity": "warning",
+      "order": 240,
+      "target": {
+        "numeratorPoolId": "DP_FOOD_SNACK",
+        "denominatorPoolId": "DP_FOOD_TOTAL"
+      },
+      "params": {
+        "timeGrain": "week",
+        "ratioMode": "baseline_compare",
+        "lookbackPeriods": 8,
+        "baselineMethod": "mean",
+        "thresholdOffset": 0.2,
+        "minSampleSize": 4
+      },
+      "message": {
+        "title": "零食周度占比异常",
+        "template": "本周零食支出占比偏高"
+      }
+    },
+
+    "RULE_FOOD_STRUCTURE_DELIVERY_OVER_GROCERY": {
+      "ruleName": "食材 vs 外卖结构失衡",
+      "enabled": true,
+      "ruleGroup": "food",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "warning",
+      "order": 250,
+      "target": {},
+      "params": {
+        "timeGrain": "day",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "delivery_gt_grocery_3days",
+            "algorithmId": "ALG_SEQUENCE_ANOMALY",
+            "target": {
+              "leftPoolId": "DP_FOOD_DELIVERY",
+              "rightPoolId": "DP_FOOD_GROCERY"
+            },
+            "params": {
+              "sequenceUnit": "day",
+              "sequenceLength": 3,
+              "relationOperator": "gt"
+            }
+          },
+          {
+            "conditionId": "food_total_rolling_3d_high",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_FOOD_TOTAL"
+            },
+            "params": {
+              "timeGrain": "day",
+              "currentPeriod": "rolling_3d",
+              "statMetric": "sum",
+              "lookbackPeriods": 30,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.5,
+              "minSampleSize": 14,
+              "partialPeriodStrategy": "include_current"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "食材 vs 外卖结构失衡",
+        "template": "近期食物支出结构偏向外卖，建议关注消费方式变化"
+      }
+    },
+
+    "RULE_TRANSPORT_TAXI_WEEKLY_HIGH": {
+      "ruleName": "打车周度支出异常上升",
+      "enabled": true,
+      "ruleGroup": "transport",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 300,
+      "target": {
+        "targetPoolId": "DP_TRANSPORT_TAXI"
+      },
+      "params": {
+        "timeGrain": "week",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 8,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 2,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "same_day_progress"
+      },
+      "message": {
+        "title": "打车周度支出异常上升",
+        "template": "本周打车支出明显高于平时"
+      }
+    },
+
+    "RULE_TRANSPORT_TAXI_DAILY_COUNT_HIGH": {
+      "ruleName": "打车当日频次过高",
+      "enabled": true,
+      "ruleGroup": "transport",
+      "algorithmId": "ALG_COUNT_ANOMALY",
+      "severity": "notice",
+      "order": 310,
+      "target": {
+        "targetPoolId": "DP_TRANSPORT_TAXI"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "day",
+        "countWindow": "today",
+        "countMode": "fixed_threshold",
+        "countThreshold": 4
+      },
+      "message": {
+        "title": "打车当日频次过高",
+        "template": "今日打车次数较多，建议核对是否存在重复记录或特殊出行"
+      }
+    },
+
+    "RULE_TRANSPORT_SUBWAY_MISSING_WITH_TAXI_UP": {
+      "ruleName": "地铁异常缺失且打车显著上升",
+      "enabled": true,
+      "ruleGroup": "transport",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "warning",
+      "order": 320,
+      "target": {},
+      "params": {
+        "timeGrain": "week",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "subway_missing",
+            "algorithmId": "ALG_EXPECTED_MISSING",
+            "target": {
+              "targetPoolId": "DP_TRANSPORT_SUBWAY"
+            },
+            "params": {
+              "timeGrain": "week",
+              "expectedSourceMode": "history_inference",
+              "lookbackPeriods": 8,
+              "minExpectedHits": 6,
+              "graceDays": 0,
+              "institutionRequired": false
+            }
+          },
+          {
+            "conditionId": "taxi_up",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_TRANSPORT_TAXI"
+            },
+            "params": {
+              "timeGrain": "week",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 8,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.8,
+              "minSampleSize": 4,
+              "partialPeriodStrategy": "same_day_progress"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "地铁异常缺失",
+        "template": "本周出行方式明显变化，地铁减少且打车增加"
+      }
+    },
+
+    "RULE_TRANSPORT_TOTAL_MONTHLY_HIGH": {
+      "ruleName": "交通总支出月度偏高",
+      "enabled": true,
+      "ruleGroup": "transport",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 330,
+      "target": {
+        "targetPoolId": "DP_TRANSPORT_TOTAL"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.6,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "交通总支出月度偏高",
+        "template": "本月交通支出明显偏高"
+      }
+    },
+
+    "RULE_DAILY_CLEANING_7D_COUNT_HIGH": {
+      "ruleName": "清洁用品短期重复购买",
+      "enabled": true,
+      "ruleGroup": "daily",
+      "algorithmId": "ALG_COUNT_ANOMALY",
+      "severity": "notice",
+      "order": 400,
+      "target": {
+        "targetPoolId": "DP_DAILY_CLEANING"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "day",
+        "countWindow": "rolling_7d",
+        "countMode": "fixed_threshold",
+        "countThreshold": 3
+      },
+      "message": {
+        "title": "清洁用品短期重复购买",
+        "template": "近期清洁用品购买较频繁，建议确认是否重复采购"
+      }
+    },
+
+    "RULE_DAILY_CONSUMABLE_WEEKLY_HIGH": {
+      "ruleName": "消耗品周度偏高",
+      "enabled": true,
+      "ruleGroup": "daily",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 410,
+      "target": {
+        "targetPoolId": "DP_DAILY_CONSUMABLE"
+      },
+      "params": {
+        "timeGrain": "week",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 8,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.8,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "same_day_progress"
+      },
+      "message": {
+        "title": "消耗品周度偏高",
+        "template": "本周消耗品支出偏高"
+      }
+    },
+
+    "RULE_DAILY_CLOTHES_MONTHLY_HIGH": {
+      "ruleName": "衣服月度异常增长",
+      "enabled": true,
+      "ruleGroup": "daily",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 420,
+      "target": {
+        "targetPoolId": "DP_DAILY_CLOTHES"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 2,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "衣服月度异常增长",
+        "template": "本月衣物支出明显高于平时"
+      }
+    },
+
+    "RULE_DAILY_TOTAL_BUDGET_BREACH": {
+      "ruleName": "日用品总支出月度超预算",
+      "enabled": true,
+      "ruleGroup": "budget",
+      "algorithmId": "ALG_BUDGET_BREACH",
+      "severity": "warning",
+      "order": 430,
+      "target": {
+        "targetPoolId": "DP_DAILY_TOTAL",
+        "budgetId": "BUDGET_DAILY_MONTH"
+      },
+      "params": {
+        "timeGrain": "month",
+        "budgetMode": "breach",
+        "budgetThreshold": 1,
+        "partialPeriodStrategy": "direct_compare"
+      },
+      "message": {
+        "title": "日用品总支出月度超预算",
+        "template": "本月日用品支出已超预算"
+      }
+    },
+
+    "RULE_HOBBY_TOTAL_BUDGET_BREACH": {
+      "ruleName": "爱好支出总额月度超预算",
+      "enabled": true,
+      "ruleGroup": "budget",
+      "algorithmId": "ALG_BUDGET_BREACH",
+      "severity": "warning",
+      "order": 500,
+      "target": {
+        "targetPoolId": "DP_HOBBY_TOTAL",
+        "budgetId": "BUDGET_HOBBY_MONTH"
+      },
+      "params": {
+        "timeGrain": "month",
+        "budgetMode": "breach",
+        "budgetThreshold": 1,
+        "partialPeriodStrategy": "direct_compare"
+      },
+      "message": {
+        "title": "爱好支出总额月度超预算",
+        "template": "本月爱好支出已超预算"
+      }
+    },
+
+    "RULE_HOBBY_TOTAL_MONTHLY_HIGH": {
+      "ruleName": "爱好支出总额月度异常偏高",
+      "enabled": true,
+      "ruleGroup": "hobby",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 510,
+      "target": {
+        "targetPoolId": "DP_HOBBY_TOTAL"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.8,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "爱好支出总额月度异常偏高",
+        "template": "本月爱好支出明显高于平时"
+      }
+    },
+
+    "RULE_HOBBY_RESEARCH_SINGLE_HIGH": {
+      "ruleName": "技术研究单笔偏高",
+      "enabled": true,
+      "ruleGroup": "hobby",
+      "algorithmId": "ALG_PERCENTILE_SPIKE",
+      "severity": "warning",
+      "order": 520,
+      "target": {
+        "targetPoolId": "DP_HOBBY_RESEARCH"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "month",
+        "valueScope": "single_record",
+        "lookbackPeriods": 12,
+        "percentile": "p90",
+        "compareOperator": "gt",
+        "thresholdMultiplier": 1.2,
+        "minSampleSize": 6
+      },
+      "message": {
+        "title": "技术研究单笔偏高",
+        "template": "本次技术研究支出金额偏高"
+      }
+    },
+
+    "RULE_HOBBY_GAME_SHORT_TERM_CONTINUOUS": {
+      "ruleName": "电子游戏短期连续消费",
+      "enabled": true,
+      "ruleGroup": "hobby",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "notice",
+      "order": 530,
+      "target": {},
+      "params": {
+        "timeGrain": "week",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "game_count_7d",
+            "algorithmId": "ALG_COUNT_ANOMALY",
+            "target": {
+              "targetPoolId": "DP_HOBBY_GAME"
+            },
+            "params": {
+              "timeGrain": "day",
+              "countWindow": "rolling_7d",
+              "countMode": "fixed_threshold",
+              "countThreshold": 3
+            },
+            "filters": {
+              "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+              "sceneTagPolicy": "exclude_any_tagged"
+            }
+          },
+          {
+            "conditionId": "game_weekly_high",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_HOBBY_GAME"
+            },
+            "params": {
+              "timeGrain": "week",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 8,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.8,
+              "minSampleSize": 4,
+              "partialPeriodStrategy": "same_day_progress"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "电子游戏短期连续消费",
+        "template": "近期兴趣类消费较频繁"
+      }
+    },
+
+    "RULE_HOBBY_PUZZLE_SHORT_TERM_CONTINUOUS": {
+      "ruleName": "拼图短期连续消费",
+      "enabled": true,
+      "ruleGroup": "hobby",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "notice",
+      "order": 540,
+      "target": {},
+      "params": {
+        "timeGrain": "week",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "puzzle_count_7d",
+            "algorithmId": "ALG_COUNT_ANOMALY",
+            "target": {
+              "targetPoolId": "DP_HOBBY_PUZZLE"
+            },
+            "params": {
+              "timeGrain": "day",
+              "countWindow": "rolling_7d",
+              "countMode": "fixed_threshold",
+              "countThreshold": 3
+            },
+            "filters": {
+              "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+              "sceneTagPolicy": "exclude_any_tagged"
+            }
+          },
+          {
+            "conditionId": "puzzle_weekly_high",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_HOBBY_PUZZLE"
+            },
+            "params": {
+              "timeGrain": "week",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 8,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.8,
+              "minSampleSize": 4,
+              "partialPeriodStrategy": "same_day_progress"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "拼图短期连续消费",
+        "template": "近期兴趣类消费较频繁"
+      }
+    },
+
+    "RULE_HOBBY_TV_SHORT_TERM_CONTINUOUS": {
+      "ruleName": "电视剧短期连续消费",
+      "enabled": true,
+      "ruleGroup": "hobby",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "notice",
+      "order": 550,
+      "target": {},
+      "params": {
+        "timeGrain": "week",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "tv_count_7d",
+            "algorithmId": "ALG_COUNT_ANOMALY",
+            "target": {
+              "targetPoolId": "DP_HOBBY_TV"
+            },
+            "params": {
+              "timeGrain": "day",
+              "countWindow": "rolling_7d",
+              "countMode": "fixed_threshold",
+              "countThreshold": 3
+            },
+            "filters": {
+              "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+              "sceneTagPolicy": "exclude_any_tagged"
+            }
+          },
+          {
+            "conditionId": "tv_weekly_high",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_HOBBY_TV"
+            },
+            "params": {
+              "timeGrain": "week",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 8,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.8,
+              "minSampleSize": 4,
+              "partialPeriodStrategy": "same_day_progress"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "电视剧短期连续消费",
+        "template": "近期兴趣类消费较频繁"
+      }
+    },
+
+    "RULE_HOBBY_RATIO_IN_FREE_EXPENSE_HIGH": {
+      "ruleName": "爱好支出占自由支出比例过高",
+      "enabled": true,
+      "ruleGroup": "hobby",
+      "algorithmId": "ALG_RATIO_ANOMALY",
+      "severity": "warning",
+      "order": 560,
+      "target": {
+        "numeratorPoolId": "DP_HOBBY_TOTAL",
+        "denominatorPoolId": "DP_EXPENSE_FREE"
+      },
+      "params": {
+        "timeGrain": "month",
+        "ratioMode": "absolute_threshold",
+        "ratioThreshold": 0.4
+      },
+      "message": {
+        "title": "爱好支出占自由支出比例过高",
+        "template": "本月爱好支出占比较高，建议关注消费结构"
+      }
+    },
+
+    "RULE_APPLIANCE_SINGLE_LARGE": {
+      "ruleName": "家用电器单笔大额提醒",
+      "enabled": true,
+      "ruleGroup": "appliance",
+      "algorithmId": "ALG_ABSOLUTE_THRESHOLD",
+      "severity": "notice",
+      "order": 600,
+      "target": {
+        "targetPoolId": "DP_APPLIANCE_TOTAL"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "month",
+        "compareTarget": "single_record",
+        "compareOperator": "gt",
+        "thresholdValue": 500
+      },
+      "message": {
+        "title": "家用电器单笔大额提醒",
+        "template": "本次家电支出金额较大，建议确认用途和必要性"
+      }
+    },
+
+    "RULE_APPLIANCE_SINGLE_P95_HIGH": {
+      "ruleName": "家用电器历史极值偏高",
+      "enabled": true,
+      "ruleGroup": "appliance",
+      "algorithmId": "ALG_PERCENTILE_SPIKE",
+      "severity": "warning",
+      "order": 610,
+      "target": {
+        "targetPoolId": "DP_APPLIANCE_TOTAL"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "month",
+        "valueScope": "single_record",
+        "lookbackPeriods": 12,
+        "percentile": "p95",
+        "compareOperator": "gt",
+        "thresholdMultiplier": 1.2,
+        "minSampleSize": 6
+      },
+      "message": {
+        "title": "家用电器历史极值偏高",
+        "template": "本次家电支出明显高于历史水平"
+      }
+    },
+
+    "RULE_APPLIANCE_MONTHLY_CONCENTRATED_PURCHASE": {
+      "ruleName": "家用电器同月连续采购",
+      "enabled": true,
+      "ruleGroup": "appliance",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "warning",
+      "order": 620,
+      "target": {},
+      "params": {
+        "timeGrain": "month",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "appliance_count_month",
+            "algorithmId": "ALG_COUNT_ANOMALY",
+            "target": {
+              "targetPoolId": "DP_APPLIANCE_TOTAL"
+            },
+            "params": {
+              "timeGrain": "month",
+              "countWindow": "current_month",
+              "countMode": "fixed_threshold",
+              "countThreshold": 2
+            }
+          },
+          {
+            "conditionId": "appliance_total_month_high",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_APPLIANCE_TOTAL"
+            },
+            "params": {
+              "timeGrain": "month",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 6,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.5,
+              "minSampleSize": 4,
+              "partialPeriodStrategy": "close_only"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "家用电器同月连续采购",
+        "template": "本月家电支出较集中，建议关注集中采购情况"
+      }
+    },
+
+    "RULE_CHILD_TOY_MONTHLY_HIGH": {
+      "ruleName": "玩具月度偏高",
+      "enabled": true,
+      "ruleGroup": "child",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 700,
+      "target": {
+        "targetPoolId": "DP_CHILD_TOY"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.8,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "玩具月度偏高",
+        "template": "本月玩具支出明显偏高"
+      }
+    },
+
+    "RULE_CHILD_DAILY_WEEKLY_HIGH": {
+      "ruleName": "儿童日常消耗周度偏高",
+      "enabled": true,
+      "ruleGroup": "child",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 710,
+      "target": {
+        "targetPoolId": "DP_CHILD_DAILY"
+      },
+      "params": {
+        "timeGrain": "week",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 8,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.6,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "same_day_progress"
+      },
+      "message": {
+        "title": "儿童日常消耗周度偏高",
+        "template": "本周儿童日常消耗支出偏高"
+      }
+    },
+
+    "RULE_CHILD_EDUCATION_SINGLE_HIGH": {
+      "ruleName": "教育支出单笔偏高",
+      "enabled": true,
+      "ruleGroup": "child",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 720,
+      "target": {
+        "targetPoolId": "DP_CHILD_EDUCATION"
+      },
+      "filters": {
+        "excludeSceneTags": ["特殊场景", "可报销", "一次性"],
+        "sceneTagPolicy": "exclude_any_tagged"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "single_max",
+        "lookbackPeriods": 12,
+        "baselineMethod": "median",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.5,
+        "minSampleSize": 6,
+        "partialPeriodStrategy": "include_current"
+      },
+      "message": {
+        "title": "教育支出单笔偏高",
+        "template": "本次教育支出高于常规水平"
+      }
+    },
+
+    "RULE_CHILD_EDUCATION_CYCLE_MISSING": {
+      "ruleName": "教育支出周期缺失",
+      "enabled": true,
+      "ruleGroup": "child",
+      "algorithmId": "ALG_EXPECTED_MISSING",
+      "severity": "warning",
+      "order": 730,
+      "target": {
+        "targetPoolId": "DP_CHILD_EDUCATION"
+      },
+      "params": {
+        "timeGrain": "month",
+        "expectedSourceMode": "hybrid",
+        "lookbackPeriods": 12,
+        "minExpectedHits": 3,
+        "graceDays": 0,
+        "institutionRequired": true
+      },
+      "message": {
+        "title": "教育支出周期缺失",
+        "template": "本期教育支出未出现，建议确认是否漏记或延后"
+      }
+    },
+
+    "RULE_CHILD_TOTAL_BUDGET_BREACH": {
+      "ruleName": "儿童支出总额月度超预算",
+      "enabled": true,
+      "ruleGroup": "budget",
+      "algorithmId": "ALG_BUDGET_BREACH",
+      "severity": "warning",
+      "order": 740,
+      "target": {
+        "targetPoolId": "DP_CHILD_TOTAL",
+        "budgetId": "BUDGET_CHILD_MONTH"
+      },
+      "params": {
+        "timeGrain": "month",
+        "budgetMode": "breach",
+        "budgetThreshold": 1,
+        "partialPeriodStrategy": "direct_compare"
+      },
+      "message": {
+        "title": "儿童支出总额月度超预算",
+        "template": "本月儿童支出已超预算"
+      }
+    },
+
+    "RULE_MEMBER_AI_MONTHLY_HIGH": {
+      "ruleName": "AI会员月度支出异常",
+      "enabled": true,
+      "ruleGroup": "member",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 800,
+      "target": {
+        "targetPoolId": "DP_MEMBER_AI"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.8,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "AI会员月度支出异常",
+        "template": "本月 AI 相关订阅支出偏高"
+      }
+    },
+
+    "RULE_MEMBER_MEDIA_PERIOD_BREAK": {
+      "ruleName": "影视类会员非预期月份扣费",
+      "enabled": true,
+      "ruleGroup": "member",
+      "algorithmId": "ALG_PERIOD_BREAK",
+      "severity": "warning",
+      "order": 810,
+      "target": {
+        "targetPoolId": "DP_MEMBER_MEDIA"
+      },
+      "params": {
+        "timeGrain": "month",
+        "cycleType": "yearly",
+        "allowedDeviation": 0,
+        "institutionRequired": true,
+        "lookbackPeriods": 12
+      },
+      "message": {
+        "title": "影视类会员非预期月份扣费",
+        "template": "影视类会员扣费时间异常，建议确认续费周期"
+      }
+    },
+
+    "RULE_MEMBER_TOTAL_MONTHLY_HIGH": {
+      "ruleName": "电子会员总额月度偏高",
+      "enabled": true,
+      "ruleGroup": "member",
+      "algorithmId": "ALG_BASELINE_DEVIATION",
+      "severity": "warning",
+      "order": 820,
+      "target": {
+        "targetPoolId": "DP_MEMBER_TOTAL"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "statMetric": "sum",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.6,
+        "minSampleSize": 4,
+        "partialPeriodStrategy": "close_only"
+      },
+      "message": {
+        "title": "电子会员总额月度偏高",
+        "template": "本月电子会员支出明显高于平时"
+      }
+    },
+
+    "RULE_CASHFLOW_EXPENSE_OVER_INCOME": {
+      "ruleName": "月度现金流支出收入倒挂",
+      "enabled": true,
+      "ruleGroup": "cashflow",
+      "algorithmId": "ALG_RATIO_ANOMALY",
+      "severity": "high",
+      "order": 900,
+      "target": {
+        "numeratorPoolId": "DP_EXPENSE_TOTAL",
+        "denominatorPoolId": "DP_INCOME_TOTAL"
+      },
+      "params": {
+        "timeGrain": "month",
+        "ratioMode": "absolute_threshold",
+        "ratioThreshold": 1
+      },
+      "message": {
+        "title": "月度现金流支出收入倒挂",
+        "template": "本月支出已超过收入，请关注现金流压力"
+      }
+    },
+
+    "RULE_CASHFLOW_FREE_EXPENSE_RATIO_HIGH": {
+      "ruleName": "自由支出占收入比例过高",
+      "enabled": true,
+      "ruleGroup": "cashflow",
+      "algorithmId": "ALG_RATIO_ANOMALY",
+      "severity": "warning",
+      "order": 910,
+      "target": {
+        "numeratorPoolId": "DP_EXPENSE_FREE",
+        "denominatorPoolId": "DP_INCOME_TOTAL"
+      },
+      "params": {
+        "timeGrain": "month",
+        "ratioMode": "absolute_threshold",
+        "ratioThreshold": 0.3
+      },
+      "message": {
+        "title": "自由支出占收入比例过高",
+        "template": "本月自由支出占收入比例偏高"
+      }
+    },
+
+    "RULE_CASHFLOW_ESSENTIAL_EXPENSE_RATIO_HIGH": {
+      "ruleName": "刚需支出占收入比例异常",
+      "enabled": true,
+      "ruleGroup": "cashflow",
+      "algorithmId": "ALG_RATIO_ANOMALY",
+      "severity": "warning",
+      "order": 920,
+      "target": {
+        "numeratorPoolId": "DP_EXPENSE_ESSENTIAL",
+        "denominatorPoolId": "DP_INCOME_TOTAL"
+      },
+      "params": {
+        "timeGrain": "month",
+        "ratioMode": "baseline_compare",
+        "lookbackPeriods": 6,
+        "baselineMethod": "mean",
+        "thresholdMultiplier": 1.4,
+        "minSampleSize": 4
+      },
+      "message": {
+        "title": "刚需支出占收入比例异常",
+        "template": "本月刚需支出占比明显偏高"
+      }
+    },
+
+    "RULE_CASHFLOW_INCOME_DROP_WITHOUT_EXPENSE_SHRINK": {
+      "ruleName": "收入下降但支出未明显收缩",
+      "enabled": true,
+      "ruleGroup": "cashflow",
+      "algorithmId": "ALG_COMPOSITE_LINKAGE",
+      "severity": "warning",
+      "order": 930,
+      "target": {},
+      "params": {
+        "timeGrain": "month",
+        "logicOperator": "AND",
+        "windowConstraint": "same_period",
+        "conditions": [
+          {
+            "conditionId": "income_drop",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_INCOME_TOTAL"
+            },
+            "params": {
+              "timeGrain": "month",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 3,
+              "baselineMethod": "mean",
+              "compareOperator": "lt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 0.8,
+              "minSampleSize": 3,
+              "partialPeriodStrategy": "close_only"
+            }
+          },
+          {
+            "conditionId": "expense_not_drop_too_much",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_EXPENSE_TOTAL"
+            },
+            "params": {
+              "timeGrain": "month",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 3,
+              "baselineMethod": "mean",
+              "compareOperator": "gt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 0.9,
+              "minSampleSize": 3,
+              "partialPeriodStrategy": "close_only"
+            }
+          },
+          {
+            "conditionId": "expense_not_rise_too_much",
+            "algorithmId": "ALG_BASELINE_DEVIATION",
+            "target": {
+              "targetPoolId": "DP_EXPENSE_TOTAL"
+            },
+            "params": {
+              "timeGrain": "month",
+              "currentPeriod": "current",
+              "statMetric": "sum",
+              "lookbackPeriods": 3,
+              "baselineMethod": "mean",
+              "compareOperator": "lt",
+              "thresholdMode": "multiplier",
+              "thresholdValue": 1.1,
+              "minSampleSize": 3,
+              "partialPeriodStrategy": "close_only"
+            }
+          }
+        ]
+      },
+      "message": {
+        "title": "收入下降但支出未明显收缩",
+        "template": "收入下降但支出未明显收缩"
+      }
+    },
+
+    "RULE_BUDGET_TOTAL_BREACH": {
+      "ruleName": "预算总额超限",
+      "enabled": true,
+      "ruleGroup": "budget",
+      "algorithmId": "ALG_BUDGET_BREACH",
+      "severity": "high",
+      "order": 940,
+      "target": {
+        "targetPoolId": "DP_EXPENSE_TOTAL",
+        "budgetId": "BUDGET_TOTAL_MONTH"
+      },
+      "params": {
+        "timeGrain": "month",
+        "budgetMode": "breach",
+        "budgetThreshold": 1,
+        "partialPeriodStrategy": "direct_compare"
+      },
+      "message": {
+        "title": "预算总额超限",
+        "template": "本月总支出已超预算"
+      }
+    },
+
+    "RULE_BUDGET_TOTAL_WARNING": {
+      "ruleName": "预算预警接近预算上限",
+      "enabled": true,
+      "ruleGroup": "budget",
+      "algorithmId": "ALG_BUDGET_BREACH",
+      "severity": "notice",
+      "order": 950,
+      "target": {
+        "targetPoolId": "DP_EXPENSE_TOTAL",
+        "budgetId": "BUDGET_TOTAL_MONTH"
+      },
+      "params": {
+        "timeGrain": "month",
+        "budgetMode": "warn",
+        "budgetThreshold": 0.85,
+        "partialPeriodStrategy": "direct_compare"
+      },
+      "message": {
+        "title": "预算预警接近预算上限",
+        "template": "本月总支出已接近预算上限"
+      }
+    },
+    "RULE_MEMBER_NEW_SUBSCRIPTION_GROWTH_FAST":{
+      "ruleName": "订阅数量新增过快",
+      "enabled": true,
+      "ruleGroup": "member",
+      "algorithmId": "ALG_NEW_ENTITY_GROWTH",
+      "severity": "warning",
+      "order": 830,
+      "target": {
+        "targetPoolId": "DP_MEMBER_TOTAL"
+      },
+      "filters": {
+        "institutionNames": [],
+        "cycleTypes": [],
+        "includeSceneTags": [],
+        "excludeSceneTags": [],
+        "sceneTagPolicy": "include_all"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "entityKey": "institutionName",
+        "institutionRequired": true,
+        "lookbackPeriods": 6,
+        "historyWindowMode": "period_avg",
+        "newEntityDefinition": "not_seen_before_current_period",
+        "thresholdMode": "offset",
+        "thresholdValue": 2,
+        "minSampleSize": 3
+      },
+      "message": {
+        "title": "订阅数量新增过快",
+        "template": "本月新增订阅数量偏多，建议关注新增订阅节奏"
+      },
+      "resultPolicy": {
+        "cooldownDays": 0,
+        "dedupeKeyMode": "rule_month_target",
+        "allowPartialPeriod": true
+      }
+    },
+    "RULE_CASHFLOW_GAP_WIDENING":{
+      "ruleName": "月度现金流倒挂扩大",
+      "enabled": true,
+      "ruleGroup": "cashflow",
+      "algorithmId": "ALG_DERIVED_METRIC_DEVIATION",
+      "severity": "high",
+      "order": 905,
+      "target": {},
+      "filters": {
+        "institutionNames": [],
+        "cycleTypes": [],
+        "includeSceneTags": [],
+        "excludeSceneTags": [],
+        "sceneTagPolicy": "include_all"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "metricKey": "cashflow_gap",
+        "metricInputs": {
+          "incomePoolId": "DP_INCOME_TOTAL",
+          "expensePoolId": "DP_EXPENSE_TOTAL"
+        },
+        "compareMode": "previous_period",
+        "compareOperator": "gt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 1.2,
+        "minSampleSize": 1
+      },
+      "message": {
+        "title": "月度现金流倒挂扩大",
+        "template": "本月现金流压力较上月进一步增加"
+      },
+      "resultPolicy": {
+        "cooldownDays": 0,
+        "dedupeKeyMode": "rule_month_target",
+        "allowPartialPeriod": false
+      }
+    },
+    "RULE_CASHFLOW_SURPLUS_RATE_DROP":{
+      "ruleName": "结余率异常下降",
+      "enabled": true,
+      "ruleGroup": "cashflow",
+      "algorithmId": "ALG_DERIVED_METRIC_DEVIATION",
+      "severity": "warning",
+      "order": 935,
+      "target": {},
+      "filters": {
+        "institutionNames": [],
+        "cycleTypes": [],
+        "includeSceneTags": [],
+        "excludeSceneTags": [],
+        "sceneTagPolicy": "include_all"
+      },
+      "params": {
+        "timeGrain": "month",
+        "currentPeriod": "current",
+        "metricKey": "surplus_rate",
+        "metricInputs": {
+          "incomePoolId": "DP_INCOME_TOTAL",
+          "expensePoolId": "DP_EXPENSE_TOTAL"
+        },
+        "compareMode": "history_mean",
+        "lookbackPeriods": 6,
+        "compareOperator": "lt",
+        "thresholdMode": "multiplier",
+        "thresholdValue": 0.7,
+        "zeroIncomePolicy": "skip",
+        "minSampleSize": 4
+      },
+      "message": {
+        "title": "结余率异常下降",
+        "template": "本月结余率明显下降"
+      },
+      "resultPolicy": {
+        "cooldownDays": 0,
+        "dedupeKeyMode": "rule_month_target",
+        "allowPartialPeriod": false
+      }
+    }
+  }
+}

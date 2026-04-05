@@ -1,4 +1,7 @@
 import { App, TFile, moment } from "obsidian";
+import type { ContactInteractionEvent } from "../../contactsRSLatte/types";
+import type { TaskPanelSettings } from "../../types/taskTypes";
+import { compactInteractionEventSummaryForDisplay, formatIsoForDisplay } from "./contactInteractionDisplay";
 // ✅ moment 从 Obsidian 导入，但 TypeScript 类型定义可能不完整，使用类型断言
 const momentFn = moment as any;
 
@@ -11,6 +14,8 @@ export type ManualContactEventWriteOpts = {
   timeFormat?: string;
   /** optional: add a trailing wiki link or markdown link */
   sourceLink?: string;
+  /** 指定互动发生时刻（本地）；不传则使用「当下」 */
+  occurredAt?: Date;
 };
 
 function isHeaderLine(line: string): boolean {
@@ -57,7 +62,7 @@ export async function appendManualContactEvent(app: App, file: TFile, content: s
   const subHeader = normalizeHeader(opts.subHeader ?? "");
   const timeFmt = String(opts.timeFormat ?? "YYYY-MM-DD HH:mm");
 
-  const ts = momentFn().format(timeFmt);
+  const ts = opts.occurredAt ? momentFn(opts.occurredAt).format(timeFmt) : momentFn().format(timeFmt);
   const bulletLines = buildBulletLines(ts, content, opts.sourceLink);
   if ((content ?? "").trim().length === 0) throw new Error("empty content");
 
@@ -161,12 +166,16 @@ export async function appendManualContactEvent(app: App, file: TFile, content: s
 // ---------------------------------------------
 
 export type DynamicContactSummaryItem = {
-  statusIcon?: string; // pre-rendered icon (e.g. ✅)
+  statusIcon?: string; // pre-rendered icon (e.g. ✅)，应与任务管理侧栏一致（见 statusIconForInteractionWithPhase）
   source_type?: string; // e.g. task / project_task
   snippet: string;
   source_path: string;
   line_no?: number;
   heading?: string;
+  /** 关注中/已结束，用于在动态块中显示文字标签，与任务管理侧栏一致 */
+  follow_status?: "following" | "ended";
+  /** 实际互动记录（状态变更等），渲染为主条目下的子列表 */
+  interaction_events?: ContactInteractionEvent[];
 };
 
 export type ReplaceGeneratedBlockResult = {
@@ -174,8 +183,55 @@ export type ReplaceGeneratedBlockResult = {
   created: boolean;
 };
 
+/** 仅按 status 的图标（不区分 phase），保留用于非任务类条目。 */
+export function statusIconForInteractionStatus(status: string): string {
+  const st = String(status ?? "").trim();
+  if (!st) return "•";
+  switch (st) {
+    case "done": return "✅";
+    case "cancelled": return "⛔";
+    case "in_progress": return "▶";
+    case "blocked": return "🛑";
+    case "todo": return "☐";
+    default: return "•";
+  }
+}
+
+/**
+ * 根据 status + task_phase 返回与任务管理侧栏一致的图标：
+ * done→✅, cancelled→⛔, todo→☐, in_progress+waiting_others→↻, in_progress+waiting_until→⏸, in_progress→▶
+ */
+export function statusIconForInteractionWithPhase(status: string, taskPhase?: string): string {
+  const st = String(status ?? "").trim().toLowerCase();
+  const phase = String(taskPhase ?? "").trim();
+  if (!st) return "•";
+  if (st === "done") return "✅";
+  if (st === "cancelled") return "⛔";
+  if (st === "todo") return "☐";
+  if (st === "in_progress") {
+    if (phase === "waiting_others") return "↻";
+    if (phase === "waiting_until") return "⏸";
+    return "▶";
+  }
+  if (st === "blocked") return "🛑";
+  return "•";
+}
+
 const DYN_START = "<!-- rslatte:contact:dynamic:start -->";
 const DYN_END = "<!-- rslatte:contact:dynamic:end -->";
+/** 旧版/手改注释可能带下划线，识别以便替换并统一写回 canonical 标记 */
+const LEGACY_DYN_START = "<!-- rs_latte:contact:dynamic:start -->";
+const LEGACY_DYN_END = "<!-- rs_latte:contact:dynamic:end -->";
+
+function lineIsDynStart(line: string): boolean {
+  const t = (line ?? "").trim();
+  return t === DYN_START || t === LEGACY_DYN_START;
+}
+
+function lineIsDynEnd(line: string): boolean {
+  const t = (line ?? "").trim();
+  return t === DYN_END || t === LEGACY_DYN_END;
+}
 
 function normalizeNewlines(text: string): string {
   return String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -199,7 +255,17 @@ function stripTaskCheckboxPrefix(s: string): string {
   return t.replace(/^\s*[-*+]\s*\[[^\]]*\]\s*/u, "");
 }
 
-function buildDynamicSummaryLines(items: DynamicContactSummaryItem[], limit: number): string[] {
+function formatEventLineTime(iso: string): string {
+  const s = String(iso ?? "").trim();
+  if (!s) return "";
+  return s.length >= 16 ? s.slice(0, 16).replace("T", " ") : s;
+}
+
+function buildDynamicSummaryLines(
+  items: DynamicContactSummaryItem[],
+  limit: number,
+  taskPanel?: TaskPanelSettings | null,
+): string[] {
   const out: string[] = [];
   const take = Math.max(0, Math.min(Number(limit ?? 20) || 20, 200));
   const list = (items ?? []).slice(0, take);
@@ -212,6 +278,11 @@ function buildDynamicSummaryLines(items: DynamicContactSummaryItem[], limit: num
   for (const it of list) {
     const icon = String(it.statusIcon ?? "•").trim() || "•";
     const st = String(it.source_type ?? "").trim();
+    const followStatus = (it.follow_status ?? "") as "following" | "ended" | "";
+    const followLabel =
+      followStatus && (st === "task" || st === "project_task")
+        ? (followStatus === "following" ? "**关注中** " : "**已结束** ")
+        : "";
     const sn = truncateOneLine(stripTaskCheckboxPrefix(it.snippet ?? ""), 140);
     const fileLabel = String(it.source_path ?? "");
     const link = `[[${it.source_path}|${fileLabel}]]`;
@@ -220,7 +291,17 @@ function buildDynamicSummaryLines(items: DynamicContactSummaryItem[], limit: num
     const head = String(it.heading ?? "").trim();
     const headPart = head ? ` · ${head}` : "";
     const stPart = st ? `(${st}) ` : "";
-    out.push(`- ${icon} ${stPart}${sn} — ${link}${lnPart}${headPart}`.trim());
+    out.push(`- ${icon} ${followLabel}${stPart}${sn} — ${link}${lnPart}${headPart}`.trim());
+
+    const evs = [...(it.interaction_events ?? [])].sort(
+      (a, b) => Date.parse(String(a.occurred_at ?? "")) - Date.parse(String(b.occurred_at ?? ""))
+    );
+    for (const ev of evs) {
+      const t = formatIsoForDisplay(String(ev.occurred_at ?? ""), taskPanel);
+      const sum = compactInteractionEventSummaryForDisplay(String(ev.summary ?? "").trim(), it.snippet ?? "");
+      const line = sum ? `${t} · ${sum}` : t;
+      if (line) out.push(`  - ${line}`);
+    }
   }
   return out;
 }
@@ -242,7 +323,7 @@ export async function replaceContactDynamicGeneratedBlock(
   app: App,
   file: TFile,
   items: DynamicContactSummaryItem[],
-  opts?: { limit?: number; sectionHeader?: string; subHeader?: string },
+  opts?: { limit?: number; sectionHeader?: string; subHeader?: string; taskPanel?: TaskPanelSettings },
 ): Promise<ReplaceGeneratedBlockResult> {
   const limit = Math.max(1, Math.min(Number(opts?.limit ?? 20) || 20, 200));
   const sectionHeader = normalizeHeader(opts?.sectionHeader ?? "## 互动记录") || "## 互动记录";
@@ -252,7 +333,7 @@ export async function replaceContactDynamicGeneratedBlock(
   const text = normalizeNewlines(raw);
   const lines = text.split("\n");
 
-  const gen = buildDynamicSummaryLines(items, limit);
+  const gen = buildDynamicSummaryLines(items, limit, opts?.taskPanel);
   const blockLines = [DYN_START, ...gen, DYN_END];
 
   const findExactLine = (target: string, start: number, end: number): number => {
@@ -323,9 +404,9 @@ export async function replaceContactDynamicGeneratedBlock(
   // 2) Find all blocks across file (pairs). We'll keep at most one within target range.
   const blocks: Array<{ s: number; e: number }> = [];
   for (let i = 0; i < lines.length; i++) {
-    if ((lines[i] ?? "").trim() !== DYN_START) continue;
+    if (!lineIsDynStart(lines[i] ?? "")) continue;
     for (let j = i + 1; j < lines.length; j++) {
-      if ((lines[j] ?? "").trim() === DYN_END) {
+      if (lineIsDynEnd(lines[j] ?? "")) {
         blocks.push({ s: i, e: j });
         i = j;
         break;
@@ -366,11 +447,11 @@ export async function replaceContactDynamicGeneratedBlock(
   let s = -1;
   let e = -1;
   for (let i = targetStart; i < targetEnd; i++) {
-    if ((lines[i] ?? "").trim() === DYN_START) { s = i; break; }
+    if (lineIsDynStart(lines[i] ?? "")) { s = i; break; }
   }
   if (s >= 0) {
     for (let j = s + 1; j < targetEnd; j++) {
-      if ((lines[j] ?? "").trim() === DYN_END) { e = j; break; }
+      if (lineIsDynEnd(lines[j] ?? "")) { e = j; break; }
     }
   }
 

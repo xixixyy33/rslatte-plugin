@@ -6,6 +6,7 @@ import type {
   RSLatteReconcileGate,
 } from "../moduleSpec";
 import type { RSLatteResult, RSLatteError } from "../types";
+import { isScheduleMemoLine } from "../../../taskRSLatte/types";
 
 function ok<T>(data: T, warnings?: string[]): RSLatteResult<T> {
   return warnings?.length ? { ok: true, data, warnings } : { ok: true, data };
@@ -129,6 +130,12 @@ export function createMemoSpecAtomic(plugin: any): ModuleSpecAtomic {
     async scanIncremental(ctx) {
       try {
         await plugin?.taskRSLatte?.ensureReady?.();
+        if (
+          ctx.mode === "manual_refresh" &&
+          typeof plugin?.taskRSLatte?.clearScanCache === "function"
+        ) {
+          await plugin.taskRSLatte.clearScanCache();
+        }
         const fixUidAndMeta = ctx.mode !== "auto_refresh";
         const scan: any = await plugin?.taskRSLatte?.e2ScanIncremental?.(MEMO_MODULES, { fixUidAndMeta });
 
@@ -136,10 +143,11 @@ export function createMemoSpecAtomic(plugin: any): ModuleSpecAtomic {
           ...(scan ?? {}),
           modules: MEMO_MODULES,
           tasks: Array.isArray(scan?.tasks) ? scan.tasks : [],
-          memos: Array.isArray(scan?.memos) ? scan.memos : [],
+          memos: Array.isArray(scan?.memos) ? scan.memos.filter((m: any) => !isScheduleMemoLine(m)) : [],
           includedFilePaths: Array.isArray(scan?.includedFilePaths) ? scan.includedFilePaths : [],
           touchedFilePaths: Array.isArray(scan?.touchedFilePaths) ? scan.touchedFilePaths : [],
           removedFilePaths: Array.isArray(scan?.removedFilePaths) ? scan.removedFilePaths : [],
+          contactInteractionsByFile: (scan?.contactInteractionsByFile && typeof scan.contactInteractionsByFile === "object") ? scan.contactInteractionsByFile : {},
           fullScan: false,
         };
 
@@ -169,7 +177,26 @@ export function createMemoSpecAtomic(plugin: any): ModuleSpecAtomic {
     async applyDelta(_ctx, scan: any) {
       try {
         await plugin?.taskRSLatte?.ensureReady?.();
-        const applied: any = await plugin?.taskRSLatte?.e2ApplyScanToIndex?.(scan);
+        const memoScan = {
+          ...(scan ?? {}),
+          memos: Array.isArray(scan?.memos) ? scan.memos.filter((m: any) => !isScheduleMemoLine(m)) : [],
+        };
+        const applied: any = await plugin?.taskRSLatte?.e2ApplyScanToIndex?.(memoScan);
+        try {
+          const store = plugin?.contactsIndex?.getInteractionsStore?.();
+          if (store && typeof store.applyFileUpdates === "function") {
+            const byFile = (scan?.contactInteractionsByFile && typeof scan.contactInteractionsByFile === "object") ? scan.contactInteractionsByFile : {};
+            const upserts = Object.keys(byFile).map((fp) => ({
+              source_path: fp,
+              mtime: Number((byFile as any)[fp]?.mtime ?? 0),
+              entries: Array.isArray((byFile as any)[fp]?.entries) ? (byFile as any)[fp].entries : [],
+            }));
+            const removals = Array.isArray(scan?.removedFilePaths) ? scan.removedFilePaths : [];
+            await store.applyFileUpdates({ upserts, removals });
+          }
+        } catch {
+          // never block memo pipeline
+        }
         // ✅ D3: dbSyncForceFullNext.memo => treat next run as forceFullSync even under incremental/manual
         const forceFullSync = getForceFullFlag();
         return ok({ ...(applied ?? {}), modules: MEMO_MODULES, forceFullSync });
@@ -186,10 +213,11 @@ export function createMemoSpecAtomic(plugin: any): ModuleSpecAtomic {
           ...(scan ?? {}),
           modules: MEMO_MODULES,
           tasks: Array.isArray(scan?.tasks) ? scan.tasks : [],
-          memos: Array.isArray(scan?.memos) ? scan.memos : [],
+          memos: Array.isArray(scan?.memos) ? scan.memos.filter((m: any) => !isScheduleMemoLine(m)) : [],
           includedFilePaths: Array.isArray(scan?.includedFilePaths) ? scan.includedFilePaths : [],
           touchedFilePaths: Array.isArray(scan?.touchedFilePaths) ? scan.touchedFilePaths : [],
           removedFilePaths: Array.isArray(scan?.removedFilePaths) ? scan.removedFilePaths : [],
+          contactInteractionsByFile: (scan?.contactInteractionsByFile && typeof scan.contactInteractionsByFile === "object") ? scan.contactInteractionsByFile : {},
           fullScan: true,
         };
         
@@ -219,7 +247,28 @@ export function createMemoSpecAtomic(plugin: any): ModuleSpecAtomic {
     async replaceAll(_ctx, scan: any) {
       try {
         await plugin?.taskRSLatte?.ensureReady?.();
-        const applied: any = await plugin?.taskRSLatte?.e2ApplyScanToIndex?.(scan);
+        const memoScan = {
+          ...(scan ?? {}),
+          memos: Array.isArray(scan?.memos) ? scan.memos.filter((m: any) => !isScheduleMemoLine(m)) : [],
+        };
+        const applied: any = await plugin?.taskRSLatte?.e2ApplyScanToIndex?.(memoScan);
+        try {
+          const store = plugin?.contactsIndex?.getInteractionsStore?.();
+          if (store) {
+            const byFile = (scan?.contactInteractionsByFile && typeof scan.contactInteractionsByFile === "object") ? scan.contactInteractionsByFile : {};
+            const upserts = Object.keys(byFile).map((fp) => ({
+              source_path: fp,
+              mtime: Number((byFile as any)[fp]?.mtime ?? 0),
+              entries: Array.isArray((byFile as any)[fp]?.entries) ? (byFile as any)[fp].entries : [],
+            }));
+            const removals = Array.isArray(scan?.removedFilePaths) ? scan.removedFilePaths : [];
+            await (store as any).applyFileUpdates?.({ upserts, removals });
+            const allowed = new Set(Array.isArray(scan?.includedFilePaths) ? scan.includedFilePaths : []);
+            await (store as any).cleanupSourceTypeNotIn?.("memo", allowed);
+          }
+        } catch {
+          // never block memo pipeline
+        }
         return ok({ ...(applied ?? {}), modules: MEMO_MODULES, forceFullSync: true });
       } catch (e: any) {
         return fail("MEMO_REPLACE_ALL_FAILED", "Memo replaceAll failed", { message: e?.message ?? String(e) });

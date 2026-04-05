@@ -1,11 +1,37 @@
-import { ItemView, WorkspaceLeaf, normalizePath } from "obsidian";
+import { ItemView, Notice, WorkspaceLeaf, normalizePath } from "obsidian";
 import type RSLattePlugin from "../../main";
-import { VIEW_TYPE_HUB } from "../../constants/viewTypes";
-import type { RSLatteSpaceStatsFileV1, RSLatteSpaceStatsModuleEntryV1 } from "../../types/spaceStats";
-import { resolveSpaceStatsDir } from "../../services/spaceContext";
-import { SpaceStatsService } from "../../services/spaceStatsService";
+import { VIEW_TYPE_HUB, WORKFLOW_VIEW_IDS, WORKFLOW_VIEW_LABELS, type WorkflowViewId } from "../../constants/viewTypes";
+import type {
+  RSLatteSpaceStatsFileV1,
+  RSLatteSpaceStatsModuleEntryV1,
+  RSLatteSpaceStatsSyncStatus,
+} from "../../types/spaceStats";
+import { resolveSpaceStatsDir } from "../../services/space/spaceContext";
+import { SpaceStatsService } from "../../services/space/spaceStatsService";
 import { RSLATTE_EVENT_DB_SYNC_STATUS_CHANGED, RSLATTE_EVENT_SPACE_STATS_UPDATED } from "../../constants/space";
 import { StatusCalculationService } from "../../services/statusCalculationService";
+import { buildHubFlatAlerts, type HubAlertInputRow } from "../../services/hub/hubAlertsBuilder";
+import { readFinanceAnalysisAlertIndex } from "../../services/finance/financeAnalysisAlertIndex";
+import { readHealthAnalysisAlertIndex } from "../../services/health/healthAnalysisAlertIndex";
+import {
+  computeHubJournalSnapshot,
+  hubJournalContentLevel,
+  HUB_JOURNAL_MEANINGFUL_OK_THRESHOLD,
+  type HubJournalSnapshot,
+} from "../../services/hub/hubJournalSnapshot";
+
+/** Hub 卡片内业务模块顺序（日记行单独渲染在最后） */
+const HUB_CARD_MODULE_KEYS = [
+  "task",
+  "memo",
+  "schedule",
+  "checkin",
+  "finance",
+  "health",
+  "project",
+  "output",
+  "contacts",
+] as const;
 
 export class SpaceHubView extends ItemView {
   private plugin: RSLattePlugin;
@@ -19,7 +45,7 @@ export class SpaceHubView extends ItemView {
   }
 
   getViewType(): string { return VIEW_TYPE_HUB; }
-  getDisplayText(): string { return "RSLatte Hub"; }
+  getDisplayText(): string { return "RSLatte工作台"; }
   getIcon(): string { return "layout-dashboard"; }
 
   async onOpen() {
@@ -125,8 +151,7 @@ export class SpaceHubView extends ItemView {
           const statsService = new SpaceStatsService(this.plugin);
           // 获取所有启用的模块
           const enabledModules: string[] = [];
-          const moduleKeys = ["task", "memo", "checkin", "finance", "project", "output", "contacts"];
-          for (const key of moduleKeys) {
+          for (const key of HUB_CARD_MODULE_KEYS) {
             try {
               // 使用统一的模块启用检查方法，传入 spaceId
               if (this.isModuleEnabledInSpace(key, space.id)) {
@@ -210,13 +235,15 @@ export class SpaceHubView extends ItemView {
   private getModuleLabel(moduleKey: string): string {
     const labels: Record<string, string> = {
       task: "任务",
-      memo: "备忘",
+      memo: "提醒",
+      schedule: "日程",
       checkin: "打卡",
       finance: "财务",
+      health: "健康",
       project: "项目",
       output: "输出",
       contacts: "联系人",
-      publish: "发布",
+      journal: "日记",
     };
     return labels[moduleKey] || moduleKey;
   }
@@ -246,9 +273,17 @@ export class SpaceHubView extends ItemView {
       
       // Memo KPI
       if (kpi.memo) {
-        const { total, new7d } = kpi.memo;
+        const { total, new7d, overdueUnclosed, dueWithin7dUnclosed } = kpi.memo;
         if (total !== undefined) parts.push(`总计: ${total}`);
-        if (new7d > 0) parts.push(`新${new7d}天: ${new7d}`);
+        if (overdueUnclosed != null && overdueUnclosed > 0) parts.push(`逾期未关: ${overdueUnclosed}`);
+        if (dueWithin7dUnclosed != null && dueWithin7dUnclosed > 0) parts.push(`7日内待处理: ${dueWithin7dUnclosed}`);
+        if (new7d > 0) parts.push(`近7天新增: ${new7d}`);
+      }
+
+      if (kpi.schedule) {
+        const { scheduledHoursNext7d, expectedUnclosedCount } = kpi.schedule;
+        if (scheduledHoursNext7d > 0) parts.push(`7天内排程: ${scheduledHoursNext7d.toFixed(1)}h`);
+        if (expectedUnclosedCount > 0) parts.push(`逾期未结束: ${expectedUnclosedCount}`);
       }
       
       // Checkin KPI
@@ -287,12 +322,6 @@ export class SpaceHubView extends ItemView {
         if (upcoming30d > 0) parts.push(`30天将到: ${upcoming30d}`);
       }
       
-      // Publish KPI
-      if (kpi.publish) {
-        const { publishedCount, unpublishedCount } = kpi.publish;
-        if (publishedCount !== undefined) parts.push(`已发布: ${publishedCount}`);
-        if (unpublishedCount !== undefined) parts.push(`未发布: ${unpublishedCount}`);
-      }
     }
 
     return parts.join(" · ") || "暂无数据";
@@ -304,6 +333,7 @@ export class SpaceHubView extends ItemView {
    */
   private isModuleEnabledInSpace(moduleKey: string, spaceId?: string): boolean {
     try {
+      if ((this.plugin as any).isPluginEnvInitModuleGateOpen?.() !== true) return false;
       // 如果提供了 spaceId，从对应空间的配置中读取
       if (spaceId) {
         const spaceConfig = this.plugin.getSpaceConfig(spaceId);
@@ -365,7 +395,7 @@ export class SpaceHubView extends ItemView {
       // 对于特定模块，使用专门的检查方法（这些方法检查全局设置）
       // 注意：这些方法只检查全局设置，不检查空间配置，所以放在最后作为兜底
       if (moduleKey === "finance") {
-        return (this.plugin as any).isFinanceModuleEnabled?.() ?? true;
+        return (this.plugin as any).isFinanceModuleEnabled?.() ?? false;
       }
       
       if (moduleKey === "contacts") {
@@ -396,36 +426,465 @@ export class SpaceHubView extends ItemView {
     }
   }
 
-  private getModuleStatusIcon(moduleKey: string, entry: RSLatteSpaceStatsModuleEntryV1, spaceId?: string): string {
-    // 检查模块是否启用
-    const isEnabled = this.isModuleEnabledInSpace(moduleKey, spaceId);
-    
-    // 发布模块默认显示绿色（🟢），因为不支持数据库同步
-    if (moduleKey === "publish" && isEnabled) {
-      return "🟢";
+  private listEnabledHubModules(spaceId: string): string[] {
+    const enabled: string[] = [];
+    for (const key of HUB_CARD_MODULE_KEYS) {
+      try {
+        if (this.isModuleEnabledInSpace(key, spaceId)) enabled.push(key);
+      } catch {
+        // ignore
+      }
     }
-    
-    // 使用统一的状态计算服务
-    const syncStatus = entry.sync_status || "unknown";
-    const businessStatus = StatusCalculationService.calculateBusinessStatus(moduleKey, entry.kpi);
-    return StatusCalculationService.calculateStatusIcon(moduleKey, syncStatus, businessStatus, isEnabled);
+    return enabled;
   }
 
-  /** 获取状态灯的含义说明 */
-  private getModuleStatusTooltip(moduleKey: string, entry: RSLatteSpaceStatsModuleEntryV1, spaceId?: string): string {
-    // 检查模块是否启用
-    const isEnabled = this.isModuleEnabledInSpace(moduleKey, spaceId);
-    
-    // 发布模块特殊处理：显示已发布/未发布数量
-    if (moduleKey === "publish" && isEnabled && entry.kpi?.publish) {
-      const { publishedCount = 0, unpublishedCount = 0 } = entry.kpi.publish;
-      return `已发布: ${publishedCount} · 未发布: ${unpublishedCount}`;
+  /** 读取并必要时补全 space.json（与原先卡片内逻辑一致） */
+  private async loadStatsForHubSpace(space: { id: string; name?: string; settingsSnapshot?: unknown }, seq: number): Promise<{
+    space: { id: string; name?: string; settingsSnapshot?: unknown };
+    stats: RSLatteSpaceStatsFileV1 | null;
+    diaryExists: boolean;
+    journalSnapshot: HubJournalSnapshot;
+  } | null> {
+    if (seq !== this._renderSeq) return null;
+    let stats = await this.readSpaceStats(space.id);
+    let needsRefresh = !stats || !stats.modules || Object.keys(stats.modules).length === 0;
+    if (!needsRefresh && stats && stats.modules) {
+      const enabledModules = this.listEnabledHubModules(space.id);
+      for (const key of enabledModules) {
+        if (!stats.modules[key]) {
+          if (this.plugin.isDebugLogEnabled()) {
+            console.log(`[RSLatte][Hub][DEBUG] Module ${key} is enabled but missing in stats file for space ${space.id}`);
+          }
+          needsRefresh = true;
+          break;
+        }
+      }
     }
-    
-    // 使用统一的状态计算服务
-    const syncStatus = entry.sync_status || "unknown";
-    const businessStatus = StatusCalculationService.calculateBusinessStatus(moduleKey, entry.kpi);
-    return StatusCalculationService.calculateStatusText(moduleKey, syncStatus, businessStatus, entry, isEnabled);
+    if (needsRefresh) {
+      try {
+        const ctx = this.plugin.getSpaceCtx(space.id);
+        const statsService = new SpaceStatsService(this.plugin);
+        const enabledModules = this.listEnabledHubModules(space.id);
+        if (enabledModules.length === 0) {
+          if (this.plugin.isDebugLogEnabled()) {
+            console.log(`[RSLatte][Hub] All modules disabled for space ${space.id}, skipping refresh to avoid infinite loop`);
+          }
+          stats = {
+            schema_version: 1,
+            updated_at: new Date().toISOString(),
+            vault_id: ctx.vaultId,
+            space_id: ctx.spaceId,
+            modules: {},
+            agg: { pending_total: 0, failed_total: 0, modules_enabled: 0 },
+          };
+        } else {
+          await statsService.refreshSpaceStats(ctx, enabledModules as any);
+          stats = await this.readSpaceStats(space.id);
+        }
+      } catch (e) {
+        console.warn(`[RSLatte][Hub] Failed to refresh stats for space ${space.id}:`, e);
+      }
+    }
+    const journalSnapshot = await computeHubJournalSnapshot(this.plugin, space);
+    const diaryExists = journalSnapshot.fileExists;
+    return { space, stats, diaryExists, journalSnapshot };
+  }
+
+  /** 切换空间告警页签（供卡片定位与页签点击共用） */
+  private activateHubAlertTabForSpace(spaceId: string): void {
+    const root = this.containerEl.children[1];
+    if (!root) return;
+    const tabsRow = root.querySelector(".rslatte-hub-alert-tabs");
+    const panelsWrap = root.querySelector(".rslatte-hub-alert-panels");
+    if (!tabsRow || !panelsWrap) return;
+    for (const t of tabsRow.querySelectorAll(".rslatte-hub-alert-tab")) {
+      const el = t as HTMLElement;
+      if (el.dataset.rslatteHubAlertTabSpace === spaceId) el.addClass("rslatte-hub-alert-tab--active");
+      else el.removeClass("rslatte-hub-alert-tab--active");
+    }
+    for (const p of panelsWrap.querySelectorAll(".rslatte-hub-alert-panel")) {
+      const el = p as HTMLElement;
+      if (el.dataset.rslatteHubAlertPanelSpace === spaceId) el.addClass("rslatte-hub-alert-panel--active");
+      else el.removeClass("rslatte-hub-alert-panel--active");
+    }
+  }
+
+  /** 当前空间页签下：全部展开 / 全部折叠模块告警子清单 */
+  private setHubAlertModulesOpenAll(open: boolean): void {
+    const root = this.containerEl.children[1];
+    if (!root) return;
+    const active = root.querySelector(".rslatte-hub-alert-panel--active") as HTMLElement | null;
+    if (!active) return;
+    for (const d of active.querySelectorAll(".rslatte-hub-alert-module")) {
+      (d as HTMLDetailsElement).open = open;
+    }
+  }
+
+  private fillHubAlertsSection(section: HTMLElement, rows: HubAlertInputRow[]): void {
+    section.empty();
+    const alerts = buildHubFlatAlerts(rows);
+    section.createDiv({ cls: "rslatte-hub-alerts-title", text: "空间告警" });
+    if (rows.length === 0) {
+      section.createDiv({ cls: "rslatte-hub-alerts-empty rslatte-muted", text: "暂无空间" });
+      return;
+    }
+    const spaceOrder = [...rows].sort((a, b) => (a.isCurrent === b.isCurrent ? 0 : a.isCurrent ? -1 : 1));
+    const uniqueRows: HubAlertInputRow[] = [];
+    const seen = new Set<string>();
+    for (const r of spaceOrder) {
+      if (seen.has(r.spaceId)) continue;
+      seen.add(r.spaceId);
+      uniqueRows.push(r);
+    }
+    const curSpaceId = this.plugin.getCurrentSpaceId();
+    const idSet = new Set(uniqueRows.map((r) => r.spaceId));
+    const defaultTabSpaceId = idSet.has(curSpaceId) ? curSpaceId : uniqueRows[0]!.spaceId;
+
+    const tabsRow = section.createDiv({ cls: "rslatte-hub-alert-tabs" });
+    const toolbar = section.createDiv({ cls: "rslatte-hub-alert-toolbar" });
+    const btnExpandAll = toolbar.createEl("button", {
+      cls: "rslatte-hub-alert-bulk-btn",
+      type: "button",
+      text: "全部展开",
+    });
+    btnExpandAll.title = "展开当前空间页签下所有模块清单";
+    btnExpandAll.onclick = () => this.setHubAlertModulesOpenAll(true);
+    const btnCollapseAll = toolbar.createEl("button", {
+      cls: "rslatte-hub-alert-bulk-btn",
+      type: "button",
+      text: "全部折叠",
+    });
+    btnCollapseAll.title = "折叠当前空间页签下所有模块清单";
+    btnCollapseAll.onclick = () => this.setHubAlertModulesOpenAll(false);
+    const panelsWrap = section.createDiv({ cls: "rslatte-hub-alert-panels" });
+
+    for (const r of uniqueRows) {
+      const tab = tabsRow.createEl("button", {
+        cls: "rslatte-hub-alert-tab",
+        type: "button",
+        text: r.spaceName || r.spaceId,
+      });
+      tab.dataset.rslatteHubAlertTabSpace = r.spaceId;
+      if (r.spaceId === defaultTabSpaceId) tab.addClass("rslatte-hub-alert-tab--active");
+      if (r.isCurrent) tab.addClass("rslatte-hub-alert-tab--current-space");
+
+      const panel = panelsWrap.createDiv({ cls: "rslatte-hub-alert-panel" });
+      panel.dataset.rslatteHubAlertPanelSpace = r.spaceId;
+      if (r.spaceId === defaultTabSpaceId) panel.addClass("rslatte-hub-alert-panel--active");
+
+      const body = panel.createDiv({ cls: "rslatte-hub-alert-panel-body" });
+      const st = r.stats;
+      if (st?.agg && ((st.agg.pending_total ?? 0) > 0 || (st.agg.failed_total ?? 0) > 0)) {
+        const aggEl = body.createDiv({ cls: "rslatte-hub-alert-agg rslatte-muted" });
+        const bits: string[] = [];
+        if ((st.agg.pending_total ?? 0) > 0) bits.push(`待同步 ${st.agg.pending_total}`);
+        if ((st.agg.failed_total ?? 0) > 0) bits.push(`同步失败 ${st.agg.failed_total}`);
+        aggEl.setText(bits.join(" · "));
+      }
+
+      const appendModuleAlertDetails = (
+        moduleKey: string,
+        summaryText: string,
+        modAlerts: { text: string }[],
+        dedupeAgainst?: string
+      ) => {
+        const modDet = body.createEl("details", { cls: "rslatte-hub-alert-module" });
+        modDet.dataset.rslatteAlertSpace = r.spaceId;
+        modDet.dataset.rslatteAlertModule = moduleKey;
+        const sum = modDet.createEl("summary", { cls: "rslatte-hub-alert-module-summary" });
+        sum.createSpan({ cls: "rslatte-hub-alert-module-label", text: this.getModuleLabel(moduleKey) });
+        const btn = sum.createEl("button", {
+          cls: "rslatte-hub-alert-open-sidebar",
+          text: "侧栏",
+          type: "button",
+        });
+        btn.title = "打开对应模块侧栏（需当前空间）";
+        btn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.openHubModuleRow(r.spaceId, moduleKey);
+        };
+        const modBody = modDet.createDiv({ cls: "rslatte-hub-alert-module-body" });
+        modBody.createDiv({ cls: "rslatte-hub-alert-kpi", text: summaryText });
+        const extra = dedupeAgainst
+          ? modAlerts.filter((a) => a.text !== dedupeAgainst)
+          : modAlerts;
+        for (const item of extra) {
+          modBody.createDiv({ cls: "rslatte-hub-alert-line", text: item.text });
+        }
+      };
+
+      for (const moduleKey of HUB_CARD_MODULE_KEYS) {
+        const entry = st?.modules?.[moduleKey] as RSLatteSpaceStatsModuleEntryV1 | undefined;
+        const isEnabled = this.isModuleEnabledInSpace(moduleKey, r.spaceId);
+        if (!isEnabled && !entry) continue;
+        const modLabel = this.getModuleLabel(moduleKey);
+        let summaryText: string;
+        if (!isEnabled) summaryText = "模块已关闭";
+        else if (entry) summaryText = this.formatHubModuleStatsText(moduleKey, entry);
+        else summaryText = "暂无数据";
+        const modAlerts = alerts.filter((a) => a.spaceId === r.spaceId && a.moduleKey === moduleKey);
+        const primaryKpi =
+          isEnabled && entry ? StatusCalculationService.hubPrimaryKpiLine(moduleKey, entry.kpi) : "";
+        const dedupeKey = primaryKpi ? `${modLabel}：${primaryKpi}` : "";
+        appendModuleAlertDetails(moduleKey, summaryText, modAlerts, dedupeKey || undefined);
+      }
+
+      {
+        const modKey = "journal";
+        const js = r.journalSnapshot;
+        let summaryText: string;
+        if (!js?.fileExists) summaryText = "今日日记未创建";
+        else if (js.meaningfulChars > HUB_JOURNAL_MEANINGFUL_OK_THRESHOLD) {
+          summaryText = `今日日记已达标（有效字>${HUB_JOURNAL_MEANINGFUL_OK_THRESHOLD}）`;
+        } else if (js.meaningfulChars > 0) {
+          summaryText = `今日日记有效字 ${js.meaningfulChars}（未达 ${HUB_JOURNAL_MEANINGFUL_OK_THRESHOLD}）`;
+        } else {
+          summaryText = "今日日记无实质内容";
+        }
+        const modAlerts = alerts.filter((a) => a.spaceId === r.spaceId && a.moduleKey === modKey);
+        const dedupeKey = !js?.fileExists ? "今日日记未创建" : "";
+        appendModuleAlertDetails(modKey, summaryText, modAlerts, dedupeKey || undefined);
+      }
+    }
+
+    for (const tab of tabsRow.querySelectorAll(".rslatte-hub-alert-tab")) {
+      const btn = tab as HTMLButtonElement;
+      btn.onclick = () => {
+        const sid = btn.dataset.rslatteHubAlertTabSpace;
+        if (sid) this.activateHubAlertTabForSpace(sid);
+      };
+    }
+  }
+
+  /** 按空间预读财务/健康分析告警索引，写入 `hubInputRows`（供 `buildHubFlatAlerts` 追加条目） */
+  private async enrichHubInputRowsWithAnalysisIndices(rows: HubAlertInputRow[]): Promise<void> {
+    await Promise.all(
+      rows.map(async (r) => {
+        try {
+          if (r.enabledModules.includes("finance")) {
+            const idx = await readFinanceAnalysisAlertIndex(this.plugin, r.spaceId);
+            if (idx?.status === "missing_data" && idx.missingData?.length) {
+              r.financeAnalysisExtras = idx.missingData.slice(0, 4).map((m) => {
+                const d = String(m.detail ?? "").trim();
+                const short = d.length > 100 ? `${d.slice(0, 100)}…` : d;
+                return short ? `${m.title}：${short}` : m.title;
+              });
+            }
+          }
+          if (r.enabledModules.includes("health")) {
+            const idx = await readHealthAnalysisAlertIndex(this.plugin, r.spaceId);
+            if (idx?.status === "missing_data" && idx.missingData?.length) {
+              r.healthAnalysisExtras = idx.missingData.slice(0, 4).map((m) => {
+                const d = String(m.detail ?? "").trim();
+                const short = d.length > 100 ? `${d.slice(0, 100)}…` : d;
+                return short ? `${m.title}：${short}` : m.title;
+              });
+            }
+          }
+        } catch (e) {
+          console.warn(`[RSLatte][Hub] enrichHubInputRowsWithAnalysisIndices failed space=${r.spaceId}`, e);
+        }
+      })
+    );
+  }
+
+  /** 切换到对应空间页签、仅展开目标模块子清单（同面板内其余模块先折叠）并滚到该 `<details>` */
+  private scrollHubAlertIntoView(spaceId: string, moduleKey: string): void {
+    const root = this.containerEl.children[1];
+    if (!root) return;
+    this.activateHubAlertTabForSpace(spaceId);
+    const panel = root.querySelector(
+      `.rslatte-hub-alert-panel[data-rslatte-hub-alert-panel-space="${spaceId}"]`
+    ) as HTMLElement | null;
+    const sel = `.rslatte-hub-alert-module[data-rslatte-alert-space="${spaceId}"][data-rslatte-alert-module="${moduleKey}"]`;
+    const scope = panel ?? root;
+    const el = scope.querySelector(sel) as HTMLElement | null;
+    if (!el) {
+      new Notice("当前无对应告警模块");
+      return;
+    }
+    const collapseHost = (panel ?? el.closest(".rslatte-hub-alert-panel")) as HTMLElement | null;
+    if (collapseHost) {
+      for (const d of collapseHost.querySelectorAll(".rslatte-hub-alert-module")) {
+        (d as HTMLDetailsElement).open = false;
+      }
+    }
+    (el as HTMLDetailsElement).open = true;
+    el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    el.addClass("rslatte-hub-alert-module--flash");
+    window.setTimeout(() => el.removeClass("rslatte-hub-alert-module--flash"), 1200);
+  }
+
+  /** 整行点击：打开对应侧栏（非当前空间先 Notice） */
+  private openHubModuleRow(spaceId: string, moduleKey: string): void {
+    const cur = this.plugin.getCurrentSpaceId();
+    if (spaceId !== cur) {
+      new Notice("请先切换到该空间后再从工作台打开侧栏模块");
+      return;
+    }
+    const p = this.plugin as any;
+    switch (moduleKey) {
+      case "journal":
+        void p.activateRSLatteView?.({ inspectSection: "journal" });
+        break;
+      case "task":
+        void p.activateTaskView?.({ subTab: "task" });
+        break;
+      case "memo":
+        void p.activateTaskView?.({ subTab: "memo" });
+        break;
+      case "schedule":
+        void p.activateTaskView?.({ subTab: "schedule" });
+        break;
+      case "checkin":
+        void p.activateCheckinView?.();
+        break;
+      case "finance":
+        void p.activateFinanceView?.();
+        break;
+      case "health":
+        void p.activateHealthView?.();
+        break;
+      case "project":
+        void p.activateProjectView?.();
+        break;
+      case "output":
+        void p.activateOutputView?.();
+        break;
+      case "contacts":
+        void p.activateContactsView?.();
+        break;
+      default:
+        break;
+    }
+  }
+
+  private formatHubModuleStatsText(moduleKey: string, entry: RSLatteSpaceStatsModuleEntryV1): string {
+    const primary = StatusCalculationService.hubPrimaryKpiLine(moduleKey, entry.kpi);
+    if (primary) return primary;
+    return this.formatModuleStats(entry);
+  }
+
+  private appendHubSpaceCard(
+    grid: HTMLElement,
+    pack: { space: any; stats: RSLatteSpaceStatsFileV1 | null; diaryExists: boolean; journalSnapshot: HubJournalSnapshot },
+    curSpaceId: string,
+    seq: number
+  ): void {
+    if (seq !== this._renderSeq) return;
+    const { space, stats, journalSnapshot } = pack;
+    if (this.plugin.isDebugLogEnabled()) {
+      console.log(`[RSLatte][Hub][DEBUG] Rendering space: id=${space.id}, name=${space.name}`);
+    }
+    const card = grid.createDiv({ cls: "rslatte-hub-card" });
+    if (space.id === curSpaceId) card.addClass("rslatte-hub-card-active");
+
+    const top = card.createDiv({ cls: "rslatte-hub-card-top" });
+    top.createDiv({ cls: "rslatte-hub-card-title", text: space.name || space.id });
+    const topRight = top.createDiv({ cls: "rslatte-hub-card-top-right" });
+    if (space.id === curSpaceId) {
+      const btnCurrent = topRight.createEl("button", { text: "当前", cls: "rslatte-hub-card-current-btn" });
+      btnCurrent.addClass("rslatte-hub-card-current");
+    } else {
+      const btnSwitchCard = topRight.createEl("button", { text: "切换到此空间", cls: "rslatte-hub-card-switch-btn" });
+      btnSwitchCard.onclick = () => {
+        void ((this.plugin as any).switchSpace?.(space.id, { source: "hub" }) ?? Promise.resolve());
+      };
+    }
+
+    const modulesList = card.createDiv({ cls: "rslatte-hub-card-modules rslatte-hub-modules-compact" });
+
+    const attachChipClick = (chip: HTMLElement, moduleKey: string, isEnabled: boolean) => {
+      chip.addClass("rslatte-hub-mod-chip--actionable");
+      chip.title = isEnabled
+        ? "单击定位下方空间告警中该模块；Alt+单击打开侧栏"
+        : "单击定位下方空间告警（模块已关闭）；Alt+单击不可用";
+      chip.onclick = (ev: MouseEvent) => {
+        if (ev.altKey && isEnabled) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.openHubModuleRow(space.id, moduleKey);
+          return;
+        }
+        this.scrollHubAlertIntoView(space.id, moduleKey);
+      };
+    };
+
+    for (const moduleKey of HUB_CARD_MODULE_KEYS) {
+      const entry = stats?.modules?.[moduleKey] as RSLatteSpaceStatsModuleEntryV1 | undefined;
+      const isEnabled = this.isModuleEnabledInSpace(moduleKey, space.id);
+      if (this.plugin.isDebugLogEnabled() && moduleKey === "finance") {
+        console.log(`[RSLatte][Hub][DEBUG] Module ${moduleKey} in space ${space.id}: isEnabled=${isEnabled}, hasEntry=${!!entry}`);
+      }
+      if (!isEnabled && !entry) continue;
+
+      const displayEntry: RSLatteSpaceStatsModuleEntryV1 = entry || {
+        updated_at: "",
+        module_key: moduleKey as any,
+        sync_status: "off",
+        pending_count: 0,
+        failed_count: 0,
+        counts: {},
+        kpi: {},
+      };
+      const syncStatus = (displayEntry.sync_status || "unknown") as RSLatteSpaceStatsSyncStatus;
+      const contentLevel = isEnabled ? StatusCalculationService.hubContentLevel(moduleKey, displayEntry.kpi) : 2;
+      const contentEmoji = isEnabled ? StatusCalculationService.hubContentEmojiFromLevel(contentLevel) : "🟠";
+      const syncEmoji = StatusCalculationService.hubSyncEmoji(syncStatus);
+
+      const chip = modulesList.createDiv({ cls: "rslatte-hub-mod-chip" });
+      chip.dataset.rslatteHubRowSpace = space.id;
+      chip.dataset.rslatteHubRowModule = moduleKey;
+      attachChipClick(chip, moduleKey, isEnabled);
+
+      const contentLight = chip.createSpan({ cls: "rslatte-hub-light rslatte-hub-light--content", text: contentEmoji });
+      contentLight.title = isEnabled
+        ? StatusCalculationService.hubContentTooltip(moduleKey, displayEntry.kpi, contentLevel)
+        : "模块未启用";
+      contentLight.setAttribute("aria-label", contentLight.title);
+
+      chip.createSpan({ cls: "rslatte-hub-mod-chip-name", text: this.getModuleLabel(moduleKey) });
+
+      const syncLight = chip.createSpan({ cls: "rslatte-hub-light rslatte-hub-light--sync", text: syncEmoji });
+      syncLight.title = StatusCalculationService.hubSyncTooltip(syncStatus, displayEntry);
+      syncLight.setAttribute("aria-label", syncLight.title);
+    }
+
+    {
+      const chip = modulesList.createDiv({
+        cls: "rslatte-hub-mod-chip rslatte-hub-mod-chip--journal rslatte-hub-mod-chip--actionable",
+      });
+      chip.dataset.rslatteHubRowSpace = space.id;
+      chip.dataset.rslatteHubRowModule = "journal";
+      chip.title = "单击定位下方「日记」告警；Alt+单击打开今日打卡·日记";
+      chip.onclick = (ev: MouseEvent) => {
+        if (ev.altKey) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.openHubModuleRow(space.id, "journal");
+          return;
+        }
+        this.scrollHubAlertIntoView(space.id, "journal");
+      };
+      const jLevel = hubJournalContentLevel(journalSnapshot);
+      const journalEmoji = journalSnapshot.fileExists
+        ? StatusCalculationService.hubContentEmojiFromLevel(jLevel)
+        : "⚪";
+      const journalIcon = chip.createSpan({
+        cls: "rslatte-hub-light rslatte-hub-light--content rslatte-hub-light--journal",
+        text: journalEmoji,
+      });
+      journalIcon.title = !journalSnapshot.fileExists
+        ? "今日日记未创建"
+        : journalSnapshot.meaningfulChars > HUB_JOURNAL_MEANINGFUL_OK_THRESHOLD
+          ? `今日日记有效字 ${journalSnapshot.meaningfulChars}（已达标）`
+          : journalSnapshot.meaningfulChars > 0
+            ? `今日日记有效字 ${journalSnapshot.meaningfulChars}（未达 ${HUB_JOURNAL_MEANINGFUL_OK_THRESHOLD}）`
+            : "今日日记无实质内容";
+      journalIcon.setAttribute("aria-label", journalIcon.title);
+      chip.createSpan({ cls: "rslatte-hub-mod-chip-name", text: this.getModuleLabel("journal") });
+    }
   }
 
   private async render() {
@@ -436,25 +895,51 @@ export class SpaceHubView extends ItemView {
     container.addClass("rslatte-hub");
 
     const header = container.createDiv({ cls: "rslatte-hub-header" });
-    header.createDiv({ cls: "rslatte-hub-title", text: "RSLatte Hub" });
-    
+    const titleWrap = header.createDiv({ cls: "rslatte-hub-title-wrap" });
+    titleWrap.createDiv({ cls: "rslatte-hub-title", text: "RSLatte工作台" });
+    titleWrap.createDiv({ cls: "rslatte-hub-subtitle rslatte-muted", text: "空间与工作流入口" });
     const headerRight = header.createDiv({ cls: "rslatte-hub-header-right" });
     const curSpaceId = this.plugin.getCurrentSpaceId();
     const curSpaceConfig = this.plugin.getSpaceConfig(curSpaceId);
     const curName = curSpaceConfig?.name ?? curSpaceId;
     headerRight.createSpan({ cls: "rslatte-hub-sub", text: `当前：${curName}` });
 
-    const btnRefresh = headerRight.createEl("button", { text: "刷新" });
+    const btnRefresh = headerRight.createEl("button", { text: "全部刷新" });
     btnRefresh.addClass("mod-cta");
+    btnRefresh.title = "并行刷新所有空间中已启用模块的 space.json（强制从队列取数）";
     btnRefresh.onclick = () => this.refresh();
 
     const btnSwitch = headerRight.createEl("button", { text: "切换空间" });
     btnSwitch.onclick = () => this.plugin.openSpaceSwitcher();
 
+    const workflowSection = container.createDiv({ cls: "rslatte-hub-workflow" });
+    workflowSection.createDiv({ cls: "rslatte-hub-workflow-title", text: "工作流" });
+    const workflowBtns = workflowSection.createDiv({ cls: "rslatte-hub-workflow-btns" });
+    const btnCalendar = workflowBtns.createEl("button", {
+      text: "日程日历",
+      cls: "rslatte-hub-workflow-btn",
+    });
+    btnCalendar.title = "打开日程日历侧栏";
+    btnCalendar.onclick = () => void this.plugin.activateCalendarView();
+    const btnTodayInspect = workflowBtns.createEl("button", {
+      text: "今日打卡",
+      cls: "rslatte-hub-workflow-btn",
+    });
+    btnTodayInspect.title = "打开今日打卡侧栏（打卡、财务、健康、日记等）";
+    btnTodayInspect.onclick = () => void this.plugin.activateRSLatteView();
+    for (const id of WORKFLOW_VIEW_IDS) {
+      const btn = workflowBtns.createEl("button", {
+        text: WORKFLOW_VIEW_LABELS[id],
+        cls: "rslatte-hub-workflow-btn",
+      });
+      btn.onclick = () => {
+        void (this.plugin as any).activateWorkflowView?.(id as WorkflowViewId);
+      };
+    }
+
     const grid = container.createDiv({ cls: "rslatte-hub-grid" });
 
-    // List all spaces
-    const spaces = ((this.plugin as any).listSpaces?.() ?? []);
+    const spaces = ((this.plugin as any).listSpaces?.() ?? []) as any[];
 
     if (seq !== this._renderSeq) return;
 
@@ -462,366 +947,59 @@ export class SpaceHubView extends ItemView {
       const empty = grid.createDiv({ cls: "rslatte-hub-empty" });
       empty.createDiv({ text: "未配置任何空间" });
       empty.createDiv({ cls: "rslatte-muted", text: "请在设置页的「空间管理」中创建空间" });
+      const alertsEmpty = container.createDiv({ cls: "rslatte-hub-alerts" });
+      this.fillHubAlertsSection(alertsEmpty, []);
       return;
     }
 
-    // Create a card for each space with module statistics
+    const hubInputRows: HubAlertInputRow[] = [];
+    const loadedPacks: Array<{
+      space: any;
+      stats: RSLatteSpaceStatsFileV1 | null;
+      diaryExists: boolean;
+      journalSnapshot: HubJournalSnapshot;
+    }> = [];
+
+    if (seq !== this._renderSeq) return;
+
     for (const space of spaces) {
-      if (this.plugin.isDebugLogEnabled()) {
-        console.log(`[RSLatte][Hub][DEBUG] Rendering space: id=${space.id}, name=${space.name}`);
+      const pack = await this.loadStatsForHubSpace(space, seq);
+      if (!pack) return;
+      if (this.plugin.isDebugLogEnabled() && pack.stats?.modules) {
+        const checkinStats = pack.stats.modules.checkin;
+        const financeStats = pack.stats.modules.finance;
+        if (checkinStats) console.log(`[RSLatte][Hub][DEBUG] Space ${space.id} (${space.name}) checkin stats:`, checkinStats.counts);
+        if (financeStats) console.log(`[RSLatte][Hub][DEBUG] Space ${space.id} (${space.name}) finance stats:`, financeStats.counts);
       }
-      const card = grid.createDiv({ cls: "rslatte-hub-card" });
-      if (space.id === curSpaceId) {
-        card.addClass("rslatte-hub-card-active");
-      }
-
-      const top = card.createDiv({ cls: "rslatte-hub-card-top" });
-      top.createDiv({ cls: "rslatte-hub-card-title", text: space.name || space.id });
-      
-      // 右上角按钮区域
-      const topRight = top.createDiv({ cls: "rslatte-hub-card-top-right" });
-      
-      if (space.id === curSpaceId) {
-        // 当前空间：显示"当前"标记（按钮样式，白底绿字）
-        const btnCurrent = topRight.createEl("button", { text: "当前", cls: "rslatte-hub-card-current-btn" });
-        btnCurrent.addClass("rslatte-hub-card-current");
-      } else {
-        // 非当前空间：显示"切换到此空间"按钮
-        const btnSwitch = topRight.createEl("button", { text: "切换到此空间", cls: "rslatte-hub-card-switch-btn" });
-        btnSwitch.onclick = () => {
-          void ((this.plugin as any).switchSpace?.(space.id, { source: "hub" }) ?? Promise.resolve());
-        };
-      }
-
-      // Load statistics for this space
-      let stats = await this.readSpaceStats(space.id);
-      if (stats && stats.modules) {
-        const checkinStats = stats.modules.checkin;
-        const financeStats = stats.modules.finance;
-        if (this.plugin.isDebugLogEnabled()) {
-          if (checkinStats) {
-            console.log(`[RSLatte][Hub][DEBUG] Space ${space.id} (${space.name}) checkin stats:`, checkinStats.counts);
-          }
-          if (financeStats) {
-            console.log(`[RSLatte][Hub][DEBUG] Space ${space.id} (${space.name}) finance stats:`, financeStats.counts);
-          }
-        }
-      }
-      
-      // 检查是否需要刷新统计数据
-      // 1. 统计文件不存在
-      // 2. 统计文件为空（没有模块数据）
-      // 3. 统计文件中缺少启用的模块数据（数据不完整）
-      let needsRefresh = !stats || !stats.modules || Object.keys(stats.modules).length === 0;
-      
-      if (!needsRefresh && stats && stats.modules) {
-        // 检查是否所有启用的模块都有数据
-        const enabledModules: string[] = [];
-        const moduleKeys = ["task", "memo", "checkin", "finance", "project", "output", "contacts", "publish"];
-        for (const key of moduleKeys) {
-          try {
-            // 使用统一的模块启用检查方法，传入 spaceId
-            if (this.isModuleEnabledInSpace(key, space.id)) {
-              enabledModules.push(key);
-            }
-          } catch {
-            // ignore
-          }
-        }
-        
-        // 如果某个启用的模块在统计文件中没有数据，需要刷新
-        for (const key of enabledModules) {
-          if (!stats.modules[key]) {
-            if (this.plugin.isDebugLogEnabled()) {
-              console.log(`[RSLatte][Hub][DEBUG] Module ${key} is enabled but missing in stats file for space ${space.id}`);
-            }
-            needsRefresh = true;
-            break;
-          }
-        }
-      }
-      
-      // If no stats file exists or stats are incomplete, try to refresh stats from module files
-      if (needsRefresh) {
-        try {
-          const ctx = this.plugin.getSpaceCtx(space.id);
-          const statsService = new SpaceStatsService(this.plugin);
-          // 获取所有启用的模块
-          const enabledModules: string[] = [];
-          const moduleKeys = ["task", "memo", "checkin", "finance", "project", "output", "contacts", "publish"];
-          for (const key of moduleKeys) {
-            try {
-              // 使用统一的模块启用检查方法，传入 spaceId
-              if (this.isModuleEnabledInSpace(key, space.id)) {
-                enabledModules.push(key);
-              }
-            } catch {
-              // ignore
-            }
-          }
-          
-          // ✅ 如果所有模块都关闭了，跳过刷新，避免触发事件导致无限循环
-          if (enabledModules.length === 0) {
-            if (this.plugin.isDebugLogEnabled()) {
-              console.log(`[RSLatte][Hub] All modules disabled for space ${space.id}, skipping refresh to avoid infinite loop`);
-            }
-            // 不刷新，直接使用空的统计数据
-            stats = {
-              schema_version: 1,
-              updated_at: new Date().toISOString(),
-              vault_id: ctx.vaultId,
-              space_id: ctx.spaceId,
-              modules: {},
-              agg: { pending_total: 0, failed_total: 0, modules_enabled: 0 },
-            };
-          } else {
-            await statsService.refreshSpaceStats(ctx, enabledModules as any);
-            // Re-read after refresh
-            stats = await this.readSpaceStats(space.id);
-          }
-        } catch (e) {
-          console.warn(`[RSLatte][Hub] Failed to refresh stats for space ${space.id}:`, e);
-        }
-      }
-      
-      // 对于发布模块，需要单独获取数据（因为发布模块不在 spaceStatsService 中处理）
-      // 无论是否需要刷新其他模块，都要检查发布模块的数据
-      if (this.isModuleEnabledInSpace("publish", space.id)) {
-        try {
-          // 如果 stats 还没有初始化，先初始化
-          if (!stats) {
-            const ctx = this.plugin.getSpaceCtx(space.id);
-            stats = {
-              schema_version: 1,
-              updated_at: new Date().toISOString(),
-              vault_id: ctx.vaultId,
-              space_id: ctx.spaceId,
-              modules: {},
-              agg: { pending_total: 0, failed_total: 0, modules_enabled: 0 },
-            };
-          }
-          
-          // 检查是否需要更新发布模块的数据（如果数据不存在或已过期）
-          const publishEntry = stats.modules?.publish;
-          const needsUpdate = !publishEntry || 
-            (publishEntry.updated_at && Date.now() - new Date(publishEntry.updated_at).getTime() > 30_000); // 30秒过期
-          
-          if (needsUpdate) {
-            await this.plugin.publishRSLatte?.refreshIndexIfStale(30_000);
-            const publishSnap = await this.plugin.publishRSLatte?.getSnapshot();
-            if (publishSnap?.items) {
-              const itemsAll = publishSnap.items as any[];
-              const publishedCount = itemsAll.filter((it: any) => it.publishType && it.publishType.trim() !== "").length;
-              const unpublishedCount = itemsAll.length - publishedCount;
-              
-              if (!stats.modules) stats.modules = {};
-              
-              // 创建或更新发布模块的统计数据
-              stats.modules.publish = {
-                updated_at: new Date().toISOString(),
-                module_key: "publish",
-                sync_status: "off", // 发布模块不支持数据库同步
-                pending_count: 0,
-                failed_count: 0,
-                counts: {
-                  total: itemsAll.length,
-                  published: publishedCount,
-                  unpublished: unpublishedCount,
-                },
-                kpi: {
-                  publish: {
-                    publishedCount,
-                    unpublishedCount,
-                  },
-                },
-              };
-              
-              // 保存统计数据到文件
-              try {
-                const statsPath = normalizePath(`${resolveSpaceStatsDir(this.plugin.settings, space.id)}/space.json`);
-                const statsDir = normalizePath(statsPath.split("/").slice(0, -1).join("/"));
-                
-                // 确保目录存在（递归创建）
-                if (statsDir) {
-                  const parts = statsDir.split("/").filter(Boolean);
-                  let cur = "";
-                  for (const seg of parts) {
-                    cur = cur ? `${cur}/${seg}` : seg;
-                    try {
-                      const exists = await this.app.vault.adapter.exists(cur);
-                      if (!exists) {
-                        await this.app.vault.createFolder(cur);
-                      }
-                    } catch (e: any) {
-                      const msg = String(e?.message ?? e);
-                      if (msg.includes("Folder already exists") || msg.includes("EEXIST")) continue;
-                      // 继续尝试创建其他目录
-                    }
-                  }
-                }
-                
-                // 写入文件
-                const text = JSON.stringify(stats, null, 2);
-                const fileExists = await this.app.vault.adapter.exists(statsPath);
-                if (fileExists) {
-                  await this.app.vault.adapter.write(statsPath, text);
-                } else {
-                  await this.app.vault.create(statsPath, text);
-                }
-              } catch (writeErr) {
-                console.warn(`[RSLatte][Hub] Failed to save publish stats for space ${space.id}:`, writeErr);
-              }
-            }
-          }
-        } catch (e) {
-          console.warn(`[RSLatte][Hub] Failed to get publish stats for space ${space.id}:`, e);
-        }
-      }
-      
-      // 显示所有模块（包括未启用的模块）
-      const modulesList = card.createDiv({ cls: "rslatte-hub-card-modules" });
-      
-      // 日记状态行（显示在每个空间的最前面）
-      {
-        const todayKey = this.plugin.getTodayKey();
-        const spaceSnapshot = space.settingsSnapshot as any;
-        const spaceDiaryPath = spaceSnapshot?.diaryPath;
-        const spaceDiaryNameFormat = spaceSnapshot?.diaryNameFormat;
-        
-        // 临时设置日记配置覆盖（按空间）
-        const originalPathOverride = (this.plugin.journalSvc as any)._diaryPathOverride;
-        const originalFormatOverride = (this.plugin.journalSvc as any)._diaryNameFormatOverride;
-        try {
-          this.plugin.journalSvc.setDiaryPathOverride(
-            spaceDiaryPath || null,
-            spaceDiaryNameFormat || null
-          );
-          
-          // 检查今日日记是否存在
-          const todayDiaryFile = this.plugin.journalSvc.findDiaryFileForDateKey(todayKey);
-          const diaryExists = !!todayDiaryFile;
-          
-          const journalRow = modulesList.createDiv({ cls: "rslatte-hub-module-row" });
-          const journalLeft = journalRow.createDiv({ cls: "rslatte-hub-module-left" });
-          
-          // 状态图标：未创建 → ⚪，已创建 → 🟢
-          const journalIcon = journalLeft.createSpan({ 
-            cls: "rslatte-hub-module-icon", 
-            text: diaryExists ? "🟢" : "⚪"
-          });
-          journalIcon.title = diaryExists ? "今日日记已创建" : "今日日记未创建";
-          journalIcon.setAttribute("aria-label", journalIcon.title);
-          
-          // 模块名称
-          const journalNameContainer = journalLeft.createSpan({ cls: "rslatte-hub-module-name-container" });
-          journalNameContainer.createSpan({ cls: "rslatte-hub-module-name", text: "日记" });
-          
-          // 右侧状态文本
-          const journalRight = journalRow.createDiv({ cls: "rslatte-hub-module-right" });
-          journalRight.createDiv({ 
-            cls: "rslatte-hub-module-stats", 
-            text: diaryExists ? "今日已创建" : "今日未创建"
-          });
-        } finally {
-          // 恢复原始日记配置
-          this.plugin.journalSvc.setDiaryPathOverride(originalPathOverride, originalFormatOverride);
-        }
-      }
-      
-      // 定义所有可能的模块键（按顺序）
-      const allModuleKeys = ["checkin", "contacts", "finance", "memo", "output", "project", "publish", "task"];
-      
-      // 遍历所有可能的模块，确保即使统计文件中没有数据，未启用的模块也能显示
-      for (const moduleKey of allModuleKeys) {
-        const entry = stats?.modules?.[moduleKey] as RSLatteSpaceStatsModuleEntryV1 | undefined;
-        const isEnabled = this.isModuleEnabledInSpace(moduleKey, space.id);
-        
-        // ✅ 调试日志：检查模块启用状态
-        if (this.plugin.isDebugLogEnabled() && moduleKey === "finance") {
-          console.log(`[RSLatte][Hub][DEBUG] Module ${moduleKey} in space ${space.id}: isEnabled=${isEnabled}, hasEntry=${!!entry}`);
-        }
-        
-        // 如果模块启用但统计文件中没有数据，跳过（可能是数据还在生成中，避免显示空白）
-        if (isEnabled && !entry) {
-          continue;
-        }
-
-        const moduleRow = modulesList.createDiv({ cls: "rslatte-hub-module-row" });
-        
-        const moduleLeft = moduleRow.createDiv({ cls: "rslatte-hub-module-left" });
-        
-        // 创建状态图标（如果模块未启用，使用空 entry 但会显示灰色圆圈）
-        const displayEntry: RSLatteSpaceStatsModuleEntryV1 = entry || {
-          updated_at: "",
-          module_key: moduleKey as any,
-          sync_status: "off",
-          pending_count: 0,
-          failed_count: 0,
-          counts: {},
-          kpi: {},
-        };
-        
-        const statusIcon = moduleLeft.createSpan({ 
-          cls: "rslatte-hub-module-icon", 
-          text: this.getModuleStatusIcon(moduleKey, displayEntry, space.id) 
-        });
-        // 添加 tooltip 说明状态灯含义（同时显示业务状态和同步状态）
-        statusIcon.title = this.getModuleStatusTooltip(moduleKey, displayEntry, space.id);
-        statusIcon.setAttribute("aria-label", this.getModuleStatusTooltip(moduleKey, displayEntry, space.id));
-        
-        // 模块名称和状态标记
-        const moduleNameContainer = moduleLeft.createSpan({ cls: "rslatte-hub-module-name-container" });
-        moduleNameContainer.createSpan({ cls: "rslatte-hub-module-name", text: this.getModuleLabel(moduleKey) });
-        
-        // 如果模块未启用，显示"模块已关闭"标记
-        //if (!isEnabled) {
-        //  const disabledTag = moduleNameContainer.createSpan({ 
-        //    cls: "rslatte-hub-module-disabled-tag", 
-        //    text: "（模块已关闭）" 
-        //  });
-        //  disabledTag.style.marginLeft = "4px";
-        //  disabledTag.style.fontSize = "0.85em";
-        //  disabledTag.style.color = "var(--text-muted)";
-        //}
-
-        const moduleRight = moduleRow.createDiv({ cls: "rslatte-hub-module-right" });
-        
-        // ✅ 如果模块未启用，无论是否有历史数据，都显示"模块已关闭"
-        if (!isEnabled) {
-          moduleRight.createDiv({ 
-            cls: "rslatte-hub-module-stats", 
-            text: "模块已关闭" 
-          });
-        } else if (entry) {
-          // 模块已启用且有统计数据，显示统计数据
-          moduleRight.createDiv({ 
-            cls: "rslatte-hub-module-stats", 
-            text: this.formatModuleStats(entry) 
-          });
-        } else {
-          // 启用的模块但没有数据（不应该出现，但为了安全）
-          moduleRight.createDiv({ 
-            cls: "rslatte-hub-module-stats", 
-            text: "暂无数据" 
-          });
-        }
-      }
-      
-      // 显示聚合信息（仅当有统计数据时）
-      if (stats && stats.modules && Object.keys(stats.modules).length > 0) {
-
-        // Aggregate info
-        if (stats.agg) {
-          const { pending_total, failed_total } = stats.agg;
-          if (pending_total > 0 || failed_total > 0) {
-            const agg = card.createDiv({ cls: "rslatte-hub-card-agg" });
-            if (pending_total > 0) agg.createSpan({ text: `待同步: ${pending_total}` });
-            if (failed_total > 0) agg.createSpan({ text: `失败: ${failed_total}`, cls: "rslatte-hub-error" });
-          }
-        }
-      } else {
-        card.createDiv({ cls: "rslatte-muted", text: "暂无统计数据" });
-      }
+      loadedPacks.push(pack);
+      hubInputRows.push({
+        spaceId: space.id,
+        spaceName: space.name || space.id,
+        isCurrent: space.id === curSpaceId,
+        diaryExists: pack.diaryExists,
+        stats: pack.stats,
+        enabledModules: this.listEnabledHubModules(space.id),
+        journalSnapshot: pack.journalSnapshot,
+      });
     }
+
+    const curPackIdx = loadedPacks.findIndex((p) => p.space.id === curSpaceId);
+    if (curPackIdx > 0) {
+      const curPack = loadedPacks.splice(curPackIdx, 1)[0];
+      if (curPack) loadedPacks.unshift(curPack);
+    }
+
+    if (seq !== this._renderSeq) return;
+
+    await this.enrichHubInputRowsWithAnalysisIndices(hubInputRows);
+    if (seq !== this._renderSeq) return;
+
+    for (const pack of loadedPacks) {
+      this.appendHubSpaceCard(grid, pack, curSpaceId, seq);
+    }
+
+    if (seq !== this._renderSeq) return;
+    const alertsSection = container.createDiv({ cls: "rslatte-hub-alerts" });
+    this.fillHubAlertsSection(alertsSection, hubInputRows);
   }
 }

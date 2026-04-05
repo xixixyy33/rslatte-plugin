@@ -8,6 +8,8 @@ export type ApiCheckinType = {
   status: boolean;
   order_no: number;
   created_at: string;
+  /** 侧栏扩展（难度、热力色等），与 `checkin_type.meta_sync` 对齐 */
+  meta_sync?: Record<string, unknown> | null;
 };
 
 export type ApiFinanceCategory = {
@@ -17,12 +19,20 @@ export type ApiFinanceCategory = {
   status: boolean;
   order_no: number;
   created_at: string;
+  /** 子分类（列表接口解析后的数组） */
+  sub_categories?: string[];
+  /** 机构名（列表接口解析后的数组） */
+  institution_names?: string[];
 };
 
 export type ApiFinanceRecord = {
   id: number;
   record_date: string;        // YYYY-MM-DD
   category_id: string;
+  /** 与本地索引 entryId 对齐；后端未返回时由插件生成并仅用于本地 */
+  entry_id?: string;
+  /** 与日记 meta.cycle_id / 周期表行 ID 对齐 */
+  cycle_id?: string;
   amount: number;             // signed
   note?: string;
   is_delete?: boolean;
@@ -37,6 +47,28 @@ export type ApiCheckinRecord = {
   note?: string;
   is_delete?: boolean;
   created_at: string;
+  /** 连续天数等摘要，与 `checkin_records.meta_sync` 对齐 */
+  meta_sync?: Record<string, unknown> | null;
+};
+
+/** 与 `health_records` 表及 `health-record-index` 对齐 */
+export type ApiHealthRecord = {
+  id: number;
+  record_date: string;
+  metric_key: string;
+  entry_id?: string | null;
+  period?: string;
+  card_ref?: string | null;
+  value_str?: string;
+  note?: string;
+  sleep_start_hm?: string | null;
+  source_file_path?: string | null;
+  source_line_main?: number | null;
+  created_at_ms?: number | null;
+  meta_sync?: Record<string, unknown> | null;
+  is_delete?: boolean;
+  created_at?: string;
+  updated_at?: string;
 };
 
 // =========================
@@ -65,14 +97,23 @@ export type RSLatteItemPayload = {
   scheduled_date?: string;
   done_date?: string;
   cancelled_date?: string;
+  /** 任务：服务端生成列，仅响应只读 */
+  completed_date?: string;
 
   // memo fields
   memo_date?: string;
   memo_mmdd?: string;
-  repeat_rule?: "none" | "weekly" | "monthly" | "seasonly" | "yearly";
+  repeat_rule?: "none" | "weekly" | "monthly" | "quarterly" | "yearly";
   remind_days?: number;
   priority?: number;
   last_notified_date?: string;
+
+  cat?: string;
+  memo_lunar_mmdd?: string;
+  memo_leap?: boolean;
+  meta_extra?: Record<string, unknown>;
+  /** 侧栏扩展 JSON（白名单）；与 `rslatte_task.meta_sync` / `rslatte_memo.meta_sync` 对齐 */
+  meta_sync?: Record<string, unknown>;
 };
 
 // =========================
@@ -90,6 +131,58 @@ export type RSLatteUpsertResult = {
 };
 
 export type RSLatteItemsUpsertBatchResp = { results: RSLatteUpsertResult[] };
+
+// =========================
+// Schedules（日程 schedule-index → rslatte_schedule）
+// =========================
+
+export type ScheduleUpsertPayload = {
+  uid: string;
+  status?: RSLatteStatus;
+  text: string;
+  raw?: string;
+  file_path: string;
+  line_no: number;
+  source_hash?: string;
+  schedule_date: string;
+  start_time?: string;
+  end_time?: string;
+  duration_min?: number;
+  schedule_category?: string;
+  linked_task_uid?: string;
+  linked_output_id?: string;
+  meta_sync?: Record<string, unknown>;
+};
+
+export type SchedulesUpsertBatchReq = { items: ScheduleUpsertPayload[] };
+
+export type ScheduleUpsertResult = {
+  ok: boolean;
+  uid?: string;
+  item_type?: "schedule";
+  item_id?: number;
+  error?: string;
+  error_code?: string;
+};
+
+export type SchedulesUpsertBatchResp = { ok?: boolean; results: ScheduleUpsertResult[] };
+
+export type SchedulesExistsReq = { ids: number[] };
+
+export type SchedulesExistsResp = { missing: number[] };
+
+export type SchedulesReconcileReq = {
+  scope_file_paths: string[];
+  present_uids: string[];
+  dry_run?: boolean;
+};
+
+export type SchedulesReconcileResp = {
+  type: string;
+  dry_run: boolean;
+  missing_uids: string[];
+  updated: number;
+};
 
 export type RSLatteSyncOp = {
   op_id: string;
@@ -173,7 +266,7 @@ export type RecordReconcileReq = {
   scope_file_paths?: string[];
   /** Preferred: YYYY-MM-DD dates in the rebuild scope. */
   scope_dates?: string[];
-  /** Composite keys like 'YYYY-MM-DD|CK_xxx' (checkin) or 'YYYY-MM-DD|CAT_xxx' (finance). */
+  /** Composite keys：打卡 `YYYY-MM-DD|CK_xxx`；财务 legacy `YYYY-MM-DD|CAT_xxx`，有 entry_id 时为 `YYYY-MM-DD|CAT_xxx|<entry_id>`。 */
   present_comp_keys: string[];
   dry_run?: boolean;
 };
@@ -200,6 +293,24 @@ export type OutputFilesReconcileResp = {
   keep_paths?: number;
   marked_deleted?: number;
   candidates?: number;
+};
+
+/** POST /output-files/sync 单条文件（与后端 OutputFileIn 对齐） */
+export type OutputFilesSyncFile = {
+  output_id?: string;
+  file_path: string;
+  file_name: string;
+  doc_category: string;
+  status: "todo" | "in-progress" | "done" | "cancelled";
+  type?: string | null;
+  tags?: string[];
+  domains?: string[];
+  created_time?: string | null;
+  modified_time?: string | null;
+  done_time?: string | null;
+  cancelled_date?: string | null;
+  extra?: Record<string, unknown>;
+  meta_sync?: Record<string, unknown>;
 };
 
 export type ProjectsReconcileReq = {
@@ -234,6 +345,8 @@ export type UpsertCheckinRecordReq = {
   note?: string;
   /** 软删标记：false=有效打卡，true=取消打卡 */
   is_delete: boolean;
+  /** 未发送则不覆盖库内原值 */
+  meta_sync?: Record<string, unknown> | null;
 };
 
 export type UpsertFinanceRecordReq = {
@@ -241,6 +354,10 @@ export type UpsertFinanceRecordReq = {
   category_id: string;
   amount: number;
   note?: string;
+  /** 与日记 meta.entry_id 对齐；有则按 entry_id upsert，可多笔同日同分类 */
+  entry_id?: string;
+  /** 与日记 meta.cycle_id 对齐 */
+  cycle_id?: string;
   /** 软删标记：false=有效记录，true=取消当日账单 */
   is_delete: boolean;
 };
@@ -255,6 +372,113 @@ export type UpsertCheckinRecordBatchReq = {
 
 export type UpsertFinanceRecordBatchReq = {
   items: UpsertFinanceRecordReq[];
+};
+
+export type UpsertHealthRecordReq = {
+  record_date: string;
+  metric_key: string;
+  period?: string;
+  card_ref?: string;
+  value_str?: string;
+  note?: string;
+  sleep_start_hm?: string;
+  source_file_path?: string;
+  source_line_main?: number;
+  created_at_ms?: number;
+  meta_sync?: Record<string, unknown> | null;
+  is_delete: boolean;
+  entry_id?: string;
+};
+
+export type UpsertHealthRecordBatchReq = {
+  items: UpsertHealthRecordReq[];
+};
+
+export type UpsertKnowledgeDocReq = {
+  file_path: string;
+  basename?: string;
+  mtime_ms?: number;
+  knowledge_root?: string;
+  output_id?: string;
+  knowledge_bucket?: string;
+  published_at?: string;
+  published_space_id?: string;
+  doc_category?: string;
+  type?: string;
+  output_document_kind?: string;
+  source_create?: string;
+  domains?: string[];
+  meta_sync?: Record<string, unknown> | null;
+  is_delete?: boolean;
+};
+
+export type UpsertKnowledgeDocBatchReq = {
+  items: UpsertKnowledgeDocReq[];
+};
+
+export type KnowledgeDocsReconcileReq = {
+  knowledge_root?: string;
+  scope_path_prefixes?: string[];
+  present_file_paths?: string[];
+  dry_run?: boolean;
+};
+
+export type KnowledgeDocsReconcileResp = {
+  ok: boolean;
+  dry_run?: boolean;
+  prefixes?: number;
+  candidates?: number;
+  keep?: number;
+  marked_deleted?: number;
+};
+
+/** GET /knowledge-docs 行（与后端 `list_knowledge_docs` 一致） */
+export type ApiKnowledgeDoc = {
+  id?: number;
+  vault_id?: string;
+  space_id?: string;
+  file_path: string;
+  basename?: string | null;
+  mtime_ms?: number | null;
+  knowledge_root?: string | null;
+  output_id?: string | null;
+  knowledge_bucket?: string | null;
+  published_at?: string | null;
+  published_space_id?: string | null;
+  doc_category?: string | null;
+  type?: string | null;
+  output_document_kind?: string | null;
+  source_create?: string | null;
+  domains?: string[] | null;
+  meta_sync?: Record<string, unknown> | null;
+  is_delete?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+/** POST /work-events/upsert-batch；payload 为完整 WorkEvent JSON（含 ref/metrics） */
+export type UpsertWorkEventReq = {
+  event_id: string;
+  ts: string;
+  kind: string;
+  action: string;
+  source?: string;
+  summary?: string;
+  payload: Record<string, unknown>;
+};
+
+export type UpsertWorkEventBatchReq = { items: UpsertWorkEventReq[] };
+
+/** GET /work-events 摘要行（手机 / plugin_date） */
+export type ApiWorkEventSummary = {
+  event_id: string;
+  ts_iso: string;
+  kind: string;
+  action: string;
+  source?: string | null;
+  summary?: string | null;
+  ts_sort?: string;
+  created_at?: string;
 };
 
 // =====================
@@ -281,6 +505,8 @@ export type ContactsUpsertItem = {
   birthday?: any | null;
   last_interaction_at?: string | null;
   extra?: any;
+  /** 写入 DB `contacts.profile.meta_sync`；与任务等模块一致，内含 `schema_version` */
+  meta_sync?: Record<string, unknown> | null;
   archived_at?: string | null;
   is_delete?: boolean;
   created_at?: string | null;
@@ -315,6 +541,8 @@ export type BatchUpsertResp<TItem = any> = {
 export type ApiFinanceSummaryStats = {
   kind: "finance_summary";
   as_of: string; // YYYY-MM-DD
+  /** 与请求头 `X-Space-Id` / `finance_records.space_id` 一致 */
+  space_id: string;
   finance: {
     month: { income: number; expense: number };
     year: { income: number; expense: number };
@@ -339,90 +567,11 @@ export type VaultSyncResp =
   | { ok: true; vault_id: string; vault_name_updated?: boolean; spaces_updated?: number }
   | { ok: false; reason?: string };
 
-// =====================
-// 手机端操作记录（PWA 上传，Obsidian 拉取后写入本地 MD）
-// =====================
-
-export type MobileOpKind = "memo" | "task" | "checkin" | "finance" | "project";
-export type MobileOpAction = "create" | "update" | "delete" | "upsert_item";
-
-export type MobileOpPayloadCheckin = {
-  record_date: string; // YYYY-MM-DD
-  checkin_id: string;
-  note?: string;
-  is_delete?: boolean;
-};
-
-export type MobileOpPayloadFinance = {
-  record_date: string;
-  category_id: string;
-  amount: number;
-  note?: string;
-  /** 子分类名称（来自 finance_category.sub_categories），同步到 PC 时会合并进 note */
-  sub_category?: string;
-  is_delete?: boolean;
-};
-
-export type MobileOpPayloadTask = {
-  uid?: string;
-  text: string;
-  status?: string;
-  due_date?: string;
-  file_path?: string;
-  line_no?: number;
-  [key: string]: any;
-};
-
-export type MobileOpPayloadMemo = {
-  text: string;
-  memo_date?: string;
-  remind_days?: number;
-  file_path?: string;
-  [key: string]: any;
-};
-
-/** 手机端项目任务 upsert_item：payload.item 含 item_id、status、source_file_path、source_line 等 */
-export type MobileOpPayloadProject = {
-  project_id: string;
-  item: {
-    item_id: string;
-    item_type: string;
-    status?: string;
-    title?: string;
-    source_file_path?: string;
-    source_line?: number;
-    [key: string]: any;
-  };
-};
-
-export type MobileOp = {
-  id: string;
-  ts: string; // ISO
-  kind: MobileOpKind;
-  action: MobileOpAction;
-  payload: MobileOpPayloadCheckin | MobileOpPayloadFinance | MobileOpPayloadTask | MobileOpPayloadMemo | MobileOpPayloadProject;
-  /** 后端是否已应用到 DB（打卡/财务通常已写入；任务/备忘可能仅记录操作） */
-  applied?: boolean;
-  /** 后端置错信息（如 uid 已存在），该条不应用、不标记已同步，供手机端展示提示 */
-  plugin_sync_error?: string;
-};
-
-export type MobileOpsListReq = {
-  since?: string; // ISO，只返回该时间之后的操作
-  limit?: number;
-};
-
-export type MobileOpsListResp = {
-  ok: boolean;
-  ops: MobileOp[];
-  next_since?: string;
-};
-
 type FetchOpts = {
   timeoutMs?: number;
 };
 
-function joinUrl(base: string, path: string) {
+export function joinApiUrl(base: string, path: string) {
   // NOTE: 用户可能会误把文档里的分隔符（例如 "·"）粘贴进 baseUrl，
   // 例如 "http://192.168.1.40:8008/·"，会导致请求变成 "/·/db/initialized" 并 404。
   // 这里做一次温和清洗：仅去掉末尾的 "/·" 或 "/•" 片段，避免影响正常 URL。
@@ -484,10 +633,40 @@ async function fetchJson<T>(url: string, init?: RequestInit, opts?: FetchOpts): 
   }
 }
 
+/** 合并并发请求时避免相同 401 文案在短时间内重复弹出 */
+let _rslatteLast401NoticeKey = "";
+let _rslatteLast401NoticeAt = 0;
+
+function notifyApiUnauthorized(err: ApiError): void {
+  const detail = err.data?.detail;
+  const code =
+    detail && typeof detail === "object" && "code" in detail
+      ? String((detail as { code?: string }).code ?? "")
+      : "";
+  const msg =
+    err.message ||
+    (detail && typeof detail === "object" && "message" in detail
+      ? String((detail as { message?: string }).message ?? "")
+      : "") ||
+    "鉴权失败，请检查登录状态或重新登录";
+  const key = `${code}|${msg}`;
+  const now = Date.now();
+  if (key === _rslatteLast401NoticeKey && now - _rslatteLast401NoticeAt < 5000) return;
+  _rslatteLast401NoticeKey = key;
+  _rslatteLast401NoticeAt = now;
+  try {
+    new Notice(msg, 10000);
+  } catch {
+    /* 非 Obsidian 环境（测试等）忽略 */
+  }
+}
+
 export type UpsertCheckinTypeReq = {
   checkin_id: string;
   checkin_name: string;
   status: boolean;
+  /** 未发送则不覆盖库内原值 */
+  meta_sync?: Record<string, unknown> | null;
 };
 
 export type UpsertFinanceCategoryReq = {
@@ -495,17 +674,109 @@ export type UpsertFinanceCategoryReq = {
   category_name: string;
   category_type: "income" | "expense";
   status: boolean;
+  sub_categories?: string[];
+  institution_names?: string[];
+};
+
+export type AuthStatusResp = { auth_required: boolean };
+
+export type AuthLoginResp = {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  user_id: string;
+  user_name: string;
+};
+
+/** 供插件主进程注入：凭据读取 + 新 token 落盘（用于 401 与临近过期时静默重新登录） */
+export type AuthRefreshSupport = {
+  getCredentials: () => { userName: string; password: string } | null;
+  persistAccessToken: (token: string) => Promise<void>;
 };
 
 export class RSLatteApiClient {
   private baseUrl: string;
   private vaultId: string | null = null;
   private spaceId: string = DEFAULT_SPACE_ID;
+  /** Bearer token；服务端设置 JWT_SECRET 后必填 */
+  private authToken: string | null = null;
+  private authRefresh: AuthRefreshSupport | null = null;
+  /** 临近过期时主动续期：两次尝试间隔下限（与并发请求共用互斥） */
+  private lastProactiveReauthAttemptAt = 0;
+  private silentReauthPromise: Promise<boolean> | null = null;
 
   constructor(baseUrl: string, vaultId?: string, spaceId?: string) {
     this.baseUrl = baseUrl;
     if (vaultId) this.vaultId = vaultId;
     if (spaceId) this.setSpaceId(spaceId);
+  }
+
+  setAuthToken(token: string | null | undefined) {
+    const t = String(token ?? "").trim();
+    this.authToken = t || null;
+  }
+
+  /** 注入后可于 401 或 JWT 临近过期时自动调用 `/auth/login` 续期并重试请求 */
+  setAuthRefreshSupport(support: AuthRefreshSupport | null) {
+    this.authRefresh = support;
+  }
+
+  getAuthToken(): string | null {
+    return this.authToken;
+  }
+
+  private decodeJwtExpSec(token: string): number | null {
+    try {
+      const parts = token.split(".");
+      if (parts.length < 2) return null;
+      const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const json = atob(b64);
+      const payload = JSON.parse(json);
+      return typeof payload.exp === "number" ? payload.exp : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async doSilentReauth(): Promise<boolean> {
+    const ar = this.authRefresh;
+    if (!ar) return false;
+    const cred = ar.getCredentials();
+    if (!cred?.userName || !cred?.password) return false;
+    try {
+      const r = await this.authLogin(cred.userName, cred.password);
+      const nt = String(r.access_token ?? "").trim();
+      if (!nt) return false;
+      this.setAuthToken(nt);
+      await ar.persistAccessToken(nt);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 合并并行请求：同一段时间仅一次静默登录 */
+  private queueSilentReauth(): Promise<boolean> {
+    if (this.silentReauthPromise) return this.silentReauthPromise;
+    const p = this.doSilentReauth().finally(() => {
+      if (this.silentReauthPromise === p) this.silentReauthPromise = null;
+    });
+    this.silentReauthPromise = p;
+    return p;
+  }
+
+  private async maybeRefreshTokenProactively(): Promise<void> {
+    if (!this.authRefresh || !this.authToken) return;
+    const cred = this.authRefresh.getCredentials();
+    if (!cred?.userName || !cred?.password) return;
+    const exp = this.decodeJwtExpSec(this.authToken);
+    if (exp == null) return;
+    const ttlSec = exp - Date.now() / 1000;
+    if (ttlSec > 24 * 3600) return;
+    const now = Date.now();
+    if (now - this.lastProactiveReauthAttemptAt < 5 * 60 * 1000) return;
+    this.lastProactiveReauthAttemptAt = now;
+    await this.queueSilentReauth();
   }
 
   setBaseUrl(url: string) {
@@ -521,13 +792,20 @@ export class RSLatteApiClient {
     this.spaceId = sid || DEFAULT_SPACE_ID;
   }
 
+  getSpaceId(): string {
+    return this.spaceId || DEFAULT_SPACE_ID;
+  }
+
   private url(path: string) {
-    return joinUrl(this.baseUrl, path);
+    return joinApiUrl(this.baseUrl, path);
   }
 
   /** ✅ 统一 headers：把 vault_id 放进 header */
   private buildHeaders(extra?: Record<string, string>, opts?: { allowNoVault?: boolean }) {
     const h: Record<string, string> = { ...(extra ?? {}) };
+    if (this.authToken) {
+      h["Authorization"] = `Bearer ${this.authToken}`;
+    }
     if (this.vaultId) h["X-Vault-Id"] = this.vaultId;
 
     // ✅ Space scope header (UUID). Always attach; default is all-zero UUID.
@@ -552,8 +830,53 @@ export class RSLatteApiClient {
     fetchOpts?: FetchOpts,
     headerOpts?: { allowNoVault?: boolean }
   ): Promise<T> {
+    await this.maybeRefreshTokenProactively();
     const headers = this.buildHeaders((init?.headers as any) ?? undefined, headerOpts);
-    return fetchJson<T>(this.url(path), { ...(init ?? {}), headers }, fetchOpts);
+    const url = this.url(path);
+    const mergedInit = { ...(init ?? {}), headers };
+    try {
+      return await fetchJson<T>(url, mergedInit, fetchOpts);
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.status === 401) {
+        const ok = await this.queueSilentReauth();
+        if (ok) {
+          const headers2 = this.buildHeaders((init?.headers as any) ?? undefined, headerOpts);
+          try {
+            return await fetchJson<T>(this.url(path), { ...(init ?? {}), headers: headers2 }, fetchOpts);
+          } catch (e2: unknown) {
+            if (e2 instanceof ApiError && e2.status === 401) {
+              notifyApiUnauthorized(e2);
+            }
+            throw e2;
+          }
+        }
+        notifyApiUnauthorized(e);
+      }
+      throw e;
+    }
+  }
+
+  // =========================
+  // Auth（服务端配置 JWT_SECRET 时启用）
+  // =========================
+  async authStatus(): Promise<AuthStatusResp> {
+    return fetchJson<AuthStatusResp>(
+      joinApiUrl(this.baseUrl, "/auth/status"),
+      { method: "GET" },
+      { timeoutMs: 8000 }
+    );
+  }
+
+  async authLogin(userName: string, password: string): Promise<AuthLoginResp> {
+    return fetchJson<AuthLoginResp>(
+      joinApiUrl(this.baseUrl, "/auth/login"),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_name: String(userName ?? "").trim(), password }),
+      },
+      { timeoutMs: 20000 }
+    );
   }
 
   // =========================
@@ -615,7 +938,10 @@ export class RSLatteApiClient {
   // RSLatte Items (Task / Memo)
   // =========================
 
-  /** POST /rslatte-items/sync-batch */
+  /**
+   * POST /rslatte-items/sync-batch（操作日志 + task_id，非主路径）。
+   * 任务入库主路径：`rslatteItemsUpsertBatch` + `rslatteItemsReconcile`。
+   */
   async rslatteItemsSyncBatch(payload: RSLatteSyncBatchReq): Promise<RSLatteSyncBatchResp> {
     return this._fetch<RSLatteSyncBatchResp>(
       "/rslatte-items/sync-batch",
@@ -676,6 +1002,36 @@ export class RSLatteApiClient {
     );
   }
 
+  /** POST /schedules/upsert-batch（按 uid 幂等，表 rslatte_schedule） */
+  async schedulesUpsertBatch(payload: SchedulesUpsertBatchReq): Promise<SchedulesUpsertBatchResp> {
+    return this._fetch<SchedulesUpsertBatchResp>("/schedules/upsert-batch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  /** POST /schedules/exists */
+  async schedulesExists(
+    payload: SchedulesExistsReq,
+    params?: { include_deleted?: boolean }
+  ): Promise<SchedulesExistsResp> {
+    const qs: string[] = [];
+    if (params?.include_deleted) qs.push("include_deleted=true");
+    const q = qs.length ? `?${qs.join("&")}` : "";
+    return this._fetch<SchedulesExistsResp>(`/schedules/exists${q}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  /** POST /schedules/reconcile */
+  async schedulesReconcile(payload: SchedulesReconcileReq): Promise<SchedulesReconcileResp> {
+    return this._fetch<SchedulesReconcileResp>("/schedules/reconcile", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
   // =========================
   // Projects / Milestones Exists (Lightweight)
   // =========================
@@ -727,6 +1083,22 @@ export class RSLatteApiClient {
   async financeRecordsReconcile(payload: RecordReconcileReq): Promise<RecordReconcileResp> {
     return this._fetch<RecordReconcileResp>(
       `/finance-records/reconcile`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  }
+
+  /** POST /health-records/reconcile */
+  async healthRecordsReconcile(payload: RecordReconcileReq): Promise<RecordReconcileResp> {
+    return this._fetch<RecordReconcileResp>(
+      `/health-records/reconcile`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  }
+
+  /** POST /knowledge-docs/reconcile */
+  async knowledgeDocsReconcile(payload: KnowledgeDocsReconcileReq): Promise<KnowledgeDocsReconcileResp> {
+    return this._fetch<KnowledgeDocsReconcileResp>(
+      `/knowledge-docs/reconcile`,
       { method: "POST", body: JSON.stringify(payload) }
     );
   }
@@ -915,8 +1287,8 @@ export class RSLatteApiClient {
 
   async listFinanceRecords(date_from?: string, date_to?: string, includeDeleted = false) {
     const qs: string[] = [];
-    if (date_from) qs.push(`date_from=${encodeURIComponent(date_from)}`);
-    if (date_to) qs.push(`date_to=${encodeURIComponent(date_to)}`);
+    if (date_from) qs.push(`from=${encodeURIComponent(date_from)}`);
+    if (date_to) qs.push(`to=${encodeURIComponent(date_to)}`);
     if (includeDeleted) qs.push(`include_deleted=true`);
     const q = qs.length ? `?${qs.join("&")}` : "";
     return this._fetch<{ items: ApiFinanceRecord[] }>(
@@ -925,112 +1297,38 @@ export class RSLatteApiClient {
     );
   }
 
+  async listHealthRecords(date_from?: string, date_to?: string, includeDeleted = false) {
+    const qs: string[] = [];
+    if (date_from) qs.push(`from=${encodeURIComponent(date_from)}`);
+    if (date_to) qs.push(`to=${encodeURIComponent(date_to)}`);
+    if (includeDeleted) qs.push(`include_deleted=true`);
+    const q = qs.length ? `?${qs.join("&")}` : "";
+    return this._fetch<{ items: ApiHealthRecord[] }>(
+      `/health-records${q}`,
+      { method: "GET" }
+    );
+  }
+
+  /** GET /knowledge-docs：`include_deleted`、可选 `limit`（1～10000，与后端 Query 一致） */
+  async listKnowledgeDocs(opts?: { includeDeleted?: boolean; limit?: number }) {
+    const qs: string[] = [];
+    if (opts?.includeDeleted) qs.push("include_deleted=true");
+    const lim = opts?.limit;
+    if (lim != null && lim >= 1) qs.push(`limit=${encodeURIComponent(String(Math.min(lim, 10_000)))}`);
+    const q = qs.length ? `?${qs.join("&")}` : "";
+    return this._fetch<{ items: ApiKnowledgeDoc[] }>(`/knowledge-docs${q}`, { method: "GET" });
+  }
 
   async listCheckinRecords(date_from?: string, date_to?: string, includeDeleted = false) {
     const qs: string[] = [];
-    if (date_from) qs.push(`date_from=${encodeURIComponent(date_from)}`);
-    if (date_to) qs.push(`date_to=${encodeURIComponent(date_to)}`);
+    if (date_from) qs.push(`from=${encodeURIComponent(date_from)}`);
+    if (date_to) qs.push(`to=${encodeURIComponent(date_to)}`);
     if (includeDeleted) qs.push(`include_deleted=true`);
     const q = qs.length ? `?${qs.join("&")}` : "";
     return this._fetch<{ items: ApiCheckinRecord[] }>(
       `/checkin-records${q}`,
       { method: "GET" }
     );
-  }
-
-  /**
-   * 拉取手机端操作记录（供 Obsidian「从手机同步」使用）。
-   * 后端需提供 GET /mobile/ops?since=...&limit=...，返回 PWA 上传的未处理操作。
-   */
-  async listMobileOps(params?: MobileOpsListReq): Promise<MobileOpsListResp> {
-    const qs: string[] = [];
-    if (params?.since) qs.push(`since=${encodeURIComponent(params.since)}`);
-    if (params?.limit != null) qs.push(`limit=${Math.min(500, Math.max(1, params.limit))}`);
-    const q = qs.length ? `?${qs.join("&")}` : "";
-    try {
-      const r = await this._fetch<MobileOpsListResp>(`/mobile/ops${q}`, { method: "GET" });
-      return r ?? { ok: true, ops: [] };
-    } catch (e) {
-      // 后端未实现该接口时返回空列表，不阻塞
-      return { ok: false, ops: [] };
-    }
-  }
-
-  /**
-   * 标记这批手机操作已被插件成功写入，后端将设为 plugin_synced=true，下次拉取只返回未同步的，避免重复写入。
-   */
-  async markMobileOpsSynced(ids: string[]): Promise<{ ok: boolean; count?: number }> {
-    if (!ids?.length) return { ok: true, count: 0 };
-    const r = await this._fetch<{ ok: boolean; count?: number }>("/mobile/ops/mark-synced", {
-      method: "POST",
-      body: JSON.stringify({ ids }),
-    });
-    return r ?? { ok: true, count: 0 };
-  }
-
-  /**
-   * Obsidian 应用某条操作失败时调用，将失败原因写入该条的 plugin_sync_error，供 mobile 拉取展示。
-   */
-  async reportMobileOpError(id: string, error: string): Promise<{ ok: boolean }> {
-    if (!id?.trim()) return { ok: true };
-    const r = await this._fetch<{ ok: boolean }>("/mobile/ops/report-sync-error", {
-      method: "POST",
-      body: JSON.stringify({ id: id.trim(), error: (error ?? "").trim() || "应用失败" }),
-    });
-    return r ?? { ok: true };
-  }
-
-  /**
-   * 触发 backend 强制执行 mobile JSON 同步（拉取 operator 入库、刷新 plugin_date、锁定 mobile）。
-   * 用于「从手机同步」开始时；仅当 backend 配置了 mobile_sync_config 时成功。
-   */
-  async mobileSyncRunNow(): Promise<{ ok: boolean; message?: string }> {
-    try {
-      const r = await this._fetch<{ ok: boolean; message?: string }>("/mobile/sync/run-now", {
-        method: "POST",
-      });
-      return r ?? { ok: false, message: "unknown" };
-    } catch (e: any) {
-      return { ok: false, message: e?.message ?? String(e) };
-    }
-  }
-
-  /**
-   * 同步全部完成后调用：清空 operator、刷新 plugin_date、解锁 mobile。
-   * 仅当此前调过 mobileSyncRunNow 且流程走完时调用。
-   */
-  async mobileSyncComplete(): Promise<{ ok: boolean; message?: string }> {
-    try {
-      const r = await this._fetch<{ ok: boolean; message?: string }>("/mobile/sync/complete", {
-        method: "POST",
-      });
-      return r ?? { ok: false, message: "unknown" };
-    } catch (e: any) {
-      return { ok: false, message: e?.message ?? String(e) };
-    }
-  }
-
-  /**
-   * 同步手机模块配置到后端（vault 默认 + 按空间覆盖），供 PWA GET /mobile/config 按当前空间读取。
-   */
-  async setVaultMobileModuleConfig(payload: {
-    mobile_module_enabled?: boolean;
-    space_overrides?: Record<string, boolean>;
-  }): Promise<void> {
-    const body: Record<string, unknown> = {};
-    if (payload.mobile_module_enabled !== undefined) body.mobile_module_enabled = payload.mobile_module_enabled;
-    if (payload.space_overrides !== undefined && Object.keys(payload.space_overrides).length >= 0) body.space_overrides = payload.space_overrides;
-    await this._fetch<{ ok: boolean }>("/vault/config", {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    });
-  }
-
-  /**
-   * 兼容旧代码：仅设置 vault 默认开关（等同于 setVaultMobileModuleConfig({ mobile_module_enabled })）。
-   */
-  async setVaultMobileModuleEnabled(enabled: boolean): Promise<void> {
-    await this.setVaultMobileModuleConfig({ mobile_module_enabled: enabled });
   }
 
   // =========================
@@ -1083,6 +1381,45 @@ export class RSLatteApiClient {
     );
   }
 
+  async upsertHealthRecord(payload: UpsertHealthRecordReq) {
+    const r: any = await this._fetch<any>(
+      "/health-records/upsert",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+    if (r && typeof r === "object" && "item" in r) return r as { ok: true; item: ApiHealthRecord | null };
+    return { ok: true, item: r as ApiHealthRecord };
+  }
+
+  async upsertHealthRecordsBatch(payload: UpsertHealthRecordBatchReq): Promise<BatchUpsertResp<ApiHealthRecord>> {
+    return this._fetch<BatchUpsertResp<ApiHealthRecord>>(
+      "/health-records/upsert-batch",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  }
+
+  async upsertKnowledgeDocsBatch(payload: UpsertKnowledgeDocBatchReq): Promise<BatchUpsertResp<unknown>> {
+    return this._fetch<BatchUpsertResp<unknown>>(
+      "/knowledge-docs/upsert-batch",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  }
+
+  async upsertWorkEventsBatch(payload: UpsertWorkEventBatchReq): Promise<BatchUpsertResp<unknown>> {
+    return this._fetch<BatchUpsertResp<unknown>>(
+      "/work-events/upsert-batch",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  }
+
+  /** GET /work-events：默认仅摘要（summary_only=true） */
+  async listWorkEvents(opts?: { limit?: number; summaryOnly?: boolean }) {
+    const qs: string[] = [];
+    if (opts?.limit != null && opts.limit >= 1) qs.push(`limit=${encodeURIComponent(String(Math.min(opts.limit, 10_000)))}`);
+    if (opts?.summaryOnly === false) qs.push("summary_only=false");
+    const q = qs.length ? `?${qs.join("&")}` : "";
+    return this._fetch<{ items: ApiWorkEventSummary[]; summary_only: boolean }>(`/work-events${q}`, { method: "GET" });
+  }
+
   /** ✅ Batch upsert: POST /contacts/upsert-batch */
   async upsertContactsBatch(payload: ContactsUpsertBatchReq): Promise<ContactsUpsertBatchResp> {
     return this._fetch<ContactsUpsertBatchResp>(
@@ -1108,12 +1445,15 @@ export class RSLatteApiClient {
   /**
    * 统一统计接口：GET /stats?kind=...&as_of=...
    * - kind 目前支持 finance_summary
+   * - 财务汇总按当前 **`X-Space-Id`**（与 `setSpaceId`）过滤 `finance_records.space_id`；响应含 **`space_id`**
    */
-  async getStats(kind: string, as_of?: string) {
+  async getStats(kind: "finance_summary", as_of?: string): Promise<ApiFinanceSummaryStats>;
+  async getStats(kind: string, as_of?: string): Promise<unknown>;
+  async getStats(kind: string, as_of?: string): Promise<unknown> {
     const qs: string[] = [`kind=${encodeURIComponent(kind)}`];
     if (as_of) qs.push(`as_of=${encodeURIComponent(as_of)}`);
     const q = `?${qs.join("&")}`;
-    return this._fetch<any>(`/stats${q}`, { method: "GET" });
+    return this._fetch<unknown>(`/stats${q}`, { method: "GET" });
   }
 
   // =========================
@@ -1149,7 +1489,11 @@ export class RSLatteApiClient {
   }
 
   /** POST /output-files/sync */
-  async outputFilesSync(payload: any): Promise<any> {
+  async outputFilesSync(payload: {
+    sync_mode?: "full";
+    files?: OutputFilesSyncFile[];
+    daily_ops?: Record<string, unknown>;
+  }): Promise<any> {
     return this._fetch<any>(
       `/output-files/sync`,
       { method: "POST", body: JSON.stringify(payload) }

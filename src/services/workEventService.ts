@@ -1,7 +1,9 @@
 import { normalizePath, type App } from "obsidian";
 import type { RSLattePluginSettings } from "../types/settings";
 import type { AuditService } from "./auditService";
-import { resolveSpaceBaseDir } from "./spaceContext";
+import { resolveSpaceBaseDir } from "./space/spaceContext";
+import { toLocalOffsetIsoString } from "../utils/localCalendarYmd";
+import { normalizeWorkEventSource, type WorkEventSource } from "../types/stats/workEvent";
 
 /**
  * Work Event Stream
@@ -12,19 +14,33 @@ import { resolveSpaceBaseDir } from "./spaceContext";
 export type WorkEventKind =
   | "checkin"
   | "finance"
+  | "health"
   | "task"
   | "projecttask"
   | "memo"
+  | "schedule"
   | "contact"
   | "project"
   | "milestone"
   | "output"
   | "file"
-  | "sync";
+  | "sync"
+  | "capture";
 
-export type WorkEventAction = "create" | "update" | "status" | "delete" | "archive" | "cancelled" | "done" | "start" | "recover" | "paused" | "continued";
-
-export type WorkEventSource = "ui" | "auto" | "reconcile" | "mobile";
+export type WorkEventAction =
+  | "create"
+  | "update"
+  | "publish"
+  | "recall"
+  | "status"
+  | "delete"
+  | "archive"
+  | "cancelled"
+  | "done"
+  | "start"
+  | "recover"
+  | "paused"
+  | "continued";
 
 export type WorkEvent = {
   /** ISO string */
@@ -150,6 +166,10 @@ export class WorkEventService {
       { codeLocation: "src/ui/modals/FinanceRecordModal.ts:326", module: "财务管理", kind: "finance", action: "create", source: "ui", description: "创建财务记录" },
       { codeLocation: "src/ui/modals/FinanceRecordModal.ts:326", module: "财务管理", kind: "finance", action: "update", source: "ui", description: "更新财务记录" },
       { codeLocation: "src/ui/modals/FinanceRecordModal.ts:326", module: "财务管理", kind: "finance", action: "delete", source: "ui", description: "删除财务记录" },
+      { codeLocation: "src/ui/modals/AddHealthRecordModal.ts", module: "健康管理", kind: "health", action: "create", source: "ui", description: "新增健康记录" },
+      { codeLocation: "src/ui/modals/AddHealthRecordModal.ts", module: "健康管理", kind: "health", action: "update", source: "ui", description: "保存健康日/周/月卡片（多指标合并一条事件）" },
+      { codeLocation: "src/ui/modals/EditHealthEntryModal.ts", module: "健康管理", kind: "health", action: "update", source: "ui", description: "侧栏修改单条健康记录（独立弹窗）" },
+      { codeLocation: "src/ui/views/HealthSidePanelView.ts", module: "健康管理", kind: "health", action: "delete", source: "ui", description: "撤销/删除健康记录（日记取消行）" },
       { codeLocation: "src/taskRSLatte/service.ts:2388", module: "任务管理", kind: "task", action: "create", source: "ui", description: "创建任务" },
       { codeLocation: "src/taskRSLatte/service.ts:2193", module: "任务管理", kind: "task", action: "update", source: "ui", description: "更新任务信息" },
       // { codeLocation: "src/taskRSLatte/service.ts:1945", module: "任务管理", kind: "task", action: "status", source: "ui", description: "任务状态变更（TODO/IN_PROGRESS/DONE）" }, // 已废弃：已拆分为具体的 action（start/continued/done/cancelled/paused）
@@ -167,10 +187,19 @@ export class WorkEventService {
       { codeLocation: "src/projectManager/service.ts:1810", module: "项目管理", kind: "projecttask", action: "continued", source: "ui", description: "项目任务继续（恢复进行中）" },
       { codeLocation: "src/projectManager/service.ts:1810", module: "项目管理", kind: "projecttask", action: "done", source: "ui", description: "项目任务完成" },
       { codeLocation: "src/projectManager/service.ts:1810", module: "项目管理", kind: "projecttask", action: "cancelled", source: "ui", description: "项目任务取消" },
-      { codeLocation: "src/taskRSLatte/service.ts:2444", module: "备忘管理", kind: "memo", action: "create", source: "ui", description: "创建备忘" },
-      { codeLocation: "src/taskRSLatte/service.ts:2339", module: "备忘管理", kind: "memo", action: "update", source: "ui", description: "更新备忘" },
-      { codeLocation: "src/taskRSLatte/service.ts:2069", module: "备忘管理", kind: "memo", action: "status", source: "ui", description: "备忘状态变更" },
-      { codeLocation: "src/taskRSLatte/service.ts:2069", module: "备忘管理", kind: "memo", action: "cancelled", source: "ui", description: "备忘取消" },
+      { codeLocation: "src/taskRSLatte/service.ts:2444", module: "提醒管理", kind: "memo", action: "create", source: "ui", description: "创建提醒" },
+      { codeLocation: "src/taskRSLatte/service.ts:2339", module: "提醒管理", kind: "memo", action: "update", source: "ui", description: "更新提醒" },
+      { codeLocation: "src/taskRSLatte/service.ts:2069", module: "提醒管理", kind: "memo", action: "status", source: "ui", description: "提醒状态变更" },
+      { codeLocation: "src/taskRSLatte/service.ts:2069", module: "提醒管理", kind: "memo", action: "cancelled", source: "ui", description: "提醒取消" },
+      { codeLocation: "src/services/execution/buildExecutionWorkEvents.ts", module: "日程管理", kind: "schedule", action: "create", source: "ui", description: "创建日程" },
+      { codeLocation: "src/taskRSLatte/service.ts:updateScheduleBasicInfo", module: "日程管理", kind: "schedule", action: "update", source: "ui", description: "更新日程信息" },
+      { codeLocation: "src/ui/modals/EditScheduleModal.ts", module: "日程管理", kind: "schedule", action: "update", source: "ui", description: "更新日程（弹窗保存）" },
+      { codeLocation: "src/ui/views/TaskSidePanelView.ts", module: "日程管理", kind: "schedule", action: "done", source: "ui", description: "日程结束" },
+      { codeLocation: "src/ui/views/TaskSidePanelView.ts", module: "日程管理", kind: "schedule", action: "cancelled", source: "ui", description: "日程取消" },
+      { codeLocation: "src/ui/views/TaskSidePanelView.ts", module: "日程管理", kind: "schedule", action: "status", source: "ui", description: "日程周期/失效状态变更" },
+      { codeLocation: "src/ui/views/TaskSidePanelView.ts", module: "日程管理", kind: "schedule", action: "recover", source: "ui", description: "日程恢复" },
+      { codeLocation: "src/taskRSLatte/service.ts:applyMemoStatusAction", module: "日程管理", kind: "schedule", action: "status", source: "ui", description: "日程状态变更（侧栏/同步路径）" },
+      { codeLocation: "src/taskRSLatte/service.ts:applyMemoStatusAction", module: "日程管理", kind: "schedule", action: "cancelled", source: "ui", description: "日程取消（侧栏/同步路径）" },
       { codeLocation: "src/ui/modals/AddContactModal.ts:761", module: "联系人管理", kind: "contact", action: "create", source: "ui", description: "创建联系人" },
       { codeLocation: "src/ui/modals/EditContactModal.ts:891", module: "联系人管理", kind: "contact", action: "update", source: "ui", description: "更新联系人信息" },
       { codeLocation: "src/ui/modals/EditContactModal.ts:891", module: "联系人管理", kind: "contact", action: "status", source: "ui", description: "联系人状态变更" },
@@ -192,6 +221,9 @@ export class WorkEventService {
       { codeLocation: "src/projectManager/service.ts:1068", module: "项目管理", kind: "milestone", action: "cancelled", source: "ui", description: "里程碑取消" },
       { codeLocation: "src/projectManager/service.ts:1068", module: "项目管理", kind: "milestone", action: "recover", source: "ui", description: "里程碑恢复（恢复到 active）" },
       { codeLocation: "src/ui/modals/CreateOutputDocModal.ts:258", module: "输出管理", kind: "output", action: "create", source: "ui", description: "创建输出" },
+      { codeLocation: "src/ui/modals/EditOutputMetaModal.ts", module: "输出管理", kind: "output", action: "update", source: "ui", description: "修正输出 frontmatter（✏️）" },
+      { codeLocation: "src/ui/modals/PublishToKnowledgeModal.ts", module: "输出管理", kind: "output", action: "publish", source: "ui", description: "发布到知识库（30-Knowledge）" },
+      { codeLocation: "src/ui/modals/RecallOutputFromKnowledgeModal.ts", module: "输出管理", kind: "output", action: "recall", source: "ui", description: "从知识库打回输出（迁回存档目录）" },
       { codeLocation: "src/outputRSLatte/service.ts:324", module: "输出管理", kind: "output", action: "update", source: "auto", description: "输出文件更新（检测到文件修改时间变化）" },
       // { codeLocation: "src/ui/views/OutputSidePanelView.ts:147", module: "输出管理", kind: "output", action: "status", source: "ui", description: "输出状态变更（todo/in-progress/done）" }, // 已废弃：已拆分为具体的 action（start/continued/done/cancelled/paused/recover）
       { codeLocation: "src/ui/views/OutputSidePanelView.ts:145", module: "输出管理", kind: "output", action: "start", source: "ui", description: "输出开始（首次开始）" },
@@ -201,13 +233,21 @@ export class WorkEventService {
       { codeLocation: "src/ui/views/OutputSidePanelView.ts:145", module: "输出管理", kind: "output", action: "paused", source: "ui", description: "输出暂停（从 in-progress 到 todo）" },
       { codeLocation: "src/ui/views/OutputSidePanelView.ts:145", module: "输出管理", kind: "output", action: "recover", source: "ui", description: "输出恢复待办（从 done/cancelled 到 todo）" },
       { codeLocation: "src/plugin/outputManager.ts:426", module: "输出管理", kind: "output", action: "archive", source: "auto", description: "归档输出（批量）" },
+      { codeLocation: "src/plugin/journalWriter.ts; CaptureView; modals", module: "快速记录", kind: "capture", action: "create", source: "ui", description: "快速记录：加入待整理 / 三合一新建任务·提醒·日程" },
+      { codeLocation: "src/ui/views/CaptureView.ts; journalWriter", module: "快速记录", kind: "capture", action: "update", source: "ui", description: "快速记录：打开整理、刷新、输入转今日任务等" },
+      { codeLocation: "src/plugin/journalWriter.ts", module: "快速记录", kind: "capture", action: "done", source: "ui", description: "待整理标为已整理 / 计时结束生成日程" },
+      { codeLocation: "src/plugin/journalWriter.ts", module: "快速记录", kind: "capture", action: "cancelled", source: "ui", description: "待整理标为取消" },
+      { codeLocation: "src/plugin/journalWriter.ts", module: "快速记录", kind: "capture", action: "paused", source: "ui", description: "待整理标为暂不处理 / 计时暂停" },
+      { codeLocation: "src/ui/views/CaptureView.ts", module: "快速记录", kind: "capture", action: "start", source: "ui", description: "专注计时开始" },
+      { codeLocation: "src/ui/views/CaptureView.ts", module: "快速记录", kind: "capture", action: "continued", source: "ui", description: "专注计时继续" },
+      { codeLocation: "src/plugin/journalWriter.ts", module: "快速记录", kind: "capture", action: "recover", source: "ui", description: "待整理恢复为待处理" },
     ];
 
     for (const entry of knownEvents) {
       const key = this.getRegistryKey(entry.kind, entry.action, entry.source);
       this._registry.set(key, {
         ...entry,
-        registeredAt: new Date().toISOString(),
+        registeredAt: toLocalOffsetIsoString(),
       });
     }
 
@@ -227,7 +267,7 @@ export class WorkEventService {
     }
     this._registry.set(key, {
       ...entry,
-      registeredAt: new Date().toISOString(),
+      registeredAt: toLocalOffsetIsoString(),
     });
     return true;
   }
@@ -263,7 +303,7 @@ export class WorkEventService {
   getRegistry(): WorkEventRegistry {
     return {
       version: 1,
-      updatedAt: new Date().toISOString(),
+      updatedAt: toLocalOffsetIsoString(),
       entries: Array.from(this._registry.values()),
     };
   }
@@ -398,22 +438,7 @@ export class WorkEventService {
    * 这是一个静态方法，可以在外部调用，用于生成 WorkEvent 的时间戳
    */
   static toLocalISOString(date?: Date): string {
-    const now = date ?? new Date();
-    const offset = -now.getTimezoneOffset(); // 分钟数，正数表示东时区
-    const offsetHours = Math.floor(Math.abs(offset) / 60).toString().padStart(2, '0');
-    const offsetMinutes = (Math.abs(offset) % 60).toString().padStart(2, '0');
-    const offsetSign = offset >= 0 ? '+' : '-';
-    
-    // 使用本地时间创建 ISO 字符串，然后替换时区部分
-    const year = now.getFullYear();
-    const month = (now.getMonth() + 1).toString().padStart(2, '0');
-    const day = now.getDate().toString().padStart(2, '0');
-    const hours = now.getHours().toString().padStart(2, '0');
-    const minutes = now.getMinutes().toString().padStart(2, '0');
-    const seconds = now.getSeconds().toString().padStart(2, '0');
-    const milliseconds = now.getMilliseconds().toString().padStart(3, '0');
-    
-    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${milliseconds}${offsetSign}${offsetHours}:${offsetMinutes}`;
+    return toLocalOffsetIsoString(date ?? new Date());
   }
 
   /**
@@ -527,7 +552,7 @@ export class WorkEventService {
     this._ready = (async () => {
       const adapter: any = this.app.vault.adapter as any;
       // Ensure current month shard exists (best-effort, never blocks).
-      const nowIso = new Date().toISOString();
+      const nowIso = toLocalOffsetIsoString();
       const monthKey = this.toMonthKey(nowIso);
       const path = this.resolveShardPath(monthKey);
       try {
@@ -587,7 +612,7 @@ export class WorkEventService {
       month: monthKey,
       events: [],
       version: 1,
-      updated_at: new Date().toISOString(),
+      updated_at: toLocalOffsetIsoString(),
     };
     return emptyIndex;
   }
@@ -601,7 +626,7 @@ export class WorkEventService {
     const indexPath = this.resolveIndexPath(monthKey);
 
     try {
-      index.updated_at = new Date().toISOString();
+      index.updated_at = toLocalOffsetIsoString();
       await this.ensureDirForPath(indexPath);
       
       if (typeof adapter?.write === "function") {
@@ -653,13 +678,24 @@ export class WorkEventService {
     // Serialize writes to keep JSONL append order stable.
     this._writeChain = this._writeChain
       .then(async () => {
-        const sourceValue: WorkEventSource = event.source ?? "ui"; // 默认 source 为 "ui"
+        const sourceValue: WorkEventSource = normalizeWorkEventSource(event.source); // 默认 ui；历史 mobile 并入 ui
         
         // ✅ 确保时间戳使用本地时区格式
         // 如果传入的是 UTC 时间戳（以 Z 结尾），自动转换为本地时区
         const eventTs = event.ts ?? WorkEventService.toLocalISOString();
         const localTs = this.convertToLocalISOString(eventTs);
-        
+
+        let eid = String(event.event_id ?? "").trim();
+        if (!eid) {
+          try {
+            const c: any = typeof crypto !== "undefined" ? crypto : null;
+            if (c && typeof c.randomUUID === "function") eid = c.randomUUID();
+          } catch {
+            eid = "";
+          }
+        }
+        if (!eid) eid = `t:${Date.now()}:${Math.random().toString(36).slice(2, 12)}`;
+
         const record: WorkEvent = {
           ts: localTs,
           kind: event.kind,
@@ -668,7 +704,7 @@ export class WorkEventService {
           summary: event.summary,
           metrics: event.metrics,
           source: sourceValue,
-          event_id: event.event_id,
+          event_id: eid,
         };
 
         // ✅ 验证事件类型是否已注册（写入前必须注册）
@@ -801,7 +837,7 @@ export class WorkEventService {
     
     try {
       const adapter: any = this.app.vault.adapter as any;
-      const nowIso = new Date().toISOString();
+      const nowIso = toLocalOffsetIsoString();
       const monthKey = this.toMonthKey(nowIso);
       const path = this.resolveShardPath(monthKey);
       
@@ -839,7 +875,7 @@ export class WorkEventService {
         try {
           const prevMonth = new Date();
           prevMonth.setMonth(prevMonth.getMonth() - 1);
-          const prevMonthKey = this.toMonthKey(prevMonth.toISOString());
+          const prevMonthKey = this.toMonthKey(toLocalOffsetIsoString(prevMonth));
           const prevPath = this.resolveShardPath(prevMonthKey);
           
           let prevContent = "";
@@ -1016,7 +1052,7 @@ export class WorkEventService {
     if (!this.isEnabled()) return;
     
     if (!monthKey) {
-      const nowIso = new Date().toISOString();
+      const nowIso = toLocalOffsetIsoString();
       monthKey = this.toMonthKey(nowIso);
     }
     
@@ -1044,7 +1080,7 @@ export class WorkEventService {
         month: monthKey,
         events: [],
         version: 1,
-        updated_at: new Date().toISOString(),
+        updated_at: toLocalOffsetIsoString(),
       };
 
       let offset = 0;
@@ -1078,7 +1114,7 @@ export class WorkEventService {
     const keys: string[] = [];
     const current = new Date(fromDate);
     for (let i = 0; i < maxMonths; i++) {
-      keys.push(this.toMonthKey(current.toISOString()));
+      keys.push(this.toMonthKey(toLocalOffsetIsoString(current)));
       current.setMonth(current.getMonth() - 1);
     }
     return keys;
@@ -1132,7 +1168,7 @@ export class WorkEventService {
       const end = new Date(endDate);
       
       while (current <= end) {
-        monthKeys.add(this.toMonthKey(current.toISOString()));
+        monthKeys.add(this.toMonthKey(toLocalOffsetIsoString(current)));
         current.setMonth(current.getMonth() + 1);
       }
       
@@ -1144,12 +1180,13 @@ export class WorkEventService {
         allEvents.push(...events);
       }
       
-      // 按时间范围过滤
-      const startIso = startDate.toISOString();
-      const endIso = endDate.toISOString();
-      let filtered = allEvents.filter(
-        (e) => e.ts >= startIso && e.ts <= endIso
-      );
+      // 按时间范围过滤（须用时间数值比较：事件 ts 常为本地偏移 ISO，与 toISOString() 的 Z 混用字符串比较会误判）
+      const startMs = startDate.getTime();
+      const endMs = endDate.getTime();
+      let filtered = allEvents.filter((e) => {
+        const t = Date.parse(String(e.ts ?? ""));
+        return Number.isFinite(t) && t >= startMs && t <= endMs;
+      });
       
       // 按空间过滤（如果指定）
       if (spaceIds && spaceIds.length > 0) {
@@ -1164,8 +1201,14 @@ export class WorkEventService {
       }
       
       // 按时间戳倒序排列（最新的在前）
-      filtered.sort((a, b) => b.ts.localeCompare(a.ts));
-      
+      filtered.sort((a, b) => {
+        const ta = Date.parse(String(a.ts ?? ""));
+        const tb = Date.parse(String(b.ts ?? ""));
+        const na = Number.isFinite(ta) ? ta : 0;
+        const nb = Number.isFinite(tb) ? tb : 0;
+        return nb - na;
+      });
+
       return filtered;
     } catch (e) {
       console.warn("[RSLatte] readEventsByDateRange failed:", e);

@@ -8,8 +8,9 @@ import { PipelineEngine } from "../services/pipeline/pipelineEngine";
 import { AutoRefreshCoordinator } from "../services/pipeline/coordinator";
 import { createDefaultModuleRegistry } from "../services/pipeline/moduleRegistry";
 import { withProjectOutputAtomicSpecs } from "../services/pipeline/specRegistry";
-import { SpaceStatsService } from "../services/spaceStatsService";
-import { buildSpaceCtx } from "../services/spaceContext";
+import { SpaceStatsService } from "../services/space/spaceStatsService";
+import { buildSpaceCtx } from "../services/space/spaceContext";
+import { runE2SealPreviousPeriodReviewSnapshots } from "../ui/helpers/reviewE2SnapshotSeal";
 import type { ModuleRegistry } from "../services/pipeline/moduleRegistry";
 import type {
   ModuleSpec,
@@ -23,6 +24,7 @@ import type {
   RSLatteFlushQueueOptions,
 } from "../services/pipeline/moduleSpec";
 import type { RSLatteModuleKey, RSLatteResult } from "../services/pipeline/types";
+import { buildPipelineModuleIsEnabled } from "./pipelineModuleEnabled";
 
 export function createPipelineManager(plugin: RSLattePlugin) {
   // 私有字段访问
@@ -240,7 +242,7 @@ export function createPipelineManager(plugin: RSLattePlugin) {
         try {
           if (!plugin.recordRSLatte) return fail("RecordRSLatte not ready");
 
-          const r = await plugin.recordRSLatte.rebuildIndexFromDiaryRange(true, true, modules);
+          const r = await plugin.recordRSLatte.rebuildIndexFromDiaryRange(true, true, modules, true);
 
           // 若扫描过程中发现新的清单项，则合并回 settings，并触发一次 settings-save（用于清单 DB sync）
           const merged = await plugin.recordRSLatte.mergeListsIndexIntoSettings?.();
@@ -709,7 +711,11 @@ export function createPipelineManager(plugin: RSLattePlugin) {
           async scanFull(_ctx) {
             try {
               await plugin.recordRSLatte?.ensureReady?.();
-              const scan: any = await plugin.recordRSLatte?.scanFullFromDiaryRange?.({ reconcileMissingDays: false, modules });
+              const scan: any = await plugin.recordRSLatte?.scanFullFromDiaryRange?.({
+                reconcileMissingDays: true,
+                modules,
+                scanAllDiaryDates: _ctx?.mode === "rebuild",
+              });
               return ok(scan ?? { empty: true, modules, kind: "full" });
             } catch (e: any) {
               return fail("Record scanFull failed", { message: e?.message ?? String(e) });
@@ -811,23 +817,9 @@ export function createPipelineManager(plugin: RSLattePlugin) {
       const projectSpec: ModuleSpec = {
         key: "project",
         label: "Project",
-        incrementalRefresh: async (ctx) => {
-          const startedAt = new Date().toISOString();
-          try {
-            if (ctx.mode === "auto_refresh") {
-              await plugin.projectMgr?.ensureReady?.();
-              await plugin.projectMgr?.autoRefreshIncrementalAndSync?.();
-              // 自动刷新后也写入项目进度到日记（writeTodayProjectProgressToJournal 内部有变化检测，不会重复写入）
-              await (plugin as any).writeTodayProjectProgressToJournal?.();
-            } else {
-              await plugin.projectMgr.manualRefreshIncrementalAndSync();
-              await (plugin as any).writeTodayProjectProgressToJournal?.();
-            }
-            return ok(mkSummary(ctx, startedAt, { refreshed: 1 }, "OK"));
-          } catch (e: any) {
-            return fail("Project refresh failed", { message: e?.message ?? String(e) });
-          }
-        },
+        // incrementalRefresh 仅供 engine.run 兼容；自动/手动增量主路径为 coordinator.tick → runE2 + projectSpecAtomic（scan/apply/buildOps/flush）
+        incrementalRefresh: async (ctx) =>
+          ok(mkSummary(ctx, new Date().toISOString(), { skipped: 1 }, "USE_ATOMIC_SPEC")),
         rebuild: async (ctx) => {
           const startedAt = new Date().toISOString();
           try {
@@ -934,9 +926,21 @@ export function createPipelineManager(plugin: RSLattePlugin) {
         stats: (ctx) => notImplementedStats(ctx, "output:stats"),
       };
 
+      // schedule：自动/手动主路径为 runE2 + scheduleSpecAtomic（coordinator tick 单轨 runE2）；legacy 以下占位仅供 engine.run 兼容，勿作 tick 依赖
+      const scheduleSpec: ModuleSpec = {
+        key: "schedule" as any,
+        label: "Schedule",
+        incrementalRefresh: (ctx) => notImplemented(ctx, "schedule:incrementalRefresh"),
+        rebuild: (ctx) => notImplemented(ctx, "schedule:rebuild"),
+        archive: (ctx) => notImplemented(ctx, "schedule:archive"),
+        reconcile: (ctx) => notImplemented(ctx, "schedule:reconcile"),
+        stats: (ctx) => notImplementedStats(ctx, "schedule:stats"),
+      };
+
       const overridesBase: Partial<Record<RSLatteModuleKey, ModuleSpecAny>> = {
         task: taskSpec,
         memo: memoSpec,
+        schedule: scheduleSpec as any,
         checkin: checkinSpec,
         finance: financeSpec,
         project: projectSpec,
@@ -947,41 +951,7 @@ export function createPipelineManager(plugin: RSLattePlugin) {
 
       const registry = createDefaultModuleRegistry(overrides);
 
-      const isEnabled = (moduleKey: RSLatteModuleKey): boolean => {
-        const v2: any = (plugin.settings as any)?.moduleEnabledV2 ?? {};
-
-        if (moduleKey === "task") return (plugin as any).isTaskModuleEnabledV2?.() !== false;
-        if (moduleKey === "memo") return (plugin as any).isMemoModuleEnabledV2?.() !== false;
-
-        if (moduleKey === "checkin") {
-          if (typeof v2.checkin === "boolean") return v2.checkin;
-          return (plugin as any).isModuleEnabled?.("record") ?? false;
-        }
-        if (moduleKey === "finance") {
-          if (typeof v2.finance === "boolean") return v2.finance;
-          return (plugin as any).isModuleEnabled?.("record") ?? false;
-        }
-
-        if (moduleKey === "project") {
-          if (typeof v2.project === "boolean") return v2.project;
-          return (plugin as any).isModuleEnabled?.("project") ?? false;
-        }
-        if (moduleKey === "output") {
-          if (typeof v2.output === "boolean") return v2.output;
-          return (plugin as any).isModuleEnabled?.("output") ?? false;
-        }
-        if (moduleKey === "contacts") {
-          if (typeof v2.contacts === "boolean") return v2.contacts;
-          return (plugin as any).isContactsModuleEnabledV2?.() !== false;
-        }
-        if (moduleKey === "publish") {
-          // 发布模块：检查 moduleEnabledV2.publish，默认为 true
-          if (typeof v2.publish === "boolean") return v2.publish;
-          return true; // 发布模块默认启用
-        }
-        // unknown => disabled by default
-        return false;
-      };
+      const isEnabled = buildPipelineModuleIsEnabled(plugin);
 
       // D1: coordinator 需要共享 registry + enabled 判定
       setPipelineRegistry(registry);
@@ -1060,7 +1030,7 @@ export function createPipelineManager(plugin: RSLattePlugin) {
               stats: args.stats,
             });
 
-            const known: RSLatteModuleKey[] = ["task", "memo", "checkin", "finance", "project", "output", "contacts"];
+            const known: RSLatteModuleKey[] = ["task", "memo", "schedule", "checkin", "finance", "health", "project", "output", "contacts", "knowledge"];
             const enabled = known.filter((k) => {
               try {
                 return isEnabled(k);
@@ -1095,7 +1065,8 @@ export function createPipelineManager(plugin: RSLattePlugin) {
     ensureAutoRefreshCoordinator(): void {
       if (!getPipelineRegistry()) return;
 
-      const isEnabled = getPipelineIsEnabled() ?? ((_: RSLatteModuleKey) => true);
+      // 与 engine 同源：禁止在 _pipelineIsEnabled 未注入时用「全开」兜底（§1.1 / 索引方案 §0.4）
+      const isEnabled = getPipelineIsEnabled() ?? buildPipelineModuleIsEnabled(plugin);
 
       setAutoRefreshCoordinator(new AutoRefreshCoordinator({
         registry: getPipelineRegistry()!,
@@ -1103,18 +1074,23 @@ export function createPipelineManager(plugin: RSLattePlugin) {
         isModuleEnabled: isEnabled,
         getIntervalMs: (k) => (plugin as any).getModuleAutoRefreshIntervalMs?.(k),
         canAutoRefresh: (k) => {
-          // 保留旧策略：record 手动操作中跳过 checkin/finance auto_refresh
-          if (k === "checkin" || k === "finance") {
-            if (!((plugin as any).isModuleEnabled?.("record") ?? false)) return false;
+          // 保留旧策略：record 手动操作中跳过 checkin/finance/health auto_refresh（共享 record 锁）
+          if (k === "checkin" || k === "finance" || k === "health") {
+            if (k === "checkin" || k === "finance") {
+              if (!((plugin as any).isModuleEnabled?.("record") ?? false)) return false;
+            }
             if (plugin.isRecordManualBusy()) return false;
           }
           return true;
         },
         canAutoArchive: (k) => {
-          // record 模块关闭时不做 checkin/finance auto_archive
+          // record 模块关闭时不做 checkin/finance auto_archive；健康独立开关
           if (k === "checkin" || k === "finance") {
             if (!((plugin as any).isModuleEnabled?.("record") ?? false)) return false;
             // 手动 busy 时跳过（避免并发冲突）
+            if (plugin.isRecordManualBusy()) return false;
+          }
+          if (k === "health") {
             if (plugin.isRecordManualBusy()) return false;
           }
 
@@ -1122,10 +1098,13 @@ export function createPipelineManager(plugin: RSLattePlugin) {
           const sAny: any = plugin.settings as any;
           if (k === "task") return (sAny?.taskModule?.autoArchiveEnabled ?? true) === true;
           if (k === "memo") return (sAny?.memoModule?.autoArchiveEnabled ?? true) === true;
+          if (k === "schedule") return (sAny?.scheduleModule?.autoArchiveEnabled ?? true) === true;
           if (k === "checkin") return (sAny?.checkinPanel?.autoArchiveEnabled ?? false) === true;
           if (k === "finance") return (sAny?.financePanel?.autoArchiveEnabled ?? false) === true;
+          if (k === "health") return (sAny?.healthPanel?.autoArchiveEnabled ?? false) === true;
           if (k === "project") return (sAny?.projectAutoArchiveEnabled ?? true) === true;
           if (k === "output") return (sAny?.outputPanel?.autoArchiveEnabled ?? false) === true;
+          if (k === "knowledge") return false;
 
           return true;
         },
@@ -1190,7 +1169,13 @@ export function createPipelineManager(plugin: RSLattePlugin) {
 
         if (spaceIds.length === 0) {
           // 如果没有配置空间，使用当前空间
-          await getAutoRefreshCoordinator()?.tick(plugin.getSpaceCtx());
+          const ctx0 = plugin.getSpaceCtx();
+          await getAutoRefreshCoordinator()?.tick(ctx0);
+          try {
+            await runE2SealPreviousPeriodReviewSnapshots(plugin, ctx0.spaceId);
+          } catch (e: any) {
+            console.warn("[RSLatte] review E2 seal after auto_refresh tick failed:", e);
+          }
         } else {
           // 为每个空间执行自动刷新
           for (const spaceId of spaceIds) {
@@ -1199,6 +1184,11 @@ export function createPipelineManager(plugin: RSLattePlugin) {
               const spaceCtx = buildSpaceCtx(plugin.settings, spaceId);
               console.log(`[rslatte] Auto refresh tick: processing space ${spaceId} (${spaceCtx.space?.name || spaceId})`);
               await getAutoRefreshCoordinator()?.tick(spaceCtx);
+              try {
+                await runE2SealPreviousPeriodReviewSnapshots(plugin, spaceId);
+              } catch (e: any) {
+                console.warn(`[RSLatte] review E2 seal after tick failed (${spaceId}):`, e);
+              }
             } catch (e: any) {
               console.warn(`[rslatte] Auto refresh failed for space ${spaceId}:`, e);
             }
@@ -1210,96 +1200,28 @@ export function createPipelineManager(plugin: RSLattePlugin) {
 
         // Contacts: auto_refresh is handled by coordinator.tick() via engine.runE2; keep auto_archive here (best-effort; does not depend on backend)
         await (plugin as any).autoArchiveContactsIfNeeded?.();
+
+        // WorkEvent：JSONL 与 DB 双写（非实时），与本次自动刷新同周期
+        if ((plugin as any).isWorkEventDbSyncEnabled?.() === true) {
+          const vaultOk = await (plugin as any).vaultSvc?.ensureVaultReadySafe?.("syncWorkEventsToDb");
+          const db = vaultOk ? await (plugin as any).vaultSvc?.checkDbReadySafe?.("syncWorkEventsToDb") : null;
+          if (vaultOk && db?.ok) {
+            const ids =
+              spaceIds.length > 0
+                ? spaceIds
+                : [String((plugin as any).getCurrentSpaceId?.() ?? "").trim()].filter(Boolean);
+            for (const sid of ids) {
+              try {
+                await (plugin as any).syncWorkEventsToDbForSpace?.(sid, { reason: "auto_refresh_tick" });
+              } catch (e: any) {
+                console.warn(`[RSLatte] syncWorkEventsToDbForSpace failed (${sid}):`, e);
+              }
+            }
+          }
+        }
       } finally {
         setAutoRefreshTickRunning(false);
       }
-    },
-
-    /**
-     * 已废弃但保留的方法
-     * 用于兼容旧代码
-     */
-    async autoRefreshIncrementalAndMaybeSync(): Promise<void> {
-      const engine = plugin.pipelineEngine;
-
-      // Record (checkin/finance) - 保留旧调度策略：手动 busy 时跳过
-      if (plugin.isPipelineModuleEnabled("checkin") || plugin.isPipelineModuleEnabled("finance")) {
-        if (plugin.isRecordManualBusy()) {
-          if (plugin.isDebugLogEnabled()) {
-            plugin.dbg("autoRefresh", "skip_record_due_to_manual_busy", {});
-          }
-        } else {
-          try {
-            // ✅ E2：record（checkin/finance）已原子化，auto_refresh 走 Engine.runE2（auto 不 reconcile）
-            const ctx = plugin.getSpaceCtx();
-            if (plugin.isPipelineModuleEnabled("checkin")) await engine.runE2(ctx, "checkin", "auto_refresh");
-            if (plugin.isPipelineModuleEnabled("finance")) await engine.runE2(ctx, "finance", "auto_refresh");
-          } catch (e) {
-            console.warn("RSLatte auto refresh record via engine failed:", e);
-          }
-        }
-      }
-
-      // Task / Memo (v6-5.4: split dispatch by v2 module gates)
-      {
-        const ran: string[] = [];
-
-        if ((plugin as any).isTaskModuleEnabledV2?.()) {
-          const label = "任务";
-          console.log(`[RSLatte][自动刷新][${label}] 开始`);
-          const t0 = Date.now();
-          try {
-            const r = await engine.runE2(plugin.getSpaceCtx(), "task", "auto_refresh");
-            if (r.ok && !r.data.skipped) ran.push(label);
-          } catch (e) {
-            console.warn("RSLatte auto refresh task module via engine failed:", e);
-          } finally {
-            console.log(`[RSLatte][自动刷新][${label}] 结束 (${Date.now() - t0}ms)`);
-          }
-        }
-
-        if ((plugin as any).isMemoModuleEnabledV2?.()) {
-          const label = "备忘";
-          console.log(`[RSLatte][自动刷新][${label}] 开始`);
-          const t0 = Date.now();
-          try {
-            const r = await engine.runE2(plugin.getSpaceCtx(), "memo", "auto_refresh");
-            if (r.ok && !r.data.skipped) ran.push(label);
-          } catch (e) {
-            console.warn("RSLatte auto refresh memo module via engine failed:", e);
-          } finally {
-            console.log(`[RSLatte][自动刷新][${label}] 结束 (${Date.now() - t0}ms)`);
-          }
-        }
-
-        if (ran.length) {
-          // Notice: also show refresh type (auto) + modules
-          new Notice(`自动刷新完成：${ran.join('、')}`);
-        }
-      }
-
-      // Project
-      if (plugin.isPipelineModuleEnabled("project")) {
-        try {
-          await engine.runE2(plugin.getSpaceCtx(), "project", "auto_refresh");
-        } catch (e) {
-          console.warn("RSLatte auto refresh project via engine failed:", e);
-        }
-      }
-
-      // Output
-      if (plugin.isPipelineModuleEnabled("output")) {
-        try {
-          console.log("[rslatte] Starting auto refresh for output module");
-          await engine.runE2(plugin.getSpaceCtx(), "output", "auto_refresh");
-          console.log("[rslatte] Auto refresh for output module completed");
-        } catch (e) {
-          console.warn("RSLatte auto refresh output via engine failed:", e);
-        }
-      }
-
-      // UI refresh (best-effort)
-      try { (plugin as any).refreshSidePanel?.(); } catch { }
     },
   };
 }

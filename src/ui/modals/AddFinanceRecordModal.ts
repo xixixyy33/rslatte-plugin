@@ -1,7 +1,20 @@
 import { App, ButtonComponent, Modal, Notice, Setting, TextComponent } from "obsidian";
 import moment from "moment";
 import type RSLattePlugin from "../../main";
-import { buildFinanceNoteWithSubcategory, normalizeFinanceSubcategory } from "../../services/finance/financeSubcategory";
+import { extractFinanceMeta, normalizeFinanceSubcategory } from "../../services/finance/financeSubcategory";
+import {
+  buildFinanceListItemLine,
+  buildFinanceMainNoteParts,
+  generateFinanceEntryId,
+  stringifyFinanceMetaComment,
+} from "../../services/finance/financeJournalMeta";
+import { FINANCE_CYCLE_LABELS, normalizeFinanceCycleType, type FinanceCycleType } from "../../types/rslatteTypes";
+import { interactiveResolveCycleMetaForSave } from "../../services/finance/financeCycleInteractive";
+import { findAnyEnabledFinanceCyclePlanSameTriple, findConflictingEnabledFinanceCyclePlan } from "../../services/finance/financeCyclePlan";
+import {
+  collectAllFinanceInstitutionNames,
+  suggestSimilarInstitutionNames,
+} from "../../services/finance/financeInstitutionSimilarity";
 
 const momentFn = moment as any;
 
@@ -37,6 +50,9 @@ export class AddFinanceRecordModal extends Modal {
     let amountRaw = "";
     let note = "";
     let subcategory = "";
+    let institutionName = "";
+    let cycleType: FinanceCycleType = "none";
+    let sceneTags: string[] = [];
 
     let dateInput!: TextComponent;
     let categorySelect!: any;
@@ -45,6 +61,31 @@ export class AddFinanceRecordModal extends Modal {
     let subcategoryText!: TextComponent;
     let saveBtn!: ButtonComponent;
     let inFlight = false;
+    let institutionDdComp: any = null;
+    let institutionTxtComp: any = null;
+    let sceneTagsPool: string[] = [];
+    let sceneTagsWrap: HTMLElement | null = null;
+    let instSimilarEl: HTMLElement | null = null;
+    let cycleHintEl: HTMLElement | null = null;
+    let institutionRowEl: HTMLElement | null = null;
+    let cycleRowEl: HTMLElement | null = null;
+    let cycleDdEl: HTMLSelectElement | null = null;
+    const INST_MANUAL = "__manual__";
+    const INST_NONE = "";
+
+    const getCycleConflict = () => {
+      if (!selectedCategoryId) return null;
+      const sub = normalizeFinanceSubcategory(subcategory);
+      const inst = String(institutionName ?? "").trim();
+      if (!sub || !inst || cycleType === "none") return null;
+      return findConflictingEnabledFinanceCyclePlan(
+        this.plugin.settings.financeCyclePlans,
+        selectedCategoryId,
+        sub,
+        inst,
+        cycleType
+      );
+    };
 
     const validate = () => {
       // 验证日期格式
@@ -53,7 +94,11 @@ export class AddFinanceRecordModal extends Modal {
       if (!selectedCategoryId) return false;
       // 验证金额
       const n = Number(amountRaw);
-      return Number.isFinite(n) && n > 0;
+      if (!(Number.isFinite(n) && n > 0)) return false;
+      // 周期不为无周期时，机构必填
+      if (cycleType !== "none" && !institutionName.trim()) return false;
+      if (getCycleConflict()) return false;
+      return true;
     };
 
     const setInFlight = (v: boolean) => {
@@ -67,6 +112,8 @@ export class AddFinanceRecordModal extends Modal {
         (amountText as any)?.setDisabled?.(v);
         (noteText as any)?.setDisabled?.(v);
         (subcategoryText as any)?.setDisabled?.(v);
+        (institutionTxtComp as any)?.setDisabled?.(v);
+        (institutionDdComp as any)?.setDisabled?.(v);
       } catch { }
     };
 
@@ -74,6 +121,62 @@ export class AddFinanceRecordModal extends Modal {
       const ok = validate();
       if (saveBtn) saveBtn.setDisabled(inFlight || !ok);
       return ok;
+    };
+
+    const refreshAuxHints = () => {
+      try {
+        if (instSimilarEl) {
+          instSimilarEl.empty();
+          const all = collectAllFinanceInstitutionNames(this.plugin.settings.financeCategories);
+          const sug = suggestSimilarInstitutionNames(
+            institutionName,
+            all,
+            this.plugin.settings.financeInstitutionSimilarIgnore
+          );
+          const hasSimilar = sug.length > 0;
+          institutionTxtComp?.inputEl?.classList?.toggle("rslatte-input-warning", hasSimilar);
+          institutionDdComp?.selectEl?.classList?.toggle("rslatte-input-warning", hasSimilar);
+          institutionRowEl?.classList?.toggle("rslatte-warning-row", hasSimilar);
+          if (sug.length) {
+            const box = instSimilarEl.createDiv({ cls: "rslatte-finance-inline-hint rslatte-finance-inline-hint-warning" });
+            box.createSpan({ text: "机构名与已有 " });
+            sug.forEach((name, idx) => {
+              if (idx > 0) box.createSpan({ text: "、" });
+              box.createEl("b", { text: `「${name}」` });
+            });
+            box.createSpan({ text: " 较接近，可优先选用以减少分裂（非强制）。" });
+          }
+        }
+        if (cycleHintEl) {
+          cycleHintEl.empty();
+          const conflict = getCycleConflict();
+          cycleDdEl?.classList?.toggle("is-invalid", !!conflict);
+          cycleRowEl?.classList?.toggle("is-invalid-row", !!conflict);
+          if (conflict) {
+            const box = cycleHintEl.createDiv({ cls: "rslatte-finance-inline-hint rslatte-finance-inline-hint-error" });
+            box.createSpan({ text: "周期冲突：本分类+子类+机构已存在 " });
+            box.createEl("b", { text: `「${FINANCE_CYCLE_LABELS[normalizeFinanceCycleType(conflict.cycleType)]}」` });
+            box.createSpan({ text: `，当前选择「${FINANCE_CYCLE_LABELS[cycleType]}」不可保存。请改为已存在周期或改为「无周期」。` });
+            return;
+          }
+          if (cycleType === "none" && selectedCategoryId && normalizeFinanceSubcategory(subcategory) && institutionName.trim()) {
+            const hit = findAnyEnabledFinanceCyclePlanSameTriple(
+              this.plugin.settings.financeCyclePlans,
+              selectedCategoryId,
+              subcategory,
+              institutionName
+            );
+            if (hit) {
+              const box = cycleHintEl.createDiv({ cls: "rslatte-finance-inline-hint rslatte-finance-inline-hint-info" });
+              box.createSpan({ text: "提示：周期表已有 " });
+              box.createEl("b", { text: `「${FINANCE_CYCLE_LABELS[normalizeFinanceCycleType(hit.cycleType)]}」` });
+              box.createSpan({ text: " 与本条分类+子类+机构一致；当前记为无周期流水（允许）。" });
+            }
+          }
+        }
+      } catch {
+        /* ignore */
+      }
     };
 
     // ===== 日期选择 =====
@@ -93,6 +196,7 @@ export class AddFinanceRecordModal extends Modal {
     // ===== 财务分类 =====
     // 预加载已知子分类（当分类改变时更新）
     let knownSubs: string[] = [];
+    let knownInstitutions: string[] = [];
     const loadKnownSubs = async (catId: string) => {
       if (!catId) {
         knownSubs = [];
@@ -102,6 +206,29 @@ export class AddFinanceRecordModal extends Modal {
         knownSubs = await this.plugin.recordRSLatte?.getFinanceSubcategories?.(catId) ?? [];
       } catch {
         knownSubs = [];
+      }
+    };
+    const loadKnownInstitutions = async (catId: string) => {
+      if (!catId) {
+        knownInstitutions = [];
+        return;
+      }
+      try {
+        knownInstitutions = await this.plugin.recordRSLatte?.getFinanceInstitutions?.(catId) ?? [];
+      } catch {
+        knownInstitutions = [];
+      }
+      // fallback to settings list
+      if (knownInstitutions.length === 0) {
+        const cat = this.plugin.settings.financeCategories.find((x) => x.id === catId) as any;
+        knownInstitutions = Array.isArray(cat?.institutionNames) ? cat.institutionNames : [];
+      }
+    };
+    const loadSceneTagsHistory = async () => {
+      try {
+        sceneTagsPool = await this.plugin.recordRSLatte?.getFinanceSceneTagsHistory?.() ?? [];
+      } catch {
+        sceneTagsPool = [];
       }
     };
     
@@ -124,13 +251,21 @@ export class AddFinanceRecordModal extends Modal {
           selectedCategoryId = v;
           // ✅ 当分类改变时，清空子分类并更新子分类列表
           subcategory = "";
+          institutionName = "";
           if (txtComp) {
             try { txtComp.setValue(""); } catch {}
+          }
+          if (institutionTxtComp) {
+            try { institutionTxtComp.setValue(""); } catch {}
           }
           if (ddComp) {
             try { ddComp.setValue(NONE); } catch {}
           }
+          if (institutionDdComp) {
+            try { institutionDdComp.setValue(INST_NONE); } catch {}
+          }
           await loadKnownSubs(v);
+          await loadKnownInstitutions(v);
           // 重新渲染下拉框选项（延迟执行，确保 ddComp 已创建）
           window.setTimeout(() => {
             if (ddComp) {
@@ -144,8 +279,20 @@ export class AddFinanceRecordModal extends Modal {
                 console.warn("更新子分类下拉框失败", e);
               }
             }
+            if (institutionDdComp) {
+              try {
+                institutionDdComp.selectEl.empty();
+                institutionDdComp.addOption(INST_NONE, "（无）");
+                for (const s of knownInstitutions) institutionDdComp.addOption(s, s);
+                institutionDdComp.addOption(INST_MANUAL, "手动输入");
+                institutionDdComp.setValue(INST_NONE);
+              } catch (e) {
+                console.warn("更新机构名下拉框失败", e);
+              }
+            }
           }, 0);
           refreshValidation();
+          refreshAuxHints();
         });
       });
 
@@ -167,14 +314,16 @@ export class AddFinanceRecordModal extends Modal {
           if (v === NONE) {
             subcategory = "";
             try { txtComp?.setValue?.(""); } catch {}
+            refreshAuxHints();
             return;
           }
           if (v === MANUAL) {
-            // keep current text input
+            refreshAuxHints();
             return;
           }
           subcategory = normalizeFinanceSubcategory(v);
           try { txtComp?.setValue?.(subcategory); } catch {}
+          refreshAuxHints();
         });
       });
 
@@ -190,8 +339,119 @@ export class AddFinanceRecordModal extends Modal {
             else if (knownSubs.includes(subcategory)) ddComp?.setValue?.(subcategory);
             else ddComp?.setValue?.(MANUAL);
           } catch {}
+          refreshAuxHints();
         });
       });
+    }
+
+    // ===== 机构名 =====
+    {
+      const row = new Setting(contentEl)
+        .setName("机构名")
+        .setDesc("可选；周期类型不为「无周期」时必填（按财务分类维护）");
+      institutionRowEl = row.settingEl;
+      row.addDropdown((dd) => {
+        institutionDdComp = dd;
+        dd.addOption(INST_NONE, "（无）");
+        for (const s of knownInstitutions) dd.addOption(s, s);
+        dd.addOption(INST_MANUAL, "手动输入");
+        const init = knownInstitutions.includes(institutionName) ? institutionName : (institutionName ? INST_MANUAL : INST_NONE);
+        dd.setValue(init);
+        dd.onChange((v) => {
+          if (v === INST_NONE) {
+            institutionName = "";
+            try { institutionTxtComp?.setValue?.(""); } catch {}
+            refreshValidation();
+            refreshAuxHints();
+            return;
+          }
+          if (v === INST_MANUAL) {
+            refreshValidation();
+            refreshAuxHints();
+            return;
+          }
+          institutionName = String(v ?? "").trim();
+          try { institutionTxtComp?.setValue?.(institutionName); } catch {}
+          refreshValidation();
+          refreshAuxHints();
+        });
+      });
+      row.addText((t) => {
+        institutionTxtComp = t;
+        t.setPlaceholder("可选；可新建");
+        t.setValue(institutionName);
+        t.onChange((v) => {
+          institutionName = String(v ?? "").trim().replace(/\s+/g, " ");
+          try {
+            if (!institutionName) institutionDdComp?.setValue?.(INST_NONE);
+            else if (knownInstitutions.includes(institutionName)) institutionDdComp?.setValue?.(institutionName);
+            else institutionDdComp?.setValue?.(INST_MANUAL);
+          } catch {}
+          refreshValidation();
+          refreshAuxHints();
+        });
+      });
+      instSimilarEl = row.settingEl.createDiv({ cls: "rslatte-finance-inst-similar" });
+    }
+
+    // ===== 周期类型 =====
+    new Setting(contentEl)
+      .setName("周期类型")
+      .setDesc("必填；非「无周期」时机构名必填")
+      .addDropdown((dd) => {
+        cycleRowEl = dd.selectEl.closest(".setting-item") as HTMLElement | null;
+        cycleDdEl = dd.selectEl;
+        const order: FinanceCycleType[] = ["none", "weekly", "biweekly", "monthly", "quarterly", "halfyearly", "yearly"];
+        for (const key of order) dd.addOption(key, FINANCE_CYCLE_LABELS[key]);
+        dd.setValue(cycleType);
+        dd.onChange((v) => {
+          cycleType = normalizeFinanceCycleType(v);
+          refreshValidation();
+          refreshAuxHints();
+        });
+      });
+    cycleHintEl = contentEl.createDiv({ cls: "rslatte-finance-cycle-hint" });
+
+    // ===== 场景标签 =====
+    {
+      const row = new Setting(contentEl)
+        .setName("场景标签")
+        .setDesc("可选；可从历史标签多选，也可手动新增");
+      const container = row.settingEl.createDiv({ cls: "rslatte-fin-scene-tags-editor" });
+      sceneTagsWrap = container.createDiv({ cls: "rslatte-subcategories-list" });
+      const renderSceneTags = () => {
+        if (!sceneTagsWrap) return;
+        sceneTagsWrap.empty();
+        for (const tag of sceneTags) {
+          const chip = sceneTagsWrap.createSpan({ cls: "rslatte-subcategory-tag", text: tag });
+          const rm = chip.createSpan({ cls: "rslatte-subcategory-remove", text: "×" });
+          rm.onclick = () => {
+            sceneTags = sceneTags.filter((x) => x !== tag);
+            renderSceneTags();
+          };
+        }
+      };
+      const actionRow = container.createDiv({ cls: "rslatte-subcat-inline-actions" });
+      const select = actionRow.createEl("select");
+      select.createEl("option", { text: "从历史标签选择", value: "" });
+      for (const t of sceneTagsPool) select.createEl("option", { text: t, value: t });
+      const addSel = actionRow.createEl("button", { text: "添加" });
+      const input = actionRow.createEl("input", { type: "text", attr: { placeholder: "新标签（可多个，逗号分隔）" } });
+      const addManual = actionRow.createEl("button", { text: "新增", cls: "mod-cta" });
+      const addTag = (tag: string) => {
+        const v = String(tag ?? "").trim().replace(/\s+/g, " ");
+        if (!v) return;
+        if (sceneTags.includes(v)) return;
+        sceneTags.push(v);
+        renderSceneTags();
+      };
+      addSel.onclick = () => addTag(select.value);
+      addManual.onclick = () => {
+        const parts = String(input.value ?? "").split(/[，,]/g).map((x) => String(x ?? "").trim()).filter(Boolean);
+        for (const p of parts) addTag(p);
+        input.value = "";
+      };
+      renderSceneTags();
     }
 
     // ===== 金额 =====
@@ -232,12 +492,12 @@ export class AddFinanceRecordModal extends Modal {
         });
       });
 
-    // ===== 初始化加载第一个分类的子分类（延迟执行，确保 ddComp 已创建） =====
+    // ===== 初始化加载第一个分类的子分类/机构（延迟执行，确保组件已创建） =====
     const selectedCategory = () => categories.find(c => c.id === selectedCategoryId);
     if (categories.length > 0 && !selectedCategoryId) {
       selectedCategoryId = categories[0].id;
       categorySelect.setValue(selectedCategoryId);
-      void loadKnownSubs(selectedCategoryId).then(() => {
+      void Promise.all([loadKnownSubs(selectedCategoryId), loadKnownInstitutions(selectedCategoryId), loadSceneTagsHistory()]).then(() => {
         // 延迟更新下拉框选项，确保 ddComp 已创建
         window.setTimeout(() => {
           if (ddComp) {
@@ -251,8 +511,21 @@ export class AddFinanceRecordModal extends Modal {
               console.warn("初始化子分类下拉框失败", e);
             }
           }
+          if (institutionDdComp) {
+            try {
+              institutionDdComp.selectEl.empty();
+              institutionDdComp.addOption(INST_NONE, "（无）");
+              for (const s of knownInstitutions) institutionDdComp.addOption(s, s);
+              institutionDdComp.addOption(INST_MANUAL, "手动输入");
+              institutionDdComp.setValue(INST_NONE);
+            } catch (e) {
+              console.warn("初始化机构下拉框失败", e);
+            }
+          }
         }, 50);
       });
+    } else {
+      void loadSceneTagsHistory();
     }
 
     // ===== 操作按钮 =====
@@ -267,112 +540,70 @@ export class AddFinanceRecordModal extends Modal {
       if (inFlight) return;
       if (!refreshValidation()) return;
 
-      setInFlight(true);
-
       try {
         const dateKey = selectedDate;
         const category = selectedCategory();
         if (!category) {
           new Notice("请选择财务分类");
-          setInFlight(false);
           return;
         }
 
         const nAbs = Number(amountRaw);
         if (!Number.isFinite(nAbs) || nAbs <= 0) {
           new Notice("请输入有效的金额");
-          setInFlight(false);
           return;
         }
 
         const type = category.type; // income | expense
         const signedAmount = type === "expense" ? -nAbs : nAbs;
-        const safeNote = buildFinanceNoteWithSubcategory(subcategory, note);
-
-        // ✅ 检查该日期该分类是否已有记录（且未删除）
-        let existingRecord: any = null;
-        try {
-          // 从索引中查找该日期和分类的记录（检查活跃和归档记录，以及统计缓存）
-          if (this.plugin.recordRSLatte) {
-            // 优先使用统计缓存（包含全量数据，不受归档影响）
-            let allRecords: any[] = [];
-            try {
-              const statsCache = await this.plugin.recordRSLatte.getFinanceStatsCache();
-              if (statsCache?.items && statsCache.items.length > 0) {
-                allRecords = statsCache.items as any[];
-              } else {
-                // 回退到主索引（活跃 + 归档）
-                const fSnapActive = await this.plugin.recordRSLatte.getFinanceSnapshot(false);
-                const fSnapArch = await this.plugin.recordRSLatte.getFinanceSnapshot(true);
-                allRecords = [
-                  ...(fSnapActive?.items ?? []),
-                  ...(fSnapArch?.items ?? [])
-                ];
-              }
-            } catch {
-              // 如果获取缓存失败，回退到主索引
-              const fSnapActive = await this.plugin.recordRSLatte.getFinanceSnapshot(false);
-              const fSnapArch = await this.plugin.recordRSLatte.getFinanceSnapshot(true);
-              allRecords = [
-                ...(fSnapActive?.items ?? []),
-                ...(fSnapArch?.items ?? [])
-              ];
-            }
-            
-            // 查找匹配的记录
-            existingRecord = allRecords.find(
-              (item: any) => {
-                // 严格检查：日期和分类ID必须匹配，且记录未删除
-                // 支持两种字段名格式：record_date/recordDate, category_id/categoryId
-                const itemDate = String(item.record_date || item.recordDate || "").trim();
-                const itemCategoryId = String(item.category_id || item.categoryId || "").trim();
-                const dateMatch = itemDate === String(dateKey || "").trim();
-                const categoryMatch = itemCategoryId === String(category.id || "").trim();
-                
-                // 检查 is_delete：可能是布尔值、字符串 "true"/"false"、或 undefined/null
-                // 支持两种字段名格式：is_delete/isDelete
-                const isDeleted = item.is_delete === true || item.isDelete === true || String(item.is_delete || item.isDelete || "").toLowerCase() === "true";
-                
-                const matches = dateMatch && categoryMatch && !isDeleted;
-                
-                if (this.plugin.isDebugLogEnabled() && dateMatch && categoryMatch) {
-                  console.log(`[RSLatte][AddFinanceRecord] 找到日期和分类匹配的记录:`, {
-                    itemDate,
-                    itemCategoryId,
-                    dateKey,
-                    categoryId: category.id,
-                    isDeleted,
-                    matches
-                  });
-                }
-                
-                return matches;
-              }
-            );
-            
-            if (this.plugin.isDebugLogEnabled()) {
-              console.log(`[RSLatte][AddFinanceRecord] 检查重复记录: dateKey=${dateKey}, categoryId=${category.id}, 扫描了 ${allRecords.length} 条记录, 找到匹配记录=${!!existingRecord}`);
-              if (existingRecord) {
-                console.log(`[RSLatte][AddFinanceRecord] 找到已有记录:`, existingRecord);
-              }
-            }
-          }
-        } catch (e) {
-          console.warn("[RSLatte][AddFinanceRecord] 检查已有记录失败", e);
+        if (cycleType !== "none" && !institutionName.trim()) {
+          new Notice("周期类型不为“无周期”时，机构名必填");
+          return;
         }
-
-        // ✅ 如果已有未删除的记录，不允许插入
-        if (existingRecord) {
-          new Notice(`该日期（${dateKey}）和财务分类（${category.name}）已有记录，请先取消已有记录后再插入`);
-          setInFlight(false);
+        const normalizedSubcat = normalizeFinanceSubcategory(subcategory);
+        if (!normalizedSubcat) {
+          new Notice("子分类不能为空");
           return;
         }
 
+        const noteMain = buildFinanceMainNoteParts({
+          subcategory: normalizedSubcat,
+          institutionName,
+          cycleType,
+          bodyNote: note,
+        });
+
+        if (dateKey === this.plugin.getTodayKey()) {
+          const siblings =
+            (await this.plugin.recordRSLatte?.getTodayFinanceRecordsForCategory?.(category.id, { activeOnly: true })) ?? [];
+          const dup = siblings.filter((x) => {
+            const ssub = String(x.subcategory ?? "").trim() || extractFinanceMeta(x.note ?? "").subcategory;
+            return normalizeFinanceSubcategory(ssub) === normalizedSubcat && Math.abs(Number(x.amount)) === Math.abs(Number(signedAmount));
+          });
+          if (dup.length > 0) {
+            const ok = window.confirm("今日该分类已有非常相似的一笔（同子分类、同金额），是否仍要保存？");
+            if (!ok) return;
+          }
+        }
+
+        const cycRes = await interactiveResolveCycleMetaForSave(this.plugin, {
+          catId: category.id,
+          subcategory: normalizedSubcat,
+          institutionName,
+          cycleType,
+          recordDateKey: dateKey,
+        });
+        if (cycRes == null) return;
+
+        setInFlight(true);
+
+        const entryId = generateFinanceEntryId();
         const payload = {
           record_date: dateKey,
           category_id: category.id,
+          entry_id: entryId,
           amount: signedAmount,
-          note: safeNote,
+          note: noteMain,
           is_delete: false,
         };
 
@@ -381,9 +612,13 @@ export class AddFinanceRecordModal extends Modal {
           id: 0, // 新建记录，id 为 0
           record_date: dateKey,
           category_id: category.id,
+          entry_id: entryId,
           type,
           amount: Number(signedAmount),
-          note: safeNote,
+          note: noteMain,
+          institution_name: institutionName || undefined,
+          cycle_type: cycleType,
+          scene_tags: sceneTags,
           is_delete: false,
           created_at: new Date().toISOString(),
         };
@@ -395,8 +630,14 @@ export class AddFinanceRecordModal extends Modal {
         }
         // 历史日期：直接写入索引（不需要更新 _todayFinancesMap，因为那是今天的缓存）
 
+        const financeCat = this.plugin.settings.financeCategories?.find(c => c.id === category.id) as any;
+        if (financeCat) {
+          if (!Array.isArray(financeCat.institutionNames)) financeCat.institutionNames = [];
+          const inst = String(institutionName ?? "").trim().replace(/\s+/g, " ");
+          if (inst && !financeCat.institutionNames.includes(inst)) financeCat.institutionNames.push(inst);
+        }
+
         // ✅ 如果使用了子分类且子分类不在分类的子分类列表中，自动添加到列表
-        const normalizedSubcat = subcategory ? normalizeFinanceSubcategory(subcategory) : "";
         if (normalizedSubcat) {
           if (!category.subCategories) category.subCategories = [];
           if (!category.subCategories.includes(normalizedSubcat)) {
@@ -409,11 +650,17 @@ export class AddFinanceRecordModal extends Modal {
         try {
           await this.plugin.recordRSLatte?.upsertFinanceRecord({
             recordDate: dateKey,
+            entryId,
             categoryId: category.id,
             categoryName: category.name,
             type,
+            subcategory: normalizedSubcat,
             amount: Number(signedAmount),
-            note: safeNote,
+            note: noteMain,
+            institutionName: institutionName || undefined,
+            cycleType: cycleType,
+            cycleId: cycRes.cycleIdForMeta === undefined ? undefined : cycRes.cycleIdForMeta,
+            sceneTags: sceneTags,
             isDelete: false,
             tsMs: Date.now(),
           });
@@ -421,12 +668,26 @@ export class AddFinanceRecordModal extends Modal {
           console.warn("recordRSLatte upsertFinanceRecord failed", e);
         }
 
-        // ✅ 写入日记
+        // ✅ 写入日记（主行 + meta）
         try {
-          const safeCatName = String(category.name ?? "").trim().replace(/\s+/g, "");
-          const line = `- ${dateKey} ${type} ${category.id} ${safeCatName || category.id} ${safeNote || "-"} ${signedAmount.toFixed(2)}`;
-
-          await ((this.plugin as any).appendJournalByModule?.("finance", dateKey, [line]) ?? Promise.resolve());
+          const mainLine = buildFinanceListItemLine({
+            dateKey,
+            type,
+            categoryId: category.id,
+            categoryDisplayName: category.name,
+            noteMain: noteMain || "-",
+            signedAmount,
+            isDelete: false,
+          });
+          const metaLine = stringifyFinanceMetaComment({
+            entry_id: entryId,
+            subcategory: normalizedSubcat,
+            institution_name: institutionName || undefined,
+            cycle_type: cycleType,
+            cycle_id: cycRes.cycleIdForMeta,
+            scene_tags: sceneTags,
+          });
+          await ((this.plugin as any).appendJournalByModule?.("finance", dateKey, [mainLine, metaLine]) ?? Promise.resolve());
         } catch (e: any) {
           new Notice("财务记录已保存，但写入日记失败");
           await this.plugin.appendAuditLog({
@@ -464,11 +725,16 @@ export class AddFinanceRecordModal extends Modal {
             source: "ui",
             ref: {
               record_date: dateKey,
+              entry_id: entryId,
+              type,
               category_id: category.id,
               category_name: category.name || undefined,
               amount: Number(signedAmount),
               subcategory: normalizedSubcat || undefined,
-              note: (safeNote || "").trim() || undefined,
+              institution_name: institutionName || undefined,
+              cycle_type: cycleType,
+              scene_tags: sceneTags,
+              note: (noteMain || "").trim() || undefined,
               is_delete: false,
             },
             summary: `💰 新增账单 ${category.name || category.id} ${Number(signedAmount)}（日期：${dateKey}）`,
@@ -500,6 +766,7 @@ export class AddFinanceRecordModal extends Modal {
     window.setTimeout(() => {
       dateInput?.inputEl?.focus();
       refreshValidation();
+      refreshAuxHints();
     }, 0);
   }
 

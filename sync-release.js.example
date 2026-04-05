@@ -1,0 +1,62 @@
+/**
+ * sync-release.js 示例（脱敏）
+ *
+ * 用法：
+ * 1) 复制本文件为 sync-release.js
+ * 2) 按你的本机路径修改以下常量
+ * 3) 运行 npm run sync / npm run build:release
+ *
+ * 说明：此文件为公开模板，不包含任何个人本机路径。
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+// ===== 请按你的环境修改 =====
+const RELEASE_ROOT = process.env.RSLATTE_RELEASE_ROOT || 'D:\\release';
+const PLUGIN_RELEASE_DIR = path.join(RELEASE_ROOT, 'plugin-release', 'rslatte-plugin');
+const PLUGIN_PUBLIC_RELEASE_DIR = path.join(RELEASE_ROOT, 'public-release', 'rslatte-plugin');
+const CODE_RELEASE_DIR = path.join(RELEASE_ROOT, 'code-release', 'rslatte-plugin');
+
+// 可选：本地 Obsidian 插件目录（不需要可置空）
+const OBSIDIAN_PLUGIN_DIR = process.env.RSLATTE_OBSIDIAN_PLUGIN_DIR || '';
+
+const BUILD_FILES = [
+  'main.js',
+  'main.js.map',
+  'manifest.json',
+  'styles.css',
+  'rslatte-workspace-preset.json',
+];
+
+/**
+ * 下面仅保留最小示例，避免公开具体发布实现细节。
+ * 你可以将本仓库当前 sync-release.js 中的完整逻辑拷贝过来使用。
+ */
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function copyBuildFilesTo(targetDir) {
+  ensureDir(targetDir);
+  for (const f of BUILD_FILES) {
+    const src = path.join(__dirname, f);
+    const dst = path.join(targetDir, f);
+    if (fs.existsSync(src)) fs.copyFileSync(src, dst);
+  }
+}
+
+function main() {
+  console.log('sync-release.js.example: template run');
+  copyBuildFilesTo(PLUGIN_RELEASE_DIR);
+  copyBuildFilesTo(PLUGIN_PUBLIC_RELEASE_DIR);
+  if (OBSIDIAN_PLUGIN_DIR && OBSIDIAN_PLUGIN_DIR.trim()) {
+    copyBuildFilesTo(OBSIDIAN_PLUGIN_DIR);
+  }
+  ensureDir(CODE_RELEASE_DIR);
+  console.log('done. Please replace with full project sync logic if needed.');
+}
+
+main();
+

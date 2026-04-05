@@ -1,0 +1,86 @@
+{
+  "_comment": "若载入失败或与你的 Obsidian 版本不兼容，请在本库执行 JSON.stringify(app.workspace.getLayout(), null, 2) 覆盖本文件（可删 _comment）。",
+  "main": {
+    "id": "rsl7main01split0",
+    "type": "split",
+    "direction": "vertical",
+    "children": [
+      {
+        "id": "rsl7maintabs01",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "rsl7mainleaf01",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "pinned": false
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "left": {
+    "id": "rsl7leftsplit0",
+    "type": "split",
+    "direction": "horizontal",
+    "children": [
+      {
+        "id": "rsl7lefttabs0",
+        "type": "tabs",
+        "dimension": 280,
+        "children": [
+          {
+            "id": "rsl7fileexp0",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": true
+              },
+              "pinned": false
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "right": {
+    "id": "rsl7rightsplit0",
+    "type": "split",
+    "direction": "horizontal",
+    "children": [
+      {
+        "id": "rsl7righttabs0",
+        "type": "tabs",
+        "dimension": 280,
+        "children": [
+          {
+            "id": "rsl7outline0",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {},
+              "pinned": false
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "left-ribbon": {
+    "id": "rsl7ribbon0",
+    "type": "leaf",
+    "state": {
+      "type": "ribbon",
+      "state": {
+        "sidebarTab": "left"
+      }
+    }
+  },
+  "active": "rsl7mainleaf01",
+  "lastOpenFiles": []
+}

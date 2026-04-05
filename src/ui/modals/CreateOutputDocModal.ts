@@ -1,7 +1,10 @@
 import { App, ButtonComponent, Modal, Notice, Setting, TextComponent, normalizePath, TFile } from "obsidian";
 
 import type RSLattePlugin from "../../main";
-import type { OutputTemplateDef } from "../../types/outputTypes";
+import { appendOutputCreatedLedgerEvent } from "../../outputRSLatte/outputHistoryLedger";
+import type { OutputCreateExtraFieldDef, OutputTemplateDef } from "../../types/outputTypes";
+import { formatYamlScalarLine, isReservedOutputFmKey } from "../../utils/outputYamlExtras";
+import { toLocalOffsetIsoString } from "../../utils/localCalendarYmd";
 
 function todayYmd(): string {
   try {
@@ -74,6 +77,8 @@ function buildFrontmatter(args: {
   create: string;
   docCategory?: string;
   domains: string[];
+  outputDocumentKind?: "general" | "project";
+  extraEntries?: { id: string; value: string; multiline?: boolean }[];
 }): string {
   const lines: string[] = [];
   lines.push("---");
@@ -92,6 +97,7 @@ function buildFrontmatter(args: {
   // requirement: create date stored in properties
   lines.push(`create: ${args.create}`);
   lines.push(`status: ${args.status}`);
+  lines.push(`output_document_kind: ${args.outputDocumentKind ?? "general"}`);
 
   // domains list (even if empty)
   if (args.domains?.length) {
@@ -99,6 +105,21 @@ function buildFrontmatter(args: {
     for (const d of args.domains) lines.push(`  - ${d}`);
   } else {
     lines.push("领域: []");
+  }
+
+  if (args.extraEntries?.length) {
+    for (const e of args.extraEntries) {
+      const k = String(e.id ?? "").trim();
+      const v = String(e.value ?? "").trim();
+      if (!k || !v) continue;
+      if (isReservedOutputFmKey(k)) continue;
+      if (e.multiline) {
+        lines.push(`${k}: |`);
+        for (const ln of v.split(/\r?\n/)) lines.push(`  ${ln}`);
+      } else {
+        lines.push(`${k}: ${formatYamlScalarLine(v)}`);
+      }
+    }
   }
 
   lines.push("---");
@@ -121,12 +142,16 @@ export class CreateOutputDocModal extends Modal {
     let domainsRaw = "";
 
     let fileNameInput!: TextComponent;
+    let domainsInput!: TextComponent;
     let createBtn!: ButtonComponent;
 
     const refresh = () => {
-      const ok = sanitizeFileName(fileName).length > 0;
+      const nameOk = sanitizeFileName(fileName).length > 0;
+      const domainsOk = parseCommaList(domainsRaw).length > 0;
+      const ok = nameOk && domainsOk;
       createBtn?.setDisabled(!ok);
-      fileNameInput?.inputEl?.classList.toggle("is-invalid", !ok);
+      fileNameInput?.inputEl?.classList.toggle("is-invalid", !nameOk);
+      domainsInput?.inputEl?.classList.toggle("is-invalid", !domainsOk);
       return ok;
     };
 
@@ -159,14 +184,42 @@ export class CreateOutputDocModal extends Modal {
       });
 
     new Setting(contentEl)
-      .setName("领域")
-      .setDesc("可选：多个用英文逗号分隔，创建后写入属性‘领域’(list)")
+      .setName("领域*")
+      .setDesc("必填：多个用英文逗号分隔，创建后写入属性‘领域’(list)")
       .addText((t) => {
-        t.setPlaceholder("(可选) 例如：OS,Security,Database");
+        domainsInput = t;
+        t.setPlaceholder("(必填) 例如：OS,Security,Database");
         t.onChange((v) => {
           domainsRaw = v ?? "";
+          refresh();
         });
       });
+
+    const op0 = this.plugin.settings.outputPanel;
+    const extraDefs = [...(op0?.createOutputExtraFields ?? [])].filter(
+      (d: OutputCreateExtraFieldDef) => d?.id && !isReservedOutputFmKey(String(d.id).trim()),
+    );
+    const extraValues: Record<string, string> = {};
+    for (const d of extraDefs) {
+      extraValues[d.id] = "";
+      const stExtra = new Setting(contentEl).setName(d.label || d.id).setDesc(`写入 YAML 键：${d.id}`);
+      if (d.multiline) {
+        stExtra.addTextArea((ta) => {
+          ta.setPlaceholder(d.placeholder ?? "");
+          ta.inputEl.rows = 4;
+          ta.onChange((v) => {
+            extraValues[d.id] = v ?? "";
+          });
+        });
+      } else {
+        stExtra.addText((t) => {
+          t.setPlaceholder(d.placeholder ?? "");
+          t.onChange((v) => {
+            extraValues[d.id] = v ?? "";
+          });
+        });
+      }
+    }
 
     const btnRow = new Setting(contentEl);
 
@@ -183,7 +236,12 @@ export class CreateOutputDocModal extends Modal {
     });
 
     const doCreate = async () => {
-      if (!refresh()) return;
+      if (!refresh()) {
+        if (parseCommaList(domainsRaw).length === 0) {
+          new Notice("领域不能为空，请至少填写一个领域");
+        }
+        return;
+      }
 
       const baseName = sanitizeFileName(fileName);
       const cat = (this.tpl.docCategory ?? "").trim();
@@ -226,7 +284,13 @@ export class CreateOutputDocModal extends Modal {
       const create = todayYmd();
       const outputId = genUuid();
       const domains = parseCommaList(domainsRaw);
-      const tags = (this.tpl.tags ?? []).map((t) => String(t).replace(/^#/, "").trim()).filter(Boolean);
+      const tags = ["output"];
+
+      const extraEntries = extraDefs.map((d) => ({
+        id: d.id,
+        value: extraValues[d.id] ?? "",
+        multiline: d.multiline,
+      }));
 
       const fm = buildFrontmatter({
         outputId,
@@ -236,6 +300,8 @@ export class CreateOutputDocModal extends Modal {
         create,
         docCategory: cat || undefined,
         domains,
+        outputDocumentKind: "general",
+        extraEntries,
       });
 
       const tplRaw = await readTemplate(this.app, this.tpl.templatePath);
@@ -262,13 +328,20 @@ export class CreateOutputDocModal extends Modal {
         void this.plugin.outputRSLatte?.upsertFile(created);
         this.plugin.refreshSidePanel();
 
+        void appendOutputCreatedLedgerEvent(this.plugin, {
+          sourceOutputPath: created.path,
+          outputId,
+          tsIso: toLocalOffsetIsoString(),
+          origin: "general",
+        });
+
         // open file
         const leaf = this.app.workspace.getLeaf(false);
         await leaf.openFile(created, { active: true });
 
         // ✅ Work Event (success only)
         void this.plugin.workEventSvc?.append({
-          ts: new Date().toISOString(),
+          ts: toLocalOffsetIsoString(),
           kind: "output",
           action: "create",
           source: "ui",
@@ -282,6 +355,14 @@ export class CreateOutputDocModal extends Modal {
           },
           summary: `📄 新建输出 ${title}`,
         });
+
+        const op = this.plugin.settings.outputPanel;
+        if (op && this.tpl.id) {
+          if (!op.templateCreateCounts) op.templateCreateCounts = {};
+          const tid = this.tpl.id;
+          op.templateCreateCounts[tid] = (op.templateCreateCounts[tid] ?? 0) + 1;
+          await this.plugin.saveSettings();
+        }
 
         new Notice(`已创建：${created.basename}`);
         this.close();

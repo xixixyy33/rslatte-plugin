@@ -2,6 +2,8 @@ import { moment } from "obsidian";
 import type { RSLatteIndexItem, RSLatteItemType } from "./types";
 import { RSLatteIndexStore } from "./indexStore";
 import { archiveStableKey } from "./keys";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
+import { normalizeRepeatRuleToken } from "./utils";
 
 export type ArchiveResult = {
   archivedCount: number;
@@ -15,22 +17,22 @@ export type ArchiveResult = {
  * Rules:
  * - task: only archive when CLOSED (DONE/CANCELLED), using ✅/❌ date.
  * - memo:
- *   - repeating memo (weekly/monthly/seasonly/yearly): only archive when DONE/CANCELLED, using ✅/❌ date.
+ *   - repeating memo (weekly/monthly/quarterly/yearly): only archive when DONE/CANCELLED, using ✅/❌ date.
  *   - one-time memo (none): archive by 📅 memoDate even if still TODO.
  */
 function getArchiveDate(type: RSLatteItemType, item: RSLatteIndexItem, today: string): string | null {
   // 1) CLOSED items (task + memo)
-  if (item.status === "CANCELLED") return item.cancelledDate || today;
-  if (item.status === "DONE") return item.doneDate || today;
+  if (item.status === "CANCELLED") return item.cancelled_date || today;
+  if (item.status === "DONE") return item.done_date || today;
 
   // 2) task: non-closed tasks are never archived
   if (type === "task") return null;
 
   // 3) memo: non-closed
   // normalize repeat rule; historical MM-DD memos without 🔁 should be treated as yearly
-  let rule = String((item as any).repeatRule || "").trim().toLowerCase();
+  let rule = normalizeRepeatRuleToken(String((item as any).repeatRule || "").trim().toLowerCase());
   if (!rule) rule = (item as any).memoMmdd ? "yearly" : "none";
-  const allowed = new Set(["none", "weekly", "monthly", "seasonly", "yearly"]);
+  const allowed = new Set(["none", "weekly", "monthly", "quarterly", "yearly"]);
   const rr = allowed.has(rule) ? rule : "none";
   if (rr !== "none") return null;
 
@@ -46,7 +48,7 @@ export async function archiveIndexByMonths(
 ): Promise<ArchiveResult> {
   const momentFn = moment as any;
   const today = momentFn().format("YYYY-MM-DD");
-  const days = Math.max(1, Math.min(3650, Math.floor(Number(thresholdDays) || 90)));
+  const days = normalizeArchiveThresholdDays(thresholdDays);
   const cutoff = momentFn(today).startOf("day").subtract(days, "days").format("YYYY-MM-DD");
 
   const idx = await store.readIndex(type);

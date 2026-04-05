@@ -23,15 +23,62 @@ export type CheckinRecordIndexItem = {
   dbLastError?: string;
 };
 
+export type HealthRecordIndexItem = {
+  recordDate: string;
+  /** 日记 meta 中的 entry_id；无 meta 时为空，按 metric_key 同日合并 */
+  entryId?: string;
+  metricKey: string;
+  /** 默认 day */
+  period?: string;
+  /** 逻辑卡片标识：D:… / W:… / M:…（meta.card_ref；旧数据可能为空） */
+  cardRef?: string;
+  /** 主行上的原始值 token（如 8、72.5） */
+  valueStr: string;
+  note?: string;
+  /** 睡眠：meta.sleep_start_hm（HH:mm），仅 metricKey=sleep_hours 时有值 */
+  sleepStartHm?: string;
+  isDelete?: boolean;
+  tsMs?: number;
+  /** 与 meta.created_at_ms 一致：本条首次写入时刻（毫秒）；用于补录展示与重建后保留创建时间 */
+  createdAtMs?: number;
+  sourceFilePath?: string;
+  sourceLineMain?: number;
+
+  dbSourceHash?: string;
+  dbLastSyncedHash?: string;
+  dbSyncState?: "pending" | "dirty" | "synced" | "failed";
+  dbLastSyncedAt?: string;
+  dbLastTriedAt?: string;
+  dbRetryCount?: number;
+  dbLastError?: string;
+};
+
 export type FinanceRecordIndexItem = {
   recordDate: string; // YYYY-MM-DD
+  /** 日记 meta 中的 entry_id；旧数据无 meta 时为空，索引内按 legacy 键合并 */
+  entryId?: string;
   categoryId: string;
   categoryName?: string;
   type: "income" | "expense";
   amount: number; // signed amount (income +, expense -)
+  /** meta 子分类（有 meta 时优先；统计可与 note 前缀互证） */
+  subcategory?: string;
   note?: string;
+  /** 机构名（可选；周期账单建议填写） */
+  institutionName?: string;
+  /** 周期类型（none/weekly/biweekly/monthly/quarterly/halfyearly/yearly） */
+  cycleType?: string;
+  /** 日记 meta 周期计划 ID（FCP_*）；显式 "none" 表示用户拒绝入表 */
+  cycleId?: string;
+  /** 场景标签（多选，可空） */
+  sceneTags?: string[];
   isDelete?: boolean;
   tsMs?: number;
+
+  /** 该条财务主行所在日记路径（vault 相对路径；由扫描写入，供侧栏跳转） */
+  sourceFilePath?: string;
+  /** 财务主行在文件中的行号，0-based，与 CodeMirror 编辑器一致 */
+  sourceLineMain?: number;
 
   /** ===== DB sync meta (per-item) ===== */
   dbSourceHash?: string;
@@ -55,6 +102,12 @@ export type FinanceRecordIndexFile = {
   items: FinanceRecordIndexItem[];
 };
 
+export type HealthRecordIndexFile = {
+  version: number;
+  updatedAt: string;
+  items: HealthRecordIndexItem[];
+};
+
 /** ===== 打卡项清单 / 财务分类清单：中央索引（含软删除与归档） ===== */
 
 export type CheckinItemIndexItem = {
@@ -65,6 +118,8 @@ export type CheckinItemIndexItem = {
   deletedAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
+  /** 已连续打卡天数（与打卡项清单一致） */
+  continuousDays?: number;
 };
 
 export type FinanceCatIndexItem = {

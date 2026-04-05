@@ -20,19 +20,57 @@ export class EditProjectMilestoneModal extends Modal {
     let name = "";
     let level: 1 | 2 | 3 = 1;
     let parentPath = "";
+    /** 计划完成日 YYYY-MM-DD，可选；保存时始终传入，空串表示清除 meta milestone_planned_end */
+    let plannedEnd = "";
+    let milestoneWeight = 1;
     let originalPath = String(this.milestonePath ?? "").trim();
 
-    let milestonesMeta: Array<{ path: string; name: string; level: 1 | 2 | 3; parentPath?: string }> = [];
+    let milestonesMeta: Array<{
+      path: string;
+      name: string;
+      level: 1 | 2 | 3;
+      parentPath?: string;
+      planned_end?: string;
+      milestone_weight?: number;
+    }> = [];
 
     let nameInput!: TextComponent;
+    let plannedEndInput!: TextComponent;
+    let plannedEndSetting!: Setting;
+    let weightInput!: TextComponent;
     let levelDd!: DropdownComponent;
     let parentDd!: DropdownComponent;
     let saveBtn!: ButtonComponent;
 
+    const isValidYmd = (s: string) => !s || /^\d{4}-\d{2}-\d{2}$/.test((s ?? "").trim());
+
+    const parseWeight = (): { ok: boolean; value: number } => {
+      const raw = String(weightInput?.inputEl?.value ?? milestoneWeight ?? "1").trim();
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n) || n < 1 || n > 100) return { ok: false, value: 1 };
+      return { ok: true, value: n };
+    };
+
+    const syncPlannedRow = () => {
+      if (plannedEndSetting?.settingEl) {
+        plannedEndSetting.settingEl.style.display = level === 1 ? "" : "none";
+      }
+      if (level !== 1) {
+        plannedEnd = "";
+        plannedEndInput?.setValue("");
+      }
+    };
+
     const refresh = () => {
-      const ok = (name ?? "").trim().length > 0 && (level === 1 || Boolean(parentPath));
+      const pe = (plannedEnd ?? "").trim();
+      const peOk = level !== 1 || isValidYmd(pe);
+      const w = parseWeight();
+      const ok =
+        (name ?? "").trim().length > 0 && (level === 1 || Boolean(parentPath)) && peOk && w.ok;
       saveBtn?.setDisabled(!ok);
-      nameInput?.inputEl?.classList.toggle("is-invalid", !ok);
+      nameInput?.inputEl?.classList.toggle("is-invalid", !(name ?? "").trim().length > 0 || !(level === 1 || Boolean(parentPath)));
+      plannedEndInput?.inputEl?.classList.toggle("is-invalid", !peOk);
+      weightInput?.inputEl?.classList.toggle("is-invalid", !w.ok);
       return ok;
     };
 
@@ -107,6 +145,42 @@ export class EditProjectMilestoneModal extends Modal {
           const n = Math.max(1, Math.min(3, Number(v) || 1)) as 1 | 2 | 3;
           level = n;
           rebuildParentOptions();
+          syncPlannedRow();
+        });
+      });
+
+    plannedEndSetting = new Setting(contentEl)
+      .setName("计划完成日")
+      .setDesc("仅一级里程碑；可选，写入 meta milestone_planned_end；留空保存将清除该字段")
+      .addText((t) => {
+        plannedEndInput = t;
+        t.inputEl.type = "date";
+        t.setValue("");
+        t.onChange((v) => {
+          plannedEnd = (v ?? "").trim();
+          refresh();
+        });
+        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
+          if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            void doSave();
+          }
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("里程碑权重")
+      .setDesc("1～100 的整数，默认 1；写入 meta milestone_weight。")
+      .addText((t) => {
+        weightInput = t;
+        t.setPlaceholder("1");
+        t.setValue("1");
+        t.inputEl.type = "number";
+        t.inputEl.min = "1";
+        t.inputEl.max = "100";
+        t.onChange((v) => {
+          milestoneWeight = parseInt(String(v ?? "1"), 10) || 1;
+          refresh();
         });
       });
 
@@ -131,10 +205,17 @@ export class EditProjectMilestoneModal extends Modal {
     const doSave = async () => {
       if (!refresh()) return;
       try {
+        const w = parseWeight();
+        if (!w.ok) {
+          new Notice("里程碑权重须为 1～100 的整数");
+          return;
+        }
         await this.plugin.projectMgr.updateMilestone(this.projectFolderPath, originalPath, {
           name: (name ?? "").trim(),
           level,
           parentPath: parentPath || undefined,
+          plannedEnd: level === 1 ? (plannedEnd ?? "").trim() : "",
+          milestoneWeight: w.value,
         });
         new Notice("里程碑已更新");
         this.plugin.refreshSidePanel();
@@ -158,6 +239,14 @@ export class EditProjectMilestoneModal extends Modal {
           name: String(x?.name ?? "").trim(),
           level: (Number(x?.level ?? 1) || 1) as 1 | 2 | 3,
           parentPath: String(x?.parentPath ?? "").trim() || undefined,
+          planned_end:
+            x?.planned_end && /^\d{4}-\d{2}-\d{2}$/.test(String(x.planned_end).trim())
+              ? String(x.planned_end).trim()
+              : undefined,
+          milestone_weight:
+            x?.milestone_weight != null && Number.isFinite(Number(x.milestone_weight))
+              ? Math.min(100, Math.max(1, Math.floor(Number(x.milestone_weight))))
+              : undefined,
         })).filter((x) => Boolean(x.path));
       } catch {
         milestonesMeta = [];
@@ -168,10 +257,15 @@ export class EditProjectMilestoneModal extends Modal {
         name = cur.name;
         level = cur.level;
         parentPath = cur.parentPath ?? "";
+        plannedEnd = cur.planned_end ?? "";
+        milestoneWeight = cur.milestone_weight != null ? cur.milestone_weight : 1;
         nameInput?.setValue(name);
         levelDd?.setValue(String(level));
+        plannedEndInput?.setValue(plannedEnd);
+        weightInput?.setValue(String(milestoneWeight));
       }
       rebuildParentOptions();
+      syncPlannedRow();
       refresh();
     })();
   }

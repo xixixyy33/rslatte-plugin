@@ -2,60 +2,161 @@ import { App, ButtonComponent, Modal, Notice, Setting, TextComponent } from "obs
 import moment from "moment";
 
 import type RSLattePlugin from "../../main";
+import type { FinanceRecordIndexItem } from "../../types/recordIndexTypes";
 
 const momentFn = moment as any;
 import type { FinanceCatDef } from "../../types/rslatteTypes";
-import { buildFinanceNoteWithSubcategory, extractFinanceSubcategory, normalizeFinanceSubcategory } from "../../services/finance/financeSubcategory";
+import { FINANCE_CYCLE_LABELS, normalizeFinanceCycleType, type FinanceCycleType } from "../../types/rslatteTypes";
+import { extractFinanceMeta, normalizeFinanceSubcategory } from "../../services/finance/financeSubcategory";
+import {
+  buildFinanceListItemLine,
+  buildFinanceMainNoteParts,
+  generateFinanceEntryId,
+  stringifyFinanceMetaComment,
+} from "../../services/finance/financeJournalMeta";
+import { interactiveResolveCycleMetaForSave } from "../../services/finance/financeCycleInteractive";
+
+type FormMode = "list" | "add" | "edit";
 
 /**
- * 财务录入（当日单条）：
- * - 每个分类每天只维护一条（DB 以 vault_id + record_date + category_id 唯一）
- * - 绿色按钮：表示当日已有有效记录（is_delete=false），点开可“更新/取消”
- * - 灰色按钮：表示未记录或已取消（is_delete=true），点开可“新增/恢复”
- * - 不提供历史补录：日期固定为今天
+ * 分类今日台账（同日同分类多条 entry_id）+ 内嵌新增/编辑表单。
  */
 export class FinanceRecordModal extends Modal {
+  private formMode: FormMode = "list";
+  /** 编辑中的索引项（来自 recordRSLatte） */
+  private editingIndex: FinanceRecordIndexItem | null = null;
+
   constructor(app: App, private plugin: RSLattePlugin, private cat: FinanceCatDef) {
     super(app);
   }
 
   onOpen() {
+    this.formMode = "list";
+    this.editingIndex = null;
+    void this.renderRoot();
+  }
+
+  private async loadTodayItems(): Promise<FinanceRecordIndexItem[]> {
+    await this.plugin.recordRSLatte?.ensureReady?.();
+    return (
+      (await this.plugin.recordRSLatte?.getTodayFinanceRecordsForCategory?.(this.cat.id, {
+        activeOnly: true,
+      })) ?? []
+    );
+  }
+
+  private async renderRoot() {
     const { contentEl } = this;
-    const render = async () => {
-      contentEl.empty();
+    contentEl.empty();
+    await ((this.plugin as any).ensureTodayFinancesInitialized?.() ?? Promise.resolve());
 
-      await ((this.plugin as any).ensureTodayFinancesInitialized?.() ?? Promise.resolve());
-
-      const dateKey = this.plugin.getTodayKey();
-      const existing = this.plugin.getTodayFinanceRecord(this.cat.id);
-      const existedAndActive = !!(existing && existing.is_delete === false);
-
-      this.titleEl.setText(existedAndActive ? `账单（已记录）：${this.cat.name}` : `记账：${this.cat.name}`);
-
-      const type = this.cat.type; // income | expense
-
-      let amountRaw = "";
-      let note = ""; // body note (without subcategory prefix)
-      let subcategory = "";
-
-      if (existing) {
-      // amount 存在符号（收入正、支出负）。输入框永远让用户输“正数”。
-      const absAmt = Math.abs(Number((existing as any).amount));
-      if (Number.isFinite(absAmt) && absAmt > 0) amountRaw = absAmt.toFixed(2);
-      const parsed = extractFinanceSubcategory((existing as any).note ?? "");
-      subcategory = parsed.subcategory;
-      note = parsed.body;
+    if (this.formMode === "list") {
+      await this.renderList(contentEl);
+      return;
     }
-      // Prefetch known subcategories for this category (from lists index, best-effort)
-      let knownSubs: string[] = [];
-      try {
-        knownSubs = await this.plugin.recordRSLatte?.getFinanceSubcategories?.(this.cat.id) ?? [];
-      } catch {
-        knownSubs = [];
+    await this.renderForm(contentEl, this.formMode === "add" ? null : this.editingIndex);
+  }
+
+  private async renderList(container: HTMLElement) {
+    const items = await this.loadTodayItems();
+    this.titleEl.setText(`今日 · ${this.cat.name}`);
+
+    if (items.length === 0) {
+      container.createDiv({ cls: "rslatte-modal-info", text: "暂无记录" });
+    } else {
+      for (const it of items) {
+        const sub = normStr(it.subcategory) || extractFinanceMeta(it.note ?? "").subcategory || "（未分类）";
+        const abs = Math.abs(Number(it.amount ?? 0));
+        const card = container.createDiv({ cls: "rslatte-finance-ledger-card" });
+        card.createDiv({
+          cls: "rslatte-finance-ledger-card-title",
+          text: `${sub} · ${abs.toFixed(2)}`,
+        });
+        const body = extractFinanceMeta(it.note ?? "").body;
+        if (body) {
+          card.createDiv({ cls: "rslatte-finance-ledger-card-note", text: body });
+        }
+        const row = card.createDiv({ cls: "rslatte-finance-ledger-card-actions" });
+        new ButtonComponent(row)
+          .setButtonText("编辑")
+          .onClick(() => {
+            this.formMode = "edit";
+            this.editingIndex = it;
+            void this.renderRoot();
+          });
+        new ButtonComponent(row)
+          .setButtonText("取消本笔")
+          .onClick(() => {
+            this.formMode = "edit";
+            this.editingIndex = it;
+            void this.renderForm(this.contentEl, it, true);
+          });
       }
+    }
 
+    const actions = container.createDiv({ cls: "rslatte-modal-actions" });
+    new ButtonComponent(actions)
+      .setButtonText("➕ 新增一条")
+      .setCta()
+      .onClick(() => {
+        this.formMode = "add";
+        this.editingIndex = null;
+        void this.renderRoot();
+      });
+    new ButtonComponent(actions).setButtonText("关闭").onClick(() => this.close());
+  }
 
-      const normalizeAmountAbs = (s: string) => {
+  private async renderForm(container: HTMLElement, existing: FinanceRecordIndexItem | null, onlyCancel = false) {
+    container.empty();
+    const dateKey = this.plugin.getTodayKey();
+    const type = this.cat.type;
+
+    this.titleEl.setText(
+      existing && !onlyCancel ? `编辑 · ${this.cat.name}` : onlyCancel ? `取消本笔 · ${this.cat.name}` : `新增 · ${this.cat.name}`
+    );
+
+    let amountRaw = "";
+    let note = "";
+    let subcategory = "";
+    let institutionName = "";
+    let cycleType: FinanceCycleType = "none";
+    let sceneTags: string[] = [];
+    let priorCycleId = "";
+
+    if (existing && !onlyCancel) {
+      const absAmt = Math.abs(Number(existing.amount));
+      if (Number.isFinite(absAmt) && absAmt > 0) amountRaw = absAmt.toFixed(2);
+      const parsed = extractFinanceMeta(existing.note ?? "");
+      subcategory = normStr(existing.subcategory) || parsed.subcategory;
+      institutionName = parsed.institutionName;
+      cycleType = normalizeFinanceCycleType(parsed.cycleType);
+      sceneTags = parsed.sceneTags ?? [];
+      note = parsed.body;
+      priorCycleId = normStr((existing as any)?.cycleId);
+    } else if (existing && onlyCancel) {
+      priorCycleId = normStr((existing as any)?.cycleId);
+    }
+
+    let knownSubs: string[] = [];
+    let knownInstitutions: string[] = [];
+    let knownSceneTags: string[] = [];
+    try {
+      knownSubs = await this.plugin.recordRSLatte?.getFinanceSubcategories?.(this.cat.id) ?? [];
+    } catch {
+      knownSubs = [];
+    }
+    try {
+      knownInstitutions = await this.plugin.recordRSLatte?.getFinanceInstitutions?.(this.cat.id) ?? [];
+    } catch {
+      knownInstitutions = [];
+    }
+    try {
+      knownSceneTags = await this.plugin.recordRSLatte?.getFinanceSceneTagsHistory?.() ?? [];
+    } catch {
+      knownSceneTags = [];
+    }
+
+    const normalizeAmountAbs = (s: string) => {
       const v = (s ?? "").trim();
       if (!v) return NaN;
       const n = Number(v);
@@ -63,134 +164,110 @@ export class FinanceRecordModal extends Modal {
       return Math.abs(n);
     };
 
-      const buildSignedAmount = (absAmount: number) => {
+    const buildSignedAmount = (absAmount: number) => {
       const fixed = Number(absAmount.toFixed(2));
       return type === "expense" ? -fixed : fixed;
     };
 
-      const safeNote = (s: string) => (s ?? "").trim().replace(/\s+/g, " ");
+    const safeNote = (s: string) => (s ?? "").trim().replace(/\s+/g, " ");
 
-      let amountText!: TextComponent;
-      let saveBtn!: ButtonComponent;
-      let cancelBillBtn: ButtonComponent | null = null;
-      let inFlight = false;
+    let amountText!: TextComponent;
+    let saveBtn!: ButtonComponent;
+    let inFlight = false;
 
-      const validateAmount = () => {
+    const validateAmount = () => {
+      if (onlyCancel) return true;
       const n = normalizeAmountAbs(amountRaw);
-      return Number.isFinite(n) && n > 0;
+      if (!(Number.isFinite(n) && n > 0)) return false;
+      if (cycleType !== "none" && !String(institutionName ?? "").trim()) return false;
+      return true;
     };
 
-      const setInFlight = (v: boolean) => {
-        inFlight = v;
-        try {
-          saveBtn?.setDisabled(v || !validateAmount());
-        } catch { }
-        try {
-          if (cancelBillBtn) cancelBillBtn.setDisabled(v);
-        } catch { }
-        try {
-          (amountText as any)?.setDisabled?.(v);
-        } catch { }
-        try {
-          if ((amountText as any)?.inputEl) (amountText as any).inputEl.disabled = v;
-        } catch { }
-      };
-
-      const refreshValidationUI = () => {
-      const ok = validateAmount();
-      amountText?.inputEl?.classList.toggle("is-invalid", !ok);
-      if (saveBtn) {
-        saveBtn.setDisabled(inFlight || !ok);
+    const setInFlight = (v: boolean) => {
+      inFlight = v;
+      try {
+        saveBtn?.setDisabled(v || !validateAmount());
+      } catch {
+        /* ignore */
       }
+      try {
+        (amountText as any)?.setDisabled?.(v);
+      } catch {
+        /* ignore */
+      }
+      try {
+        if ((amountText as any)?.inputEl) (amountText as any).inputEl.disabled = v || onlyCancel;
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const refreshValidationUI = () => {
+      const ok = validateAmount();
+      amountText?.inputEl?.classList.toggle("is-invalid", !onlyCancel && !ok);
+      if (saveBtn) saveBtn.setDisabled(inFlight || (!onlyCancel && !ok));
       return ok;
     };
 
-      // ===== 顶部信息 =====
-      const info = contentEl.createDiv({ cls: "rslatte-modal-info" });
-      if (existedAndActive && existing) {
-      const absAmt = Math.abs(Number((existing as any).amount));
-      info.setText(`今日已记录：${absAmt.toFixed(2)}（${type === "expense" ? "支出" : "收入"}）`);
-    } else {
-      info.setText("仅维护今日账单（不支持历史补录）");
-    }
-
-      // ===== 金额 =====
-      new Setting(contentEl)
-      .setName("金额")
-      .setDesc(type === "expense" ? "支出：请输入金额数" : "收入：请输入金额数")
-      .addText((t) => {
-        amountText = t;
-        t.inputEl.addClass("rslatte-amount-input");
-        t.setPlaceholder("例如 12.34");
-        t.setValue(amountRaw);
-        t.onChange((v) => {
-          amountRaw = (v || "").trim();
-          refreshValidationUI();
+    if (!onlyCancel) {
+      new Setting(container)
+        .setName("金额")
+        .setDesc(type === "expense" ? "支出：请输入正数" : "收入：请输入正数")
+        .addText((t) => {
+          amountText = t;
+          t.inputEl.addClass("rslatte-amount-input");
+          t.setPlaceholder("例如 12.34");
+          t.setValue(amountRaw);
+          t.onChange((v) => {
+            amountRaw = (v || "").trim();
+            refreshValidationUI();
+          });
         });
 
-        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-          if (ev.key === "Enter" && !ev.shiftKey) {
-            ev.preventDefault();
-            void doUpsert(false);
-          }
+      new Setting(container)
+        .setName("备注")
+        .setDesc("可选")
+        .addText((t) => {
+          t.setPlaceholder("可选");
+          t.setValue(note);
+          t.onChange((v) => (note = (v || "").trim()));
         });
-      });
 
-      // ===== 备注 =====
-      new Setting(contentEl)
-      .setName("备注")
-      .setDesc("可选；填写完金额回车即可保存")
-      .addText((t) => {
-        t.setPlaceholder("可选");
-        t.setValue(note);
-        t.onChange((v) => (note = (v || "").trim()));
-        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-          if (ev.key === "Enter" && !ev.shiftKey) {
-            ev.preventDefault();
-            void doUpsert(false);
-          }
-        });
-      });
-
-      // ===== 子分类（写入到备注前缀【子分类】） =====
-      // UI: dropdown (recent used) + text input (manual)
       {
-        const row = new Setting(contentEl)
-          .setName("子分类")
-          .setDesc("可选；保存后会以【子分类】前缀写入到备注最前方（不入库管理）");
-
+        const row = new Setting(container).setName("子分类").setDesc("必填");
         const MANUAL = "__manual__";
         const NONE = "";
-
         let ddComp: any = null;
         let txtComp: any = null;
-
         row.addDropdown((dd) => {
           ddComp = dd;
-          dd.addOption(NONE, "（无）");
+          dd.addOption(NONE, "（选择）");
           for (const s of knownSubs) dd.addOption(s, s);
           dd.addOption(MANUAL, "手动输入");
-
-          const init = knownSubs.includes(subcategory) ? subcategory : (subcategory ? MANUAL : NONE);
+          const init = knownSubs.includes(subcategory) ? subcategory : subcategory ? MANUAL : NONE;
           dd.setValue(init);
           dd.onChange((v) => {
             if (v === NONE) {
               subcategory = "";
-              try { txtComp?.setValue?.(""); } catch {}
+              try {
+                txtComp?.setValue?.("");
+              } catch {
+                /* ignore */
+              }
               return;
             }
-            if (v === MANUAL) {
-              // keep current text input
-              return;
-            }
+            if (v === MANUAL) return;
             subcategory = normalizeFinanceSubcategory(v);
-            try { txtComp?.setValue?.(subcategory); } catch {}
+            try {
+              txtComp?.setValue?.(subcategory);
+            } catch {
+              /* ignore */
+            }
           });
         });
-
         row.addText((t) => {
           txtComp = t;
-          t.setPlaceholder("可选；可新建");
+          t.setPlaceholder("必填");
           t.setValue(subcategory);
           t.onChange((v) => {
             subcategory = normalizeFinanceSubcategory(v);
@@ -198,198 +275,542 @@ export class FinanceRecordModal extends Modal {
               if (!subcategory) ddComp?.setValue?.(NONE);
               else if (knownSubs.includes(subcategory)) ddComp?.setValue?.(subcategory);
               else ddComp?.setValue?.(MANUAL);
-            } catch {}
+            } catch {
+              /* ignore */
+            }
           });
         });
       }
 
-    // ===== 操作按钮 =====
-    const btnRow = contentEl.createDiv({ cls: "rslatte-modal-actions" });
+      {
+        const row = new Setting(container).setName("机构名").setDesc("非「无周期」时必填");
+        const MANUAL_INST = "__manual__";
+        const NONE_INST = "";
+        let ddInst: any = null;
+        let txtInst: any = null;
+        row.addDropdown((dd) => {
+          ddInst = dd;
+          dd.addOption(NONE_INST, "（无）");
+          for (const s of knownInstitutions) dd.addOption(s, s);
+          dd.addOption(MANUAL_INST, "手动输入");
+          const init = knownInstitutions.includes(institutionName) ? institutionName : institutionName ? MANUAL_INST : NONE_INST;
+          dd.setValue(init);
+          dd.onChange((v) => {
+            if (v === NONE_INST) {
+              institutionName = "";
+              try {
+                txtInst?.setValue?.("");
+              } catch {
+                /* ignore */
+              }
+              refreshValidationUI();
+              return;
+            }
+            if (v === MANUAL_INST) {
+              refreshValidationUI();
+              return;
+            }
+            institutionName = String(v ?? "").trim();
+            try {
+              txtInst?.setValue?.(institutionName);
+            } catch {
+              /* ignore */
+            }
+            refreshValidationUI();
+          });
+        });
+        row.addText((t) => {
+          txtInst = t;
+          t.setPlaceholder("可选");
+          t.setValue(institutionName);
+          t.onChange((v) => {
+            institutionName = String(v ?? "").trim().replace(/\s+/g, " ");
+            try {
+              if (!institutionName) ddInst?.setValue?.(NONE_INST);
+              else if (knownInstitutions.includes(institutionName)) ddInst?.setValue?.(institutionName);
+              else ddInst?.setValue?.(MANUAL_INST);
+            } catch {
+              /* ignore */
+            }
+            refreshValidationUI();
+          });
+        });
+      }
 
-    const primaryText = existedAndActive ? "更新" : "保存";
-    saveBtn = new ButtonComponent(btnRow)
-      .setButtonText(primaryText)
-      .setCta()
-      .onClick(() => void doUpsert(false));
+      new Setting(container)
+        .setName("周期类型")
+        .setDesc("非「无周期」时机构名必填")
+        .addDropdown((dd) => {
+          const order: FinanceCycleType[] = ["none", "weekly", "biweekly", "monthly", "quarterly", "halfyearly", "yearly"];
+          for (const key of order) dd.addOption(key, FINANCE_CYCLE_LABELS[key]);
+          dd.setValue(cycleType);
+          dd.onChange((v) => {
+            cycleType = normalizeFinanceCycleType(v);
+            refreshValidationUI();
+          });
+        });
 
-    if (existedAndActive) {
-      cancelBillBtn = new ButtonComponent(btnRow)
-        .setButtonText("取消本笔")
-        .onClick(() => void doUpsert(true));
-      cancelBillBtn.buttonEl.addClass("mod-warning");
+      {
+        const row = new Setting(container).setName("场景标签").setDesc("仅写入 meta，不出现在主行");
+        const wrap = row.settingEl.createDiv({ cls: "rslatte-subcategories-list" });
+        const renderTags = () => {
+          wrap.empty();
+          for (const tag of sceneTags) {
+            const chip = wrap.createSpan({ cls: "rslatte-subcategory-tag", text: tag });
+            const rm = chip.createSpan({ cls: "rslatte-subcategory-remove", text: "×" });
+            rm.onclick = () => {
+              sceneTags = sceneTags.filter((x) => x !== tag);
+              renderTags();
+            };
+          }
+        };
+        const act = row.settingEl.createDiv({ cls: "rslatte-subcat-inline-actions" });
+        const sel = act.createEl("select");
+        sel.createEl("option", { text: "从历史标签选择", value: "" });
+        for (const t of knownSceneTags) sel.createEl("option", { text: t, value: t });
+        const btnSel = act.createEl("button", { text: "添加" });
+        const inp = act.createEl("input", { type: "text", attr: { placeholder: "新标签（逗号分隔）" } });
+        const btnIn = act.createEl("button", { text: "新增", cls: "mod-cta" });
+        const addTag = (tag: string) => {
+          const v = String(tag ?? "").trim().replace(/\s+/g, " ");
+          if (!v) return;
+          if (sceneTags.includes(v)) return;
+          sceneTags.push(v);
+          renderTags();
+        };
+        btnSel.onclick = () => addTag(sel.value);
+        btnIn.onclick = () => {
+          const parts = String(inp.value ?? "")
+            .split(/[，,]/g)
+            .map((x) => String(x ?? "").trim())
+            .filter(Boolean);
+          for (const p of parts) addTag(p);
+          inp.value = "";
+        };
+        renderTags();
+      }
+    } else if (existing) {
+      const absAmt = Math.abs(Number(existing.amount));
+      amountRaw = Number.isFinite(absAmt) ? absAmt.toFixed(2) : "";
+      container.createDiv({
+        cls: "rslatte-modal-info",
+        text: `将取消本笔：${absAmt.toFixed(2)}（${type === "expense" ? "支出" : "收入"}）`,
+      });
     }
+
+    const btnRow = container.createDiv({ cls: "rslatte-modal-actions" });
+
+    new ButtonComponent(btnRow)
+      .setButtonText("返回列表")
+      .onClick(() => {
+        this.formMode = "list";
+        this.editingIndex = null;
+        void this.renderRoot();
+      });
+
+    saveBtn = new ButtonComponent(btnRow)
+      .setButtonText(onlyCancel ? "确认取消" : "保存")
+      .setCta()
+      .onClick(() => void doSave(onlyCancel));
 
     new ButtonComponent(btnRow).setButtonText("关闭").onClick(() => this.close());
 
-    const doUpsert = async (toDelete: boolean) => {
+    const doSave = async (toDelete: boolean) => {
       if (inFlight) return;
-      if (!toDelete && !refreshValidationUI()) return;
+      if (!toDelete && !onlyCancel && !refreshValidationUI()) return;
+      if (cycleType !== "none" && !String(institutionName ?? "").trim() && !toDelete && !onlyCancel) {
+        new Notice("周期类型不为「无周期」时，机构名必填");
+        return;
+      }
 
-      // Prevent repeated clicks / Enter spamming.
-      setInFlight(true);
+      const normalizedSub = normalizeFinanceSubcategory(subcategory);
+      if (!toDelete && !onlyCancel && !normalizedSub) {
+        new Notice("子分类不能为空");
+        return;
+      }
 
       const nAbs = normalizeAmountAbs(amountRaw);
-      const signedAmount = Number.isFinite(nAbs) ? buildSignedAmount(nAbs) : (existing ? Number((existing as any).amount) : 0);
-      const catId = this.cat.id;
-      const catName = this.cat.name;
+      const prior = existing;
+      const priorEntryId = normStr(prior?.entryId);
+      const priorSub = normStr(prior?.subcategory) || extractFinanceMeta(prior?.note ?? "").subcategory;
+      const subChanged = !!priorEntryId && normalizeFinanceSubcategory(priorSub) !== normalizedSub && !toDelete && !onlyCancel;
 
-      const payload = {
-        record_date: dateKey,
-        category_id: this.cat.id,
-        amount: signedAmount,
-        note: safeNote(buildFinanceNoteWithSubcategory(subcategory, note)),
-        is_delete: !!toDelete,
-      };
+      const signedAmount =
+        toDelete || onlyCancel
+          ? buildSignedAmount(normalizeAmountAbs(amountRaw || String(Math.abs(Number(prior?.amount ?? 0)))))
+          : Number.isFinite(nAbs)
+            ? buildSignedAmount(nAbs)
+            : Number(prior?.amount ?? 0);
 
-      // ✅ UI 与后端入库解耦：
-      // - 这里始终先落本地（按钮状态/索引/日志），并立刻关闭窗口；
-      // - DB 入库由后续 auto/manual refresh 的 record sync 机制重试（带 backoff），避免后端异常时重复触发。
-      const appliedItem: any = {
-        id: existing ? Number((existing as any).id ?? 0) : 0,
-        record_date: dateKey,
-        category_id: this.cat.id,
-        type,
-        amount: Number(signedAmount),
-        note: payload.note,
-        is_delete: toDelete,
-        created_at: existing ? (existing as any).created_at ?? new Date().toISOString() : new Date().toISOString(),
-      };
-
-      this.plugin.applyTodayFinanceRecord(appliedItem);
-
-      // ✅ 如果使用了子分类且子分类不在分类的子分类列表中，自动添加到列表
-      const normalizedSubcat = subcategory ? normalizeFinanceSubcategory(subcategory) : "";
-      if (normalizedSubcat && !toDelete) {
-        const financeCat = this.plugin.settings.financeCategories?.find(c => c.id === this.cat.id);
-        if (financeCat) {
-          if (!financeCat.subCategories) financeCat.subCategories = [];
-          // ✅ 检查是否已存在（不重复）
-          if (!financeCat.subCategories.includes(normalizedSubcat)) {
-            financeCat.subCategories.push(normalizedSubcat);
-            // ✅ 异步保存设置（不阻塞当前流程）
-            void this.plugin.saveSettings();
-          }
+      if (!toDelete && !onlyCancel) {
+        const siblings =
+          (await this.plugin.recordRSLatte?.getTodayFinanceRecordsForCategory?.(this.cat.id, { activeOnly: true })) ?? [];
+        const dup = siblings.filter((x) => {
+          const sid = normStr(x.entryId);
+          if (priorEntryId && sid === priorEntryId) return false;
+          const ssub = normStr(x.subcategory) || extractFinanceMeta(x.note ?? "").subcategory;
+          return normalizeFinanceSubcategory(ssub) === normalizedSub && Math.abs(Number(x.amount)) === Math.abs(Number(signedAmount));
+        });
+        if (dup.length > 0) {
+          const ok = window.confirm("今日已有非常相似的一笔（同子分类、同金额），是否仍要保存？");
+          if (!ok) return;
         }
       }
 
-      // ✅ 无论是否 DB，同步写入“打卡/财务中央索引”
+      let cycleIdForNew: string | undefined = undefined;
+      if (!toDelete && !onlyCancel) {
+        const c = await interactiveResolveCycleMetaForSave(this.plugin, {
+          catId: this.cat.id,
+          subcategory: normalizedSub,
+          institutionName,
+          cycleType,
+          recordDateKey: dateKey,
+        });
+        if (c == null) return;
+        cycleIdForNew = c.cycleIdForMeta;
+      }
+
+      const cancelCycleId = normStr((prior as any)?.cycleId) || normStr(priorCycleId) || undefined;
+
+      setInFlight(true);
+
+      let entryId = priorEntryId || generateFinanceEntryId();
+      const noteMain = toDelete || onlyCancel
+        ? buildFinanceMainNoteParts({
+            subcategory: normStr(prior?.subcategory) || priorSub || normalizedSub,
+            institutionName: prior ? extractFinanceMeta(prior.note ?? "").institutionName : institutionName,
+            cycleType: prior ? normalizeFinanceCycleType(extractFinanceMeta(prior.note ?? "").cycleType) : cycleType,
+            bodyNote: prior ? extractFinanceMeta(prior.note ?? "").body : note,
+          })
+        : buildFinanceMainNoteParts({
+            subcategory: normalizedSub,
+            institutionName,
+            cycleType,
+            bodyNote: note,
+          });
+
+      const runJournal = async (
+        eid: string,
+        del: boolean,
+        signed: number,
+        meta: {
+          subcategory: string;
+          institution_name?: string;
+          cycle_type: FinanceCycleType;
+          cycle_id?: string;
+          scene_tags: string[];
+        },
+        mainNote: string
+      ) => {
+        const metaLine = stringifyFinanceMetaComment({
+          entry_id: eid,
+          subcategory: meta.subcategory,
+          institution_name: meta.institution_name,
+          cycle_type: meta.cycle_type,
+          cycle_id: meta.cycle_id,
+          scene_tags: meta.scene_tags,
+          is_delete: del ? true : undefined,
+        });
+        const mainLine = buildFinanceListItemLine({
+          dateKey,
+          type,
+          categoryId: this.cat.id,
+          categoryDisplayName: this.cat.name,
+          noteMain: safeNote(mainNote) || "-",
+          signedAmount: signed,
+          isDelete: del,
+          cancelTimeHm: momentFn().format("HH:mm"),
+        });
+        const pair = [mainLine, metaLine];
+        const replacer = (this.plugin as any).replaceFinanceJournalPairByEntryId as
+          | ((dk: string, id: string, p: string[]) => Promise<boolean>)
+          | undefined;
+        const useReplace = !!priorEntryId && eid === priorEntryId;
+        if (useReplace) {
+          const ok = replacer ? await replacer(dateKey, eid, pair) : false;
+          if (!ok) {
+            await ((this.plugin as any).appendJournalByModule?.("finance", dateKey, pair) ?? Promise.resolve());
+          }
+        } else {
+          await ((this.plugin as any).appendJournalByModule?.("finance", dateKey, pair) ?? Promise.resolve());
+        }
+      };
+
       try {
-        await this.plugin.recordRSLatte?.upsertFinanceRecord({
+        const priorMeta = prior ? extractFinanceMeta(prior.note ?? "") : null;
+        if (subChanged && priorEntryId) {
+          const oldSigned = Number(prior?.amount ?? signedAmount);
+          await runJournal(
+            priorEntryId,
+            true,
+            oldSigned,
+            {
+              subcategory: normStr(prior?.subcategory) || priorSub || normalizedSub,
+              institution_name: priorMeta?.institutionName || undefined,
+              cycle_type: priorMeta ? normalizeFinanceCycleType(priorMeta.cycleType) : "none",
+              cycle_id: cancelCycleId,
+              scene_tags: priorMeta?.sceneTags ?? [],
+            },
+            buildFinanceMainNoteParts({
+              subcategory: normStr(prior?.subcategory) || priorSub,
+              institutionName: priorMeta?.institutionName ?? "",
+              cycleType: priorMeta ? normalizeFinanceCycleType(priorMeta.cycleType) : "none",
+              bodyNote: priorMeta?.body ?? "",
+            })
+          );
+          entryId = generateFinanceEntryId();
+          await runJournal(
+            entryId,
+            false,
+            signedAmount,
+            {
+              subcategory: normalizedSub,
+              institution_name: institutionName || undefined,
+              cycle_type: cycleType,
+              cycle_id: cycleIdForNew,
+              scene_tags: sceneTags,
+            },
+            noteMain
+          );
+
+          const oldSignedAmt = Number(prior?.amount ?? signedAmount);
+          const cancelIdx: FinanceRecordIndexItem = {
+            recordDate: dateKey,
+            entryId: priorEntryId,
+            categoryId: this.cat.id,
+            categoryName: this.cat.name,
+            type,
+            subcategory: normStr(prior?.subcategory) || priorSub,
+            amount: oldSignedAmt,
+            note: buildFinanceMainNoteParts({
+              subcategory: normStr(prior?.subcategory) || priorSub,
+              institutionName: priorMeta?.institutionName ?? "",
+              cycleType: priorMeta ? normalizeFinanceCycleType(priorMeta.cycleType) : "none",
+              bodyNote: priorMeta?.body ?? "",
+            }),
+            institutionName: priorMeta?.institutionName || undefined,
+            cycleType: priorMeta ? normalizeFinanceCycleType(priorMeta.cycleType) : "none",
+            cycleId: cancelCycleId,
+            sceneTags: priorMeta?.sceneTags?.length ? priorMeta.sceneTags : undefined,
+            isDelete: true,
+            tsMs: Date.now(),
+          };
+          const newIdx: FinanceRecordIndexItem = {
+            recordDate: dateKey,
+            entryId,
+            categoryId: this.cat.id,
+            categoryName: this.cat.name,
+            type,
+            subcategory: normalizedSub,
+            amount: signedAmount,
+            note: noteMain,
+            institutionName: institutionName || undefined,
+            cycleType,
+            cycleId: cycleIdForNew === undefined ? undefined : cycleIdForNew,
+            sceneTags: sceneTags.length ? sceneTags : undefined,
+            isDelete: false,
+            tsMs: Date.now(),
+          };
+          await this.plugin.recordRSLatte?.upsertFinanceRecord?.(cancelIdx);
+          await this.plugin.recordRSLatte?.upsertFinanceRecord?.(newIdx);
+          this.plugin.applyTodayFinanceRecord({
+            id: 0,
+            record_date: dateKey,
+            category_id: this.cat.id,
+            entry_id: priorEntryId,
+            amount: Number(cancelIdx.amount),
+            note: cancelIdx.note,
+            is_delete: true,
+            created_at: new Date().toISOString(),
+          });
+          this.plugin.applyTodayFinanceRecord({
+            id: 0,
+            record_date: dateKey,
+            category_id: this.cat.id,
+            entry_id: entryId,
+            amount: Number(newIdx.amount),
+            note: newIdx.note,
+            is_delete: false,
+            created_at: new Date().toISOString(),
+          });
+          const financeCat = this.plugin.settings.financeCategories?.find((c) => c.id === this.cat.id) as any;
+          if (financeCat) {
+            if (!Array.isArray(financeCat.institutionNames)) financeCat.institutionNames = [];
+            const inst = String(institutionName ?? "").trim().replace(/\s+/g, " ");
+            if (inst && !financeCat.institutionNames.includes(inst)) financeCat.institutionNames.push(inst);
+            if (normalizedSub && !financeCat.subCategories) financeCat.subCategories = [];
+            if (normalizedSub && financeCat.subCategories && !financeCat.subCategories.includes(normalizedSub)) {
+              financeCat.subCategories.push(normalizedSub);
+            }
+          }
+          await this.plugin.saveSettings();
+          this.plugin.refreshSidePanel();
+          try {
+            const financeLeaves = this.app.workspace.getLeavesOfType("rslatte-financepanel");
+            for (const leaf of financeLeaves) {
+              const view = leaf.view as any;
+              if (view && typeof view.refresh === "function") void view.refresh();
+            }
+          } catch {
+            /* ignore */
+          }
+          void this.plugin.refreshFinanceSummaryFromApi(true);
+          new Notice("已保存（子分类变更：已取消旧条并新建）");
+          this.formMode = "list";
+          this.editingIndex = null;
+          setInFlight(false);
+          await this.renderRoot();
+          return;
+        } else if (toDelete || onlyCancel) {
+          if (!priorEntryId) {
+            new Notice("旧记录无 entry_id，请重建索引或手工补 meta 后再取消");
+            setInFlight(false);
+            return;
+          }
+          await runJournal(
+            priorEntryId,
+            true,
+            Number(prior?.amount ?? signedAmount),
+            {
+              subcategory: normStr(prior?.subcategory) || priorSub || normalizedSub,
+              institution_name: priorMeta?.institutionName || undefined,
+              cycle_type: priorMeta ? normalizeFinanceCycleType(priorMeta.cycleType) : "none",
+              cycle_id: cancelCycleId,
+              scene_tags: priorMeta?.sceneTags ?? [],
+            },
+            buildFinanceMainNoteParts({
+              subcategory: normStr(prior?.subcategory) || priorSub,
+              institutionName: priorMeta?.institutionName ?? "",
+              cycleType: priorMeta ? normalizeFinanceCycleType(priorMeta.cycleType) : "none",
+              bodyNote: priorMeta?.body ?? "",
+            })
+          );
+        } else if (priorEntryId) {
+          await runJournal(
+            priorEntryId,
+            false,
+            signedAmount,
+            {
+              subcategory: normalizedSub,
+              institution_name: institutionName || undefined,
+              cycle_type: cycleType,
+              cycle_id: cycleIdForNew,
+              scene_tags: sceneTags,
+            },
+            noteMain
+          );
+        } else {
+          entryId = generateFinanceEntryId();
+          await runJournal(
+            entryId,
+            false,
+            signedAmount,
+            {
+              subcategory: normalizedSub,
+              institution_name: institutionName || undefined,
+              cycle_type: cycleType,
+              cycle_id: cycleIdForNew,
+              scene_tags: sceneTags,
+            },
+            noteMain
+          );
+        }
+
+        const indexItem: FinanceRecordIndexItem = {
           recordDate: dateKey,
+          entryId: toDelete || onlyCancel ? priorEntryId : entryId,
           categoryId: this.cat.id,
           categoryName: this.cat.name,
           type,
-          amount: Number(signedAmount),
-          note: payload.note,
-          isDelete: toDelete,
+          subcategory: toDelete || onlyCancel ? normStr(prior?.subcategory) || priorSub : normalizedSub,
+          amount: toDelete || onlyCancel ? Number(prior?.amount ?? signedAmount) : signedAmount,
+          note: noteMain,
+          institutionName:
+            toDelete || onlyCancel ? priorMeta?.institutionName || undefined : institutionName || undefined,
+          cycleType:
+            (toDelete || onlyCancel) && priorMeta
+              ? normalizeFinanceCycleType(priorMeta.cycleType)
+              : cycleType,
+          cycleId:
+            toDelete || onlyCancel
+              ? cancelCycleId
+              : cycleIdForNew === undefined
+                ? undefined
+                : cycleIdForNew,
+          sceneTags:
+            toDelete || onlyCancel
+              ? priorMeta?.sceneTags?.length
+                ? priorMeta.sceneTags
+                : undefined
+              : sceneTags.length
+                ? sceneTags
+                : undefined,
+          isDelete: !!(toDelete || onlyCancel),
           tsMs: Date.now(),
+        };
+
+        await this.plugin.recordRSLatte?.upsertFinanceRecord?.(indexItem);
+
+        this.plugin.applyTodayFinanceRecord({
+          id: 0,
+          record_date: dateKey,
+          category_id: this.cat.id,
+          entry_id: indexItem.entryId,
+          amount: Number(indexItem.amount),
+          note: indexItem.note,
+          is_delete: !!indexItem.isDelete,
+          created_at: new Date().toISOString(),
         });
-      } catch (e) {
-        console.warn("recordRSLatte upsertFinanceRecord failed", e);
-      }
 
-      try {
-
-        // ✅ 写入日志（取消用“不可解析”格式避免影响统计）
-        const ts = moment().format("HH:mm");
-        const amtAbs = Math.abs(Number(signedAmount));
-        const mark = toDelete ? "❌" : "✅";
-        // 说明：为便于未来“扫描重建索引”，正常记录行也写入【分类ID + 分类名称】
-        // 格式：- 2026-01-03 expense CW_UZGMNY 日用品 - -20.00
-        const safeCatName = String(this.cat.name ?? "").trim().replace(/\s+/g, "");
-        const line = toDelete
-          ? `- ${mark} ${dateKey} ${ts} ${type} ${this.cat.id} ${safeCatName || this.cat.id} ${payload.note || "-"} ${amtAbs.toFixed(2)}`
-          : `- ${dateKey} ${type} ${this.cat.id} ${safeCatName || this.cat.id} ${payload.note || "-"} ${signedAmount.toFixed(2)}`;
-
-        try {
-          // ✅ 按“日志追加清单”配置写入日记（强制启用：财务）
-          await ((this.plugin as any).appendJournalByModule?.("finance", dateKey, [line]) ?? Promise.resolve());
-        } catch (e: any) {
-          new Notice("账单已保存，但写入日记失败（详情已写入审计日志）");
-          await this.plugin.appendAuditLog({
-            action: "FINANCE_JOURNAL_APPEND_FAILED",
-            payload,
-            error: {
-              message: e?.message ?? String(e),
-              stack: e?.stack ?? null,
-            },
-          });
+        const financeCat = this.plugin.settings.financeCategories?.find((c) => c.id === this.cat.id) as any;
+        if (financeCat && !toDelete && !onlyCancel) {
+          if (!Array.isArray(financeCat.institutionNames)) financeCat.institutionNames = [];
+          const inst = String(institutionName ?? "").trim().replace(/\s+/g, " ");
+          if (inst && !financeCat.institutionNames.includes(inst)) financeCat.institutionNames.push(inst);
+          if (normalizedSub && !financeCat.subCategories) financeCat.subCategories = [];
+          if (normalizedSub && financeCat.subCategories && !financeCat.subCategories.includes(normalizedSub)) {
+            financeCat.subCategories.push(normalizedSub);
+          }
         }
 
         await this.plugin.saveSettings();
-        // ✅ 先刷新按钮，再异步刷新统计数据（不阻断 UI 关闭）
         this.plugin.refreshSidePanel();
-        
-        // ✅ 刷新财务侧边栏（如果已打开）
         try {
           const financeLeaves = this.app.workspace.getLeavesOfType("rslatte-financepanel");
           for (const leaf of financeLeaves) {
             const view = leaf.view as any;
-            if (view && typeof view.refresh === "function") {
-              void view.refresh();
-            }
+            if (view && typeof view.refresh === "function") void view.refresh();
           }
         } catch {
-          // ignore
+          /* ignore */
         }
-        
         void this.plugin.refreshFinanceSummaryFromApi(true);
 
-        // ✅ Work Event（失败不阻断）
-        try {
-          void this.plugin.workEventSvc?.append({
-            ts: new Date().toISOString(),
-            kind: "finance",
-            action: toDelete ? "delete" : (existedAndActive ? "update" : "create"),
-            source: "ui",
-            ref: {
-              record_date: dateKey,
-              category_id: catId,
-              category_name: catName || undefined,
-              amount: Number(signedAmount),
-              subcategory: normalizeFinanceSubcategory(subcategory) || undefined,
-              note: (payload.note || "").trim() || undefined,
-              is_delete: toDelete,
-            },
-            summary: `${toDelete ? "❌ 取消账单" : (existedAndActive ? "✏️ 更新账单" : "💰 新增账单")} ${catName || catId} ${Number(signedAmount)}`,
-            metrics: { amount: Number(signedAmount), is_delete: toDelete },
-          });
-        } catch {
-          // ignore
-        }
-
-        new Notice(toDelete ? "已取消今日账单" : (existedAndActive ? "已更新账单" : "已保存记账"));
-        this.close();
+        new Notice(toDelete || onlyCancel ? "已取消本笔" : priorEntryId ? "已更新" : "已保存");
+        this.formMode = "list";
+        this.editingIndex = null;
+        await this.renderRoot();
       } catch (e: any) {
-        // ✅ 理论上不会走到这里：这里只兜底 UI 更新失败
-        await this.plugin.appendAuditLog({
-          action: "FINANCE_UI_APPLY_FAILED",
-          payload,
-          error: {
-            message: e?.message ?? String(e),
-            stack: e?.stack ?? null,
-          },
-        });
+        new Notice("保存失败（详见控制台）");
+        console.warn("FinanceRecordModal save failed", e);
       } finally {
-        // If modal is still open for any reason, re-enable UI.
-        try { setInFlight(false); } catch { }
+        setInFlight(false);
       }
     };
 
-    window.setTimeout(() => {
-      amountText?.inputEl?.focus();
-      refreshValidationUI();
-    }, 0);
-    };
-
-    void render().catch((e) => {
-      console.warn("ensureTodayFinancesInitialized/render failed", e);
-      new Notice("初始化账单信息失败");
-      this.close();
-    });
+    if (!onlyCancel) {
+      window.setTimeout(() => {
+        amountText?.inputEl?.focus();
+        refreshValidationUI();
+      }, 0);
+    }
   }
 
   onClose() {
     this.contentEl.empty();
   }
+}
+
+function normStr(v: unknown): string {
+  return String(v ?? "").trim();
 }

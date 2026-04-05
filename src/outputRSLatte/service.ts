@@ -1,9 +1,13 @@
 import { App, TFile, TFolder, normalizePath } from "obsidian";
+import { appendOutputArchivedFromIndexLedgerEvent, readMergedOutputLedgerMaps } from "./outputHistoryLedger";
+import { buildOutputRefreshScanPlan, mergeOutputPrimaryScanRoots } from "./outputRefreshScanPlan";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
 import type { RSLattePluginSettings } from "../types/settings";
 import type { OutputIndexFile, OutputIndexItem, OutputPanelSettings, OutputTimelineTimeField } from "../types/outputTypes";
 import { OutputIndexStore } from "./indexStore";
-import { resolveSpaceIndexDir } from "../services/spaceContext";
+import { resolveSpaceIndexDir } from "../services/space/spaceContext";
 import { monthKeyFromYmd } from "../taskRSLatte/utils";
+import { localYmdFromInstant, toLocalOffsetIsoString } from "../utils/localCalendarYmd";
 
 // 未使用的函数，保留以备将来使用
 // function clamp(n: number, min: number, max: number): number {
@@ -51,13 +55,17 @@ function toIsoDate(v: any): string | undefined {
 function toIsoDateTime(v: any): string | undefined {
   if (v === null || v === undefined) return undefined;
   if (typeof v === "number" && Number.isFinite(v)) {
-    try { return new Date(v).toISOString(); } catch { return undefined; }
+    try {
+      return toLocalOffsetIsoString(new Date(v));
+    } catch {
+      return undefined;
+    }
   }
   const s = String(v).trim();
   if (!s) return undefined;
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return undefined;
-  return d.toISOString();
+  return toLocalOffsetIsoString(d);
 }
 
 export class OutputRSLatteService {
@@ -77,6 +85,10 @@ export class OutputRSLatteService {
       settingsRef: () => RSLattePluginSettings;
       refreshSidePanel: () => void;
       workEventSvc?: any; // WorkEventService，可选
+      /** 批量改写输出 frontmatter 后同步 DB / 日记（与 OutputSidePanelView 一致） */
+      syncOutputToDbBestEffort?: (reason: string) => Promise<void>;
+      /** 写 `.history` 台账（主索引归档迁出等） */
+      ledgerPluginRef?: () => import("../main").default | null | undefined;
     }
   ) {}
 
@@ -84,6 +96,94 @@ export class OutputRSLatteService {
     const s = this.host.settingsRef();
     const op = s.outputPanel;
     return op as any;
+  }
+
+  /** 项目输出契约条目：用于重建前后一致性诊断。 */
+  private isProjectOutputContractItem(it: OutputIndexItem): boolean {
+    const kind = String((it as any)?.outputDocumentKind ?? "").trim().toLowerCase();
+    const outputId = String((it as any)?.outputId ?? "").trim();
+    const projectId = String((it as any)?.projectId ?? "").trim();
+    return kind === "project" && !!outputId && !!projectId;
+  }
+
+  /** 判断路径是否落在任一扫描根下（前缀匹配）。 */
+  private isPathUnderAnyRoot(filePath: string, roots: string[]): boolean {
+    const p = normalizePath(String(filePath ?? "").trim());
+    if (!p) return false;
+    for (const r0 of roots) {
+      const r = normalizePath(String(r0 ?? "").trim()).replace(/\/+$/g, "");
+      if (!r) continue;
+      if (p === r || p.startsWith(r + "/")) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 兜底发现项目 `pro_files` 根：
+   * - 优先用 projectMgr 快照（低开销）
+   * - 若快照为空，回退从 projectRootDir 递归发现名为 `pro_files` 的目录（避免重建时漏掉项目输出）
+   */
+  private collectProjectProFilesRoots(): string[] {
+    const roots = new Set<string>();
+    try {
+      const projSnap = (this.host as any).projectMgr?.getSnapshot?.();
+      const projects = (projSnap?.projects ?? []) as Array<{ folderPath?: string }>;
+      for (const p of projects) {
+        const fp = normalizePath(String(p?.folderPath ?? "").trim());
+        if (!fp) continue;
+        roots.add(normalizePath(`${fp}/pro_files`));
+      }
+      if (roots.size > 0) return Array.from(roots);
+    } catch {
+      // ignore and fallback below
+    }
+
+    // fallback：从 projectRootDir 递归发现 pro_files
+    try {
+      const s: any = this.host.settingsRef() as any;
+      const projectRootDir = normalizePath(String(s?.projectRootDir ?? "").trim());
+      const rootAf = projectRootDir ? this.host.app.vault.getAbstractFileByPath(projectRootDir) : null;
+      if (!(rootAf instanceof TFolder)) return Array.from(roots);
+
+      const walk = (folder: TFolder) => {
+        for (const ch of folder.children) {
+          if (!(ch instanceof TFolder)) continue;
+          if (ch.name === "pro_files") {
+            roots.add(normalizePath(ch.path));
+            continue;
+          }
+          walk(ch);
+        }
+      };
+      walk(rootAf);
+    } catch {
+      // ignore fallback errors
+    }
+    return Array.from(roots);
+  }
+
+  /** 输出重建一致性诊断：帮助定位“upsert 后在全量重建里丢失”的原因。 */
+  private logProjectOutputDropDiagnostics(prevItems: OutputIndexItem[], nextItems: OutputIndexItem[], scanRoots: string[]): void {
+    try {
+      const prevMap = new Map<string, OutputIndexItem>();
+      for (const it of prevItems ?? []) prevMap.set(String(it.filePath ?? "").trim(), it);
+      const nextSet = new Set<string>((nextItems ?? []).map((it) => String(it.filePath ?? "").trim()));
+
+      for (const [fp, it] of prevMap) {
+        if (!fp || !this.isProjectOutputContractItem(it)) continue;
+        if (nextSet.has(fp)) continue;
+        const inRoots = this.isPathUnderAnyRoot(fp, scanRoots);
+        console.warn("[RSLatte][output-index] project output dropped after rebuild", {
+          filePath: fp,
+          outputId: (it as any).outputId,
+          projectId: (it as any).projectId,
+          reason: inRoots ? "rebuild_parse_or_filter_miss" : "scan_roots_miss",
+          scanRootsCount: scanRoots.length,
+        });
+      }
+    } catch {
+      // diagnose only
+    }
   }
 
   private getIndexBaseDir(): string {
@@ -159,6 +259,50 @@ export class OutputRSLatteService {
       .filter((x: string) => !!x);
   }
 
+  /** 索引归档阈值：早于该日（按本地日界）的 DONE 条目可从主索引迁出（仍留在知识库路径下时）。 */
+  private getOutputIndexArchiveCutoffDayKey(): string {
+    const days = normalizeArchiveThresholdDays(this.settings.archiveThresholdDays);
+    const localMid = new Date();
+    localMid.setHours(0, 0, 0, 0);
+    localMid.setDate(localMid.getDate() - days);
+    const y = localMid.getFullYear();
+    const m = String(localMid.getMonth() + 1).padStart(2, "0");
+    const d = String(localMid.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  /** 用于与 archiveThresholdDays 比较的参考日（优先 doneDate，否则 mtime 日） */
+  private itemDayKeyForIndexArchive(it: OutputIndexItem): string | null {
+    const ds = String(it.doneDate ?? "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(ds)) return ds;
+    return toDayKeyFromMs(it.mtimeMs);
+  }
+
+  /**
+   * 合并 `.history/output-ledger.json` 中记录的 **知识库路径**：若 Vault 中仍有对应 md 且尚未进入本次扫描集合，则补建索引项。
+   * @see `types/outputTypes.ts` 文件头 §8.4（台账与磁盘扫描顺序）
+   */
+  private async mergeLedgerKnowledgePathsIntoScan(
+    items: OutputIndexItem[],
+    seen: Set<string>,
+  ): Promise<void> {
+    try {
+      const maps = await readMergedOutputLedgerMaps(this.host.app, this.host.settingsRef() as any);
+      for (const kPath of maps.byKnowledgePath.keys()) {
+        const p = normalizePath(String(kPath ?? "").trim());
+        if (!p || seen.has(p)) continue;
+        const af = this.host.app.vault.getAbstractFileByPath(p);
+        if (!(af instanceof TFile)) continue;
+        if (af.extension.toLowerCase() !== "md") continue;
+        seen.add(af.path);
+        const it = await this.buildItemFromFile(af);
+        if (it) items.push(it);
+      }
+    } catch (e) {
+      console.warn("[RSLatte][output] mergeLedgerKnowledgePathsIntoScan failed:", e);
+    }
+  }
+
   private getTopLevelDir(filePath: string): string | null {
     const p = normalizePath(String(filePath ?? "")).replace(/^\/+/, "");
     const parts = p.split("/").filter(Boolean);
@@ -207,6 +351,73 @@ export class OutputRSLatteService {
     const p = normalizePath(String(path ?? ""));
     return p === root || p.startsWith(root + "/");
   }
+
+  /**
+   * 兜底：若用户手工修改了 md 文件名，扫描时同步修正父目录中的“输出名”片段。
+   * 约束：
+   * - 仅处理符合 `【文档分类】输出名(-n)` 命名约定的父目录
+   * - 仅当 frontmatter 的 `文档分类/doc_category` 与目录前缀一致时生效
+   * - 保留原目录后缀 `-n`（如有），并做重名避让
+   */
+  private async syncFolderNameByMdFileName(file: TFile, fm?: Record<string, unknown>): Promise<TFile> {
+    try {
+      const parentPath = normalizePath(String(file.path).split("/").slice(0, -1).join("/"));
+      const parentName = parentPath.split("/").pop() ?? "";
+      const parentDir = parentPath.split("/").slice(0, -1).join("/");
+      const parentAf = this.host.app.vault.getAbstractFileByPath(parentPath);
+      if (!(parentAf instanceof TFolder)) return file;
+
+      const docCategory =
+        (fm?.["文档分类"] ? String(fm["文档分类"]).trim() : "") ||
+        (fm?.doc_category ? String(fm.doc_category).trim() : "");
+      if (!docCategory) return file;
+
+      const m = parentName.match(/^【(.+?)】(.+?)(-\d+)?$/);
+      if (!m) return file;
+      const folderCat = String(m[1] ?? "").trim();
+      const folderOutputName = String(m[2] ?? "").trim();
+      if (folderCat !== docCategory) return file;
+      // 目录名与文件名必须保持一致（去掉 `【文档分类】` 前缀后）；
+      // - 无后缀目录：`folderOutputName === file.basename`
+      // - 有后缀目录：`${folderOutputName}${suffix} === file.basename`
+      // 避免把“目录带 -2 但文件不带 -2”误判为一致，导致无法自愈。
+      const folderRawSuffix = String(m[3] ?? "");
+      const isConsistent = folderRawSuffix
+        ? `${folderOutputName}${folderRawSuffix}` === file.basename
+        : folderOutputName === file.basename;
+      if (isConsistent) return file;
+
+      // 统一口径：目标目录名始终直接跟随当前文件基名，不继承旧目录后缀。
+      let wantedFolderPath = normalizePath(`${parentDir}/【${docCategory}】${file.basename}`);
+      const exists = (p: string) => !!this.host.app.vault.getAbstractFileByPath(p);
+      if (wantedFolderPath !== parentPath && exists(wantedFolderPath)) {
+        let i = 2;
+        while (exists(normalizePath(`${parentDir}/【${docCategory}】${file.basename}-${i}`))) i++;
+        wantedFolderPath = normalizePath(`${parentDir}/【${docCategory}】${file.basename}-${i}`);
+      }
+      if (wantedFolderPath === parentPath) return file;
+
+      try {
+        await this.host.app.vault.rename(parentAf, wantedFolderPath);
+      } catch (e: any) {
+        const msg = String(e?.message ?? e ?? "");
+        // 并发刷新/重建时，父目录可能已被其他流程改名（ENOENT）或目标已被占用（EEXIST）；
+        // 这两类都属于“自愈改名竞争”，不应中断主流程。
+        if (/ENOENT|no such file or directory|EEXIST|already exists|Destination file already exists/i.test(msg)) return file;
+        throw e;
+      }
+      const renamedPath = normalizePath(`${wantedFolderPath}/${file.name}`);
+      const renamedAf = this.host.app.vault.getAbstractFileByPath(renamedPath);
+      if (renamedAf instanceof TFile) return renamedAf;
+      return file;
+    } catch (e) {
+      console.warn("[RSLatte][output] syncFolderNameByMdFileName failed:", e);
+      return file;
+    }
+  }
+  /**
+   * 重建中央输出索引：物理扫描顺序与台账合并见 **`types/outputTypes.ts` §8.4**、`buildOutputRefreshScanPlan`。
+   */
   public async refreshIndexNow(opts?: { mode?: "active" | "full" }): Promise<void> {
     await this.ensureReady();
 
@@ -220,17 +431,18 @@ export class OutputRSLatteService {
       prevItemsByPath.set(item.filePath, item);
     }
 
-    // scanRoots: user-configured active roots for output docs
-    const scanRoots = this.normalizeRootList(op?.archiveRoots ?? []);
+    // §8.4：第一段扫描根 = archiveRoots + 各项目 pro_files（与 `mergeOutputPrimaryScanRoots` 单一实现）
+    const uniqScanRoots = mergeOutputPrimaryScanRoots(op?.archiveRoots ?? [], this.collectProjectProFilesRoots());
+    const scanPlan = buildOutputRefreshScanPlan(op, mode);
 
     // If scanRoots are empty, do nothing (avoid scanning the entire vault by accident).
     // IMPORTANT: do NOT wipe existing snapshot/cancelledArchiveDirs cache, otherwise the UI may lose
     // knowledge about per-top-level _archived dirs and require an expensive full rescan.
-    if (!scanRoots.length) {
+    if (!uniqScanRoots.length) {
       const prev = await this.getSnapshot();
       this.snapshot = {
         version: 2,
-        updatedAt: new Date().toISOString(),
+        updatedAt: toLocalOffsetIsoString(),
         items: (prev?.items ?? []) as OutputIndexItem[],
         cancelledArchiveDirs: (prev?.cancelledArchiveDirs ?? []) as string[],
       };
@@ -239,14 +451,14 @@ export class OutputRSLatteService {
       return;
     }
 
-    // doneArchiveRoot: global archive root (DONE docs are archived under this root)
-    const doneArchiveRoot = normalizePath(String((op as any)?.archiveRootDir ?? "99-Archive").trim() || "99-Archive");
+    // doneArchiveRoot: global archive root（与 `buildOutputRefreshScanPlan` 一致）
+    const doneArchiveRoot = scanPlan.doneArchiveRoot;
 
     // cancelledArchiveDirs: per-top-level "_archived" dirs (CANCELLED docs)
     // - active mode: keep previous cache (no discovery)
     // - full mode: (re)discover based on scan roots + previous cache
     const prevDirs = (await this.getSnapshot())?.cancelledArchiveDirs ?? [];
-    const cancelledDirs = mode === "full" ? await this.discoverCancelledArchiveDirs(scanRoots, prevDirs) : prevDirs;
+    const cancelledDirs = mode === "full" ? await this.discoverCancelledArchiveDirs(uniqScanRoots, prevDirs) : prevDirs;
 
     // 说明：maxItems 仅用于 UI 展示；中央索引需存全量数据，用于 DB 同步/归档。
     // 为避免极端情况下索引过大，这里加一个上限。
@@ -292,12 +504,12 @@ export class OutputRSLatteService {
     };
 
     // 1) Active scan roots
-    for (const r of scanRoots) {
+    for (const r of uniqScanRoots) {
       await scanPath(r, "active");
     }
 
-    if (mode === "full") {
-      // 2) DONE archive root (global)
+    if (mode === "full" && scanPlan.includesLegacyPhysicalArchive) {
+      // 2) DONE archive root（旧版「笔记归档」目的地，如 99-Archive）
       await scanPath(doneArchiveRoot, "archived");
 
       // 3) CANCELLED per-top-level _archived dirs
@@ -305,6 +517,9 @@ export class OutputRSLatteService {
         await scanPath(d, "archived");
       }
     }
+
+    // 4) 与合并后的台账对齐：ledger 中的知识库路径若仍有文件，补入索引（发布到知识库后主流程不依赖再扫物理归档目录）
+    await this.mergeLedgerKnowledgePathsIntoScan(items, seen);
 
     // active mode: prune DONE/CANCELLED items to keep the index lightweight.
     // When the user enables showing archived statuses (done/cancelled), the view will trigger a full refresh.
@@ -315,6 +530,9 @@ export class OutputRSLatteService {
         })
       : items;
 
+    // ✅ 诊断：重建后若丢失「项目输出契约条目」，打印原因（roots miss / parse miss）
+    this.logProjectOutputDropDiagnostics(prevSnapshot?.items ?? [], finalItems, uniqScanRoots);
+
     // keep only latest by mtime for storage compactness
     finalItems.sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0));
     const trimmed = finalItems.slice(0, STORE_CAP);
@@ -323,7 +541,7 @@ export class OutputRSLatteService {
     // 这样 archiveIndexForArchivedFiles 才能读取到完整的索引并清理
     this.snapshot = {
       version: 2,
-      updatedAt: new Date().toISOString(),
+      updatedAt: toLocalOffsetIsoString(),
       items: trimmed,
       cancelledArchiveDirs: cancelledDirs,
     };
@@ -370,7 +588,7 @@ export class OutputRSLatteService {
               if (file instanceof TFile) {
                 // append 方法会自动处理时间戳转换，直接传入 ISO 字符串即可
                 void workEventSvc.append({
-                  ts: new Date(newMtime).toISOString(), // append 方法会自动转换为本地时间
+                  ts: toLocalOffsetIsoString(new Date(newMtime)),
                   kind: "output",
                   action: "update",
                   source: "auto",
@@ -432,7 +650,7 @@ export class OutputRSLatteService {
       if (d && !cancelledArchiveDirs.includes(d)) cancelledArchiveDirs = [...cancelledArchiveDirs, d];
     }
 
-    this.snapshot = { version: 2, updatedAt: new Date().toISOString(), items: trimmed, cancelledArchiveDirs };
+    this.snapshot = { version: 2, updatedAt: toLocalOffsetIsoString(), items: trimmed, cancelledArchiveDirs };
     await this.store!.writeIndex(this.snapshot);
   }
 
@@ -451,9 +669,9 @@ export class OutputRSLatteService {
   }
 
   /**
-   * 归档已归档文件的索引：将已归档文件的索引项从主索引移动到归档索引
-   * - done 状态的文件归档到 99-Archive
-   * - cancelled 状态的文件归档到 _archived
+   * 索引归档（主索引 → 按月 JSON + archive-map）：
+   * - 笔记仍在「输出笔记归档根」或 `_archived` 下时，按路径迁出；
+   * - **或** DONE 且路径落在 **输出文档扫描根**（如知识库目录）、且超过 **archiveThresholdDays**（相对 doneDate / mtime 日）时迁出，并在对应根下 **`.history/output-ledger`** 追加 `output_archived_from_index`（不要求再做笔记物理归档）。
    */
   public async archiveIndexForArchivedFiles(): Promise<void> {
     await this.ensureReady();
@@ -461,6 +679,7 @@ export class OutputRSLatteService {
 
     const op = this.settings;
     const doneArchiveRoot = normalizePath(String((op as any)?.archiveRootDir ?? "99-Archive").trim() || "99-Archive");
+    const fallbackDayYmd = localYmdFromInstant(new Date()) ?? "1970-01-01";
 
     const idx = await this.getSnapshot();
     const mapFile = await this.store.readArchiveMap();
@@ -469,6 +688,9 @@ export class OutputRSLatteService {
     const keep: OutputIndexItem[] = [];
     const toArchiveByMonth: Record<string, OutputIndexItem[]> = {};
     let hasArchivedItems = false; // 标记是否有归档文件需要处理
+
+    const cutoffDay = this.getOutputIndexArchiveCutoffDayKey();
+    const archiveRootsNorm = this.normalizeRootList(op?.archiveRoots ?? []);
 
     // 辅助函数：安全地从日期字符串提取月份键
     const safeMonthKeyFromDate = (dateStr: string | undefined | null): string | null => {
@@ -491,18 +713,30 @@ export class OutputRSLatteService {
       // 检查文件是否在归档目录中
       const isDoneArchived = this.isDoneArchivedPath(filePath, doneArchiveRoot);
       const isCancelledArchived = this.isCancelledArchivedPath(filePath);
+      const inArchiveMap = !!archiveMap[filePath];
 
-      // 如果文件在归档目录中，或者已经在归档映射中，都应该从主索引移除
-      if (isDoneArchived || isCancelledArchived || archiveMap[filePath]) {
+      const refDay = this.itemDayKeyForIndexArchive(it);
+      const st = String(it.status ?? "").toLowerCase();
+      /** 已发布在扫描根（如知识库）下、DONE 且超过索引归档阈值：仅迁出主索引，不要求笔记再搬到 99-Archive */
+      const timeArchiveKnowledgeDone =
+        !isDoneArchived &&
+        !isCancelledArchived &&
+        !inArchiveMap &&
+        st === "done" &&
+        this.isPathUnderAnyRoot(filePath, archiveRootsNorm) &&
+        !!refDay &&
+        refDay < cutoffDay;
+
+      // 物理归档目录、已在 map、或「知识库 DONE 超时」：主索引迁出
+      if (isDoneArchived || isCancelledArchived || inArchiveMap || timeArchiveKnowledgeDone) {
         hasArchivedItems = true;
-        // 如果已经在归档映射中，直接跳过（不需要再次归档）
-        if (archiveMap[filePath]) continue;
-        
-        // 否则，需要添加到归档索引
-        // 确定归档月份键（基于 doneDate 或 cancelledDate，如果没有则使用 createDate）
+        if (inArchiveMap) continue;
+
         let monthKey: string;
-        if (isDoneArchived && it.doneDate) {
-          monthKey = safeMonthKeyFromDate(it.doneDate) || monthKeyFromYmd(new Date().toISOString().slice(0, 10));
+        if (timeArchiveKnowledgeDone) {
+          monthKey = safeMonthKeyFromDate(refDay) || monthKeyFromYmd(fallbackDayYmd);
+        } else if (isDoneArchived && it.doneDate) {
+          monthKey = safeMonthKeyFromDate(it.doneDate) || monthKeyFromYmd(fallbackDayYmd);
         } else if (isCancelledArchived) {
           // cancelled 状态：优先使用 cancelledDate，否则从 cancelledTime 提取，再否则使用 createDate
           const cancelledDateKey = safeMonthKeyFromDate(it.cancelledDate);
@@ -515,25 +749,27 @@ export class OutputRSLatteService {
               monthKey = timeKey;
             } else {
               const createKey = safeMonthKeyFromDate(it.createDate);
-              monthKey = createKey || monthKeyFromYmd(new Date().toISOString().slice(0, 10));
+              monthKey = createKey || monthKeyFromYmd(fallbackDayYmd);
             }
           } else {
             const createKey = safeMonthKeyFromDate(it.createDate);
-            monthKey = createKey || monthKeyFromYmd(new Date().toISOString().slice(0, 10));
+            monthKey = createKey || monthKeyFromYmd(fallbackDayYmd);
           }
         } else {
           const createKey = safeMonthKeyFromDate(it.createDate);
-          monthKey = createKey || monthKeyFromYmd(new Date().toISOString().slice(0, 10));
+          monthKey = createKey || monthKeyFromYmd(fallbackDayYmd);
         }
 
         (toArchiveByMonth[monthKey] ??= []).push(it);
       } else {
-        // 文件不在归档目录中，保留在主索引
         keep.push(it);
       }
     }
 
     let archivedCount = 0;
+
+    const tsLedger = toLocalOffsetIsoString();
+    const ledgerPlg = this.host.ledgerPluginRef?.() ?? null;
 
     for (const [mk, items] of Object.entries(toArchiveByMonth)) {
       const added = await this.store.appendToArchive(mk, items);
@@ -543,6 +779,21 @@ export class OutputRSLatteService {
           const path = String(it.filePath ?? "").trim();
           if (path) archiveMap[path] = mk;
         }
+        if (ledgerPlg) {
+          for (const it of items) {
+            const fp = String((it as any).filePath ?? "").trim();
+            if (!fp) continue;
+            const oid =
+              String((it as any).outputId ?? (it as any).output_id ?? "")
+                .trim() || undefined;
+            void appendOutputArchivedFromIndexLedgerEvent(ledgerPlg, {
+              sourceOutputPath: fp,
+              outputId: oid,
+              archiveMonthKey: mk,
+              tsIso: tsLedger,
+            });
+          }
+        }
       }
     }
 
@@ -551,14 +802,14 @@ export class OutputRSLatteService {
     if (hasArchivedItems) {
       this.snapshot = {
         version: 2,
-        updatedAt: new Date().toISOString(),
+        updatedAt: toLocalOffsetIsoString(),
         items: keep,
         cancelledArchiveDirs: idx.cancelledArchiveDirs ?? [],
       };
       await this.store.writeIndex(this.snapshot);
       // 只有在有新归档项时才更新归档映射
       if (archivedCount > 0) {
-        await this.store.writeArchiveMap({ version: 1, updatedAt: new Date().toISOString(), map: archiveMap });
+        await this.store.writeArchiveMap({ version: 1, updatedAt: toLocalOffsetIsoString(), map: archiveMap });
       }
       // ✅ 同步修剪 output-sync-state.json：移除已归档条目的 byId，与主索引保持一致
       try {
@@ -575,7 +826,7 @@ export class OutputRSLatteService {
         }
         await this.store.writeSyncState({ 
           version: 1, 
-          updatedAt: new Date().toISOString(), 
+          updatedAt: toLocalOffsetIsoString(), 
           byId: filteredById 
         });
       } catch (e) {
@@ -587,21 +838,48 @@ export class OutputRSLatteService {
   /** Build one index item from file cache/frontmatter */
   public async buildItemFromFile(file: TFile): Promise<OutputIndexItem | null> {
     try {
-      const cache = this.host.app.metadataCache.getFileCache(file);
+      let workingFile = file;
+      const cache0 = this.host.app.metadataCache.getFileCache(workingFile);
+      const fm0 = (cache0?.frontmatter ?? {}) as Record<string, unknown>;
+      workingFile = await this.syncFolderNameByMdFileName(workingFile, fm0);
+
+      const cache = this.host.app.metadataCache.getFileCache(workingFile);
       const fm = cache?.frontmatter ?? ({} as any);
 
       const outputId = (fm?.output_id ? String(fm.output_id).trim() : "") || undefined;
 
-      const title = file.basename;
+      const title = workingFile.basename;
 
       const status = (fm?.status ? String(fm.status).trim() : "") || "todo";
       const type = fm?.type ? String(fm.type).trim() : undefined;
-      const docCategory = fm?.["文档分类"] ? String(fm["文档分类"]).trim() : undefined;
+      const docCategory =
+        (fm?.["文档分类"] ? String(fm["文档分类"]).trim() : "") ||
+        (fm?.doc_category ? String(fm.doc_category).trim() : "") ||
+        undefined;
+
+      const rawKind = fm?.output_document_kind ? String(fm.output_document_kind).trim().toLowerCase() : "";
+      const outputDocumentKind: "general" | "project" | undefined =
+        rawKind === "project" ? "project" : rawKind === "general" ? "general" : undefined;
+
+      const projectId =
+        (fm?.project_id ? String(fm.project_id).trim() : "") ||
+        (fm?.projectId ? String(fm.projectId).trim() : "") ||
+        undefined;
+      const projectName =
+        (fm?.project_name ? String(fm.project_name).trim() : "") ||
+        (fm?.projectName ? String(fm.projectName).trim() : "") ||
+        undefined;
+
+      const resumeAt = toIsoDate(fm?.resume_at ?? fm?.resumeAt) || undefined;
 
       const tags = normalizeTags(fm?.tags);
       const domains = normalizeDomains(fm?.["领域"] ?? fm?.domains ?? fm?.domain);
 
-      const createDate = toIsoDate(fm?.create ?? fm?.created ?? fm?.created_date) ?? (toDayKeyFromMs(file.stat?.ctime) ?? undefined);
+      const createDate = toIsoDate(fm?.create ?? fm?.created ?? fm?.created_date) ?? (toDayKeyFromMs(workingFile.stat?.ctime) ?? undefined);
+      const linkedScheduleUid =
+        (fm?.linked_schedule_uid ? String(fm.linked_schedule_uid).trim() : "") ||
+        (fm?.linkedScheduleUid ? String(fm.linkedScheduleUid).trim() : "") ||
+        undefined;
       // done: prefer precise timestamp in `done_time`, fallback to `done` (may be a date-only field)
       const doneTime =
         toIsoDateTime(
@@ -614,9 +892,14 @@ export class OutputRSLatteService {
             fm?.completed
         ) ??
         // If only a date is provided, keep it as a day marker
-        (toIsoDate(fm?.done_date ?? fm?.completed_date) ? new Date(String(toIsoDate(fm?.done_date ?? fm?.completed_date)) + "T00:00:00").toISOString() : undefined);
+        (toIsoDate(fm?.done_date ?? fm?.completed_date)
+          ? toLocalOffsetIsoString(new Date(String(toIsoDate(fm?.done_date ?? fm?.completed_date)) + "T00:00:00"))
+          : undefined);
 
-      const doneDate = doneTime ? toIsoDate(doneTime) : toIsoDate(fm?.done ?? fm?.done_date ?? fm?.completed ?? fm?.completed_date);
+      // done_time 为 UTC ISO 时，doneDate 须用本地日历日，勿用字符串前缀（否则与 Obsidian 本机「今天」错位）
+      const doneDate = doneTime
+        ? localYmdFromInstant(doneTime) ?? toIsoDate(doneTime)
+        : toIsoDate(fm?.done ?? fm?.done_date ?? fm?.completed ?? fm?.completed_date);
 
       // cancelled info (best-effort). Prefer precise timestamp in `cancelled_time`, fallback to `cancelled` (may be date-only).
       let cancelledTime = toIsoDateTime(
@@ -635,29 +918,34 @@ export class OutputRSLatteService {
       if (!cancelledTime && String(status) === "cancelled") {
         // fallback: use current mtime, but note that without a persisted cancelled_time,
         // subsequent edits would change mtime; front-end may choose to persist cancelled_time.
-        const ms = file.stat?.mtime;
-        if (ms && Number.isFinite(ms)) cancelledTime = new Date(ms).toISOString();
+        const ms = workingFile.stat?.mtime;
+        if (ms && Number.isFinite(ms)) cancelledTime = toLocalOffsetIsoString(new Date(ms));
       }
       if (!cancelledDate && cancelledTime) {
-        cancelledDate = toIsoDate(cancelledTime) ?? undefined;
+        cancelledDate = localYmdFromInstant(cancelledTime) ?? toIsoDate(cancelledTime) ?? undefined;
       }
 
       const it: OutputIndexItem = {
         outputId,
-        filePath: file.path,
+        filePath: workingFile.path,
         title,
+        outputDocumentKind,
         docCategory,
         tags,
         type,
         status,
+        projectId: projectId || undefined,
+        projectName: projectName || undefined,
+        resumeAt: resumeAt || undefined,
         createDate,
         doneDate,
         doneTime,
         cancelledDate,
         cancelledTime,
         domains,
-        ctimeMs: file.stat?.ctime,
-        mtimeMs: file.stat?.mtime,
+        ctimeMs: workingFile.stat?.ctime,
+        mtimeMs: workingFile.stat?.mtime,
+        linkedScheduleUid: linkedScheduleUid || undefined,
       };
 
       return it;
@@ -665,5 +953,67 @@ export class OutputRSLatteService {
       console.warn("OutputRSLatte buildItemFromFile failed:", e);
       return null;
     }
+  }
+
+  /**
+   * status=waiting_until 且 resume_at≤今日 时自动恢复为 in-progress（打开侧栏/刷新索引时补跑）。
+   */
+  public async resumeWaitingOutputsIfDue(): Promise<number> {
+    const snap = this.snapshot ?? (await this.getSnapshot());
+    const items = snap?.items ?? [];
+    const today = toDayKeyFromMs(Date.now());
+    if (!today) return 0;
+
+    let n = 0;
+    const nowIso = toLocalOffsetIsoString();
+
+    for (const it of items) {
+      if (String(it.status ?? "").trim() !== "waiting_until") continue;
+      const ra = String(it.resumeAt ?? "").trim().slice(0, 10);
+      if (!ra || ra > today) continue;
+
+      const af = this.host.app.vault.getAbstractFileByPath(it.filePath);
+      if (!(af instanceof TFile)) continue;
+
+      await this.host.app.fileManager.processFrontMatter(af, (fm: any) => {
+        fm.status = "in-progress";
+        fm.resumed_time = nowIso;
+      });
+      try {
+        this.host.app.metadataCache.trigger("changed", af);
+      } catch {
+        // ignore
+      }
+      try {
+        await this.upsertFile(af);
+      } catch {
+        // ignore
+      }
+
+      void this.host.workEventSvc?.append({
+        ts: nowIso,
+        kind: "output",
+        action: "continued",
+        source: "auto",
+        ref: { file_path: it.filePath, status: "in-progress" },
+        summary: `⏳→▶ 输出等待到期自动继续 ${af.basename}`,
+      });
+      n++;
+    }
+
+    if (n > 0) {
+      try {
+        await this.host.syncOutputToDbBestEffort?.("resume_waiting_until");
+      } catch {
+        // ignore
+      }
+      try {
+        this.host.refreshSidePanel();
+      } catch {
+        // ignore
+      }
+    }
+
+    return n;
   }
 }

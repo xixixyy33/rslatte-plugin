@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-03-25T08:24:15.542Z",
+  "items": [
+    {
+      "budgetId": "BUDGET_DAILY_MONTH",
+      "budgetName": "日用品总支出月度预算",
+      "poolId": "DP_DAILY_TOTAL",
+      "amount": 0,
+      "timeGrain": "month",
+      "enabled": true
+    },
+    {
+      "budgetId": "BUDGET_HOBBY_MONTH",
+      "budgetName": "爱好支出月度预算",
+      "poolId": "DP_HOBBY_TOTAL",
+      "amount": 0,
+      "timeGrain": "month",
+      "enabled": true
+    },
+    {
+      "budgetId": "BUDGET_CHILD_MONTH",
+      "budgetName": "儿童支出月度预算",
+      "poolId": "DP_CHILD_TOTAL",
+      "amount": 0,
+      "timeGrain": "month",
+      "enabled": true
+    },
+    {
+      "budgetId": "BUDGET_TOTAL_MONTH",
+      "budgetName": "本月总支出预算",
+      "poolId": "DP_EXPENSE_TOTAL",
+      "amount": 0,
+      "timeGrain": "month",
+      "enabled": true
+    }
+  ]
+}

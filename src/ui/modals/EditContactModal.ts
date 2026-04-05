@@ -4,7 +4,6 @@ import {
   Modal,
   Notice,
   Setting,
-  TextComponent,
   ToggleComponent,
   TFile,
   moment,
@@ -168,7 +167,7 @@ function renderGeneratedContactSection(obj: Record<string, any>): string {
   if (displayName) lines.push(`- 姓名：${displayName}`);
   if (aliases) lines.push(`- 别名：${aliases}`);
   if (groupName) lines.push(`- 分组：${groupName}`);
-  if (title) lines.push(`- 职位/头衔：${title}`);
+  lines.push(`- 职位/头衔：${title || "-"}`);
   if (status) lines.push(`- 状态：${status}`);
   if (tags) lines.push(`- 标签：${tags}`);
   lines.push("");
@@ -371,7 +370,7 @@ export class EditContactModal extends Modal {
       // Required
       let displayName = String(fm0.display_name ?? "");
       let aliasesRaw = Array.isArray(fm0.aliases) ? (fm0.aliases as any[]).join(", ") : String(fm0.aliases ?? "");
-      let groupName = String(fm0.group_name ?? "");
+      let groupName = String(fm0.group_name ?? "default");
       let title = String(fm0.title ?? "");
 
       // Optional
@@ -390,7 +389,7 @@ export class EditContactModal extends Modal {
       let bDay = (typeof (b0 as any).day === "number") ? String((b0 as any).day) : String((b0 as any).day ?? "");
       let bLeap = !!(b0 as any).leap_month;
       let bNote = String((b0 as any).note ?? "");
-      // ✅ 是否添加生日备忘（从 extra.birthday_memo 读取，如果没有则默认为 false）
+      // ✅ 是否添加生日提醒（从 extra.birthday_memo 读取，如果没有则默认为 false）
       let bAddMemo = !!(fm0.extra && typeof fm0.extra === "object" && (fm0.extra as any).birthday_memo);
 
       // arrays
@@ -424,14 +423,27 @@ export class EditContactModal extends Modal {
       let avatarFile: File | null = null;
 
       const help = contentEl.createDiv({ cls: "rslatte-muted" });
-      help.setText("仅更新 frontmatter；正文保持不变。更新后会刷新索引与侧边栏。\n注意：group_name 变更会移动文件（文件名固定 C_<uid>.md）。");
+      help.setText("保存时会更新 frontmatter，并同步修复正文动态区。更新后会刷新索引与侧边栏。\n注意：group_name 变更会移动文件（文件名固定 C_<uid>.md）。");
 
       const errEl = contentEl.createDiv({ cls: "rslatte-error" });
       errEl.hide();
 
+      const getGroupBlacklist = (): Set<string> => {
+        const raw = (this.plugin.settings as any)?.contactsModule?.groupDirBlacklist;
+        const arr = Array.isArray(raw) ? raw : ["templates", "_archived"];
+        return new Set(
+          arr
+            .map((x: any) => String(x ?? "").trim().toLowerCase())
+            .filter(Boolean)
+        );
+      };
+
       const validate = () => {
         const aliases = uniq(splitList(aliasesRaw));
-        const ok = !!displayName.trim() && aliases.length > 0 && !!sanitizeFolderName(groupName) && !!title.trim();
+        const normalizedGroup = sanitizeFolderName((groupName ?? "").trim() || "default");
+        const blacklist = getGroupBlacklist();
+        const groupOk = !!normalizedGroup && !blacklist.has(normalizedGroup.toLowerCase());
+        const ok = !!displayName.trim() && groupOk;
         return { ok, aliases };
       };
 
@@ -459,7 +471,7 @@ export class EditContactModal extends Modal {
 
       new Setting(contentEl)
         .setName("别名（aliases）")
-        .setDesc("必填，逗号/换行分隔")
+        .setDesc("可选，逗号/换行分隔")
         .addText((t) => {
           t.setValue(aliasesRaw);
           t.onChange((v) => {
@@ -470,7 +482,7 @@ export class EditContactModal extends Modal {
 
       new Setting(contentEl)
         .setName("分组（group_name）")
-        .setDesc("必填：对应 contactsDir 下子目录")
+        .setDesc("默认 default；对应 contactsDir 下子目录")
         .addText((t) => {
           t.setValue(groupName);
           t.onChange((v) => {
@@ -481,7 +493,7 @@ export class EditContactModal extends Modal {
 
       new Setting(contentEl)
         .setName("职位/头衔（title）")
-        .setDesc("必填")
+        .setDesc("可选")
         .addText((t) => {
           t.setValue(title);
           t.onChange((v) => {
@@ -724,9 +736,9 @@ export class EditContactModal extends Modal {
       noteIn.value = bNote;
       noteIn.oninput = () => (bNote = noteIn.value);
 
-      // ✅ 是否添加生日备忘开关
+      // ✅ 是否添加生日提醒开关
       const addMemoWrap = b.createDiv({ cls: "rslatte-contact-modal-inline" });
-      addMemoWrap.createSpan({ text: "添加生日备忘" });
+      addMemoWrap.createSpan({ text: "添加生日提醒" });
       const addMemoToggle = new ToggleComponent(addMemoWrap);
       addMemoToggle.setValue(bAddMemo);
       addMemoToggle.onChange((v) => (bAddMemo = v));
@@ -754,13 +766,14 @@ export class EditContactModal extends Modal {
       saveBtn.onClick(async () => {
         const v = validate();
         if (!v.ok) {
-          setErr("请填写必填项：姓名 / 别名（至少一个） / 分组 / 职位");
+          setErr("请填写必填项：姓名；分组不能是黑名单目录");
           return;
         }
 
-        const newGroup = sanitizeFolderName(groupName);
-        if (!newGroup) {
-          setErr("分组（group_name）不合法");
+        const newGroup = sanitizeFolderName((groupName ?? "").trim() || "default") || "default";
+        const blacklist = getGroupBlacklist();
+        if (!newGroup || blacklist.has(newGroup.toLowerCase())) {
+          setErr("分组（group_name）不合法或在黑名单中");
           return;
         }
 
@@ -877,6 +890,10 @@ export class EditContactModal extends Modal {
             birthday_memo: bAddMemo,
           },
         };
+        const oldBirthMemoUid = String((baseObj as any)?.extra?.birth_memo_uid ?? "").trim();
+        if (oldBirthMemoUid) {
+          merged.extra.birth_memo_uid = oldBirthMemoUid;
+        }
 
         // Write: keep body, but refresh the generated snapshot section so正文不会与属性（frontmatter）脱节
         const fmYaml = yamlOfObject(merged, 0);
@@ -937,13 +954,30 @@ export class EditContactModal extends Modal {
 
         new Notice("联系人已更新");
 
-        // ✅ 如果启用了生日备忘，创建或更新对应的备忘记录
-        if (bAddMemo && merged.birthday && merged.birthday.month && merged.birthday.day) {
+        // ✅ 联系人标记为取消：仅对 birth_memo_uids / birth_memo_uid 白名单中的生日提醒做失效处理
+        if (status === "cancelled") {
+          try {
+            const extra = (merged?.extra && typeof merged.extra === "object") ? merged.extra : {};
+            const rawList = (extra as any).birth_memo_uids;
+            const list = Array.isArray(rawList)
+              ? rawList.map((x: any) => String(x ?? "").trim()).filter(Boolean)
+              : String(rawList ?? "").split(/[|,;\s]+/g).map((x) => x.trim()).filter(Boolean);
+            const single = String((extra as any).birth_memo_uid ?? "").trim();
+            if (single) list.push(single);
+            const changed = await this.plugin.taskRSLatte.invalidateMemosByUids(list);
+            if (changed > 0) {
+              await this.plugin.taskRSLatte.refreshIndexAndSync({ sync: false, noticeOnError: false });
+            }
+          } catch (e: any) {
+            console.warn("[Contacts][Edit] Failed to invalidate birthday memos when contact cancelled", e);
+          }
+        // ✅ 如果启用了生日提醒，创建或更新对应的提醒记录
+        } else if (bAddMemo && merged.birthday && merged.birthday.month && merged.birthday.day) {
           try {
             const bMonthNum = Number(merged.birthday.month);
             const bDayNum = Number(merged.birthday.day);
             if (bMonthNum && bDayNum) {
-              await this.plugin.taskRSLatte.createOrUpdateContactBirthdayMemo({
+              const birthMemoUid = await this.plugin.taskRSLatte.createOrUpdateContactBirthdayMemo({
                 contactUid: uidForPath,
                 contactName: displayName.trim(),
                 contactFile: this.file.path,
@@ -951,7 +985,9 @@ export class EditContactModal extends Modal {
                 month: bMonthNum,
                 day: bDayNum,
                 leapMonth: bLeap,
+                birthMemoUid: oldBirthMemoUid || undefined,
               });
+              // birth_memo_uid/birth_memo_uids 已在 service.createOrUpdateContactBirthdayMemo 内统一回写
               
               // ✅ 刷新索引以便立即在侧边栏显示
               await this.plugin.taskRSLatte.refreshIndexAndSync({ sync: false, noticeOnError: false });
@@ -961,9 +997,11 @@ export class EditContactModal extends Modal {
             // 不阻止联系人更新，仅记录警告
           }
         } else if (!bAddMemo) {
-          // ✅ 如果关闭了生日备忘开关，删除已存在的生日备忘
+          // ✅ 如果关闭了生日提醒开关，删除已存在的生日提醒
           try {
-            const existingMemo = await this.plugin.taskRSLatte.findContactBirthdayMemo(uidForPath);
+            const existingMemo = oldBirthMemoUid
+              ? await this.plugin.taskRSLatte.findMemoByUid(oldBirthMemoUid)
+              : await this.plugin.taskRSLatte.findContactBirthdayMemo(uidForPath);
             if (existingMemo) {
               // 标记为取消状态（而不是删除，保留历史记录）
               await this.plugin.taskRSLatte.applyMemoStatusAction(existingMemo as any, "CANCELLED");

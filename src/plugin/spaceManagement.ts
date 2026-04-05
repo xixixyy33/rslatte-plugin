@@ -7,9 +7,20 @@ import {
   getCurrentSpaceId as getCurSpaceIdFromSettings,
   getSpaceConfig as getSpaceConfigFromSettings,
   buildSpaceCtx,
-} from "../services/spaceContext";
-import { applyPerSpaceSettings, extractPerSpaceSettings } from "../services/spaceSettings";
-import { VIEW_TYPE_HUB, VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_PUBLISH, VIEW_TYPE_FINANCE, VIEW_TYPE_CONTACTS, VIEW_TYPE_DASHBOARD } from "../constants/viewTypes";
+} from "../services/space/spaceContext";
+import { applyPerSpaceSettings, extractPerSpaceSettings } from "../services/space/spaceSettings";
+import {
+  VIEW_TYPE_HUB,
+  VIEW_TYPE_RSLATTE,
+  VIEW_TYPE_TASKS,
+  VIEW_TYPE_PROJECTS,
+  VIEW_TYPE_OUTPUTS,
+  VIEW_TYPE_FINANCE,
+  VIEW_TYPE_HEALTH,
+  VIEW_TYPE_CONTACTS,
+  VIEW_TYPE_KNOWLEDGE,
+  VIEW_TYPE_TODAY,
+} from "../constants/viewTypes";
 import type { RSLatteSpaceConfig } from "../types/space";
 
 /**
@@ -154,7 +165,6 @@ export function createSpaceManagement(plugin: RSLattePlugin) {
         try {
           plugin.recordRSLatte?.clearAllSnapshots?.();
           plugin.outputRSLatte?.clearAllSnapshots?.();
-          plugin.publishRSLatte?.clearAllSnapshots?.();
           (plugin as any).projectMgr?.clearAllSnapshots?.();
         } catch (e) {
           console.warn("[RSLatte][space] Failed to clear snapshots on space switch:", e);
@@ -193,7 +203,18 @@ export function createSpaceManagement(plugin: RSLattePlugin) {
     /** Refresh all RSLatte side panel views (best-effort). */
     refreshAllRSLatteViews(): void {
       try {
-        const types = [VIEW_TYPE_HUB, VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_PUBLISH, VIEW_TYPE_FINANCE, VIEW_TYPE_CONTACTS, VIEW_TYPE_DASHBOARD];
+        const types = [
+          VIEW_TYPE_HUB,
+          VIEW_TYPE_RSLATTE,
+          VIEW_TYPE_TASKS,
+          VIEW_TYPE_PROJECTS,
+          VIEW_TYPE_OUTPUTS,
+          VIEW_TYPE_FINANCE,
+          VIEW_TYPE_HEALTH,
+          VIEW_TYPE_CONTACTS,
+          VIEW_TYPE_KNOWLEDGE,
+          VIEW_TYPE_TODAY,
+        ];
         const refreshed: string[] = [];
         const failed: string[] = [];
         
@@ -306,15 +327,6 @@ export function createSpaceManagement(plugin: RSLattePlugin) {
           }
         } catch (e) {
           console.warn("[RSLatte][space] reset recordRSLatte store failed", e);
-        }
-
-        try {
-          // Publish service - reset store to use new space's index
-          if (plugin.publishRSLatte?.resetStore) {
-            void plugin.publishRSLatte.resetStore();
-          }
-        } catch (e) {
-          console.warn("[RSLatte][space] reset publishRSLatte store failed", e);
         }
 
         try {

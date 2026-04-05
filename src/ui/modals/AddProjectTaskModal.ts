@@ -1,11 +1,14 @@
 import { App, ButtonComponent, Modal, Notice, Setting, TextAreaComponent, TextComponent } from "obsidian";
 
 import type RSLattePlugin from "../../main";
+import type { ProjectTaskDateBounds } from "../../utils/projectDateConstraints";
+import { resolveProjectTaskDateBounds, validateProjectTaskDates } from "../../utils/projectDateConstraints";
+import { ImportProjectTasksCsvModal } from "./ImportProjectTasksCsvModal";
 
 /**
- * 新增“项目任务”或“子里程碑”（插入到指定项目的指定里程碑下）
- * 支持切换：任务描述、到期日期(due，必填)、开始日期(start)、计划日期(scheduled)
- * 或：里程碑名称、层级（自动计算为当前层级+1）
+ * 新增「项目任务」或「子里程碑」（插入到指定项目的指定里程碑下）
+ * 任务：描述、计划开始日（可选，⏳）、计划结束日（必填，📅，对应 meta/语义与 6.6 一致）
+ * 子里程碑：名称、层级（父级+1）、权重；不维护计划完成日（仅一级里程碑维护）
  */
 export class AddProjectTaskModal extends Modal {
   constructor(
@@ -43,11 +46,13 @@ export class AddProjectTaskModal extends Modal {
       return `${yyyy}-${mm}-${dd}`;
     })();
     let due = today;
-    let start = "";
     let scheduled = "";
+    let estimateH = "";
+    let complexity: "high" | "normal" | "light" = "normal";
 
     // ===== 里程碑相关状态 =====
     let newMilestoneName = "";
+    let milestoneWeight = 1;
     const currentLevel = Math.max(1, Math.min(3, Number(this.milestoneLevel ?? 1) || 1));
     const childLevel = Math.min(3, currentLevel + 1) as 1 | 2 | 3;
     const parentPath = String(this.milestonePath ?? this.milestoneName ?? "").trim();
@@ -55,26 +60,55 @@ export class AddProjectTaskModal extends Modal {
     // ===== UI 组件 =====
     let textInput!: TextAreaComponent;
     let milestoneNameInput!: TextComponent;
+    let milestoneWeightInput!: TextComponent;
     let saveBtn!: ButtonComponent;
     let taskFormContainer!: HTMLElement;
     let milestoneFormContainer!: HTMLElement;
+    const dateTaskRefs: { warnEl?: HTMLElement; dueEl?: HTMLInputElement; schedEl?: HTMLInputElement } = {};
+    let taskDateBounds: ProjectTaskDateBounds = resolveProjectTaskDateBounds(
+      this.plugin.projectMgr.getSnapshot().projects,
+      this.projectFolderPath,
+      String(this.milestoneName ?? "").trim(),
+    );
 
     const isValidYmd = (s: string) => !s || /^\d{4}-\d{2}-\d{2}$/.test(s);
 
     const refresh = () => {
       if (mode === "task") {
-        const dueOk = /^\d{4}-\d{2}-\d{2}$/.test((due ?? "").trim());
-        const startOk = isValidYmd((start ?? "").trim());
-        const scheduledOk = isValidYmd((scheduled ?? "").trim());
-        const ok = (text ?? "").trim().length > 0 && dueOk && startOk && scheduledOk;
+        const dueTrim = (due ?? "").trim();
+        const schedTrim = (scheduled ?? "").trim();
+        const dueOk = /^\d{4}-\d{2}-\d{2}$/.test(dueTrim);
+        const scheduledOk = isValidYmd(schedTrim);
+        const estOk = !estimateH || /^\d+(\.\d)?$/.test(String(estimateH).trim());
+        const val =
+          dueOk && scheduledOk
+            ? validateProjectTaskDates({
+                plannedStart: schedTrim,
+                plannedEnd: dueTrim,
+                bounds: taskDateBounds,
+              })
+            : { ok: true, messages: [] as string[] };
+        const taskDateBad = dueOk && scheduledOk && !val.ok;
+        const ok = (text ?? "").trim().length > 0 && dueOk && scheduledOk && estOk && !taskDateBad;
         saveBtn?.setDisabled(!ok);
         textInput?.inputEl?.classList.toggle("is-invalid", !(text ?? "").trim());
+        const w = dateTaskRefs.warnEl;
+        if (w) {
+          w.textContent = taskDateBad ? val.messages.join("；") : "";
+          w.style.display = taskDateBad ? "block" : "none";
+        }
+        dateTaskRefs.dueEl?.classList.toggle("is-invalid", !dueOk || taskDateBad);
+        dateTaskRefs.schedEl?.classList.toggle("is-invalid", !scheduledOk || taskDateBad);
         return ok;
       } else {
-        // milestone mode
-        const ok = (newMilestoneName ?? "").trim().length > 0 && childLevel <= 3;
+        // milestone mode（子里程碑不写 milestone_planned_end）
+        const wRaw = String(milestoneWeightInput?.inputEl?.value ?? milestoneWeight ?? "1").trim();
+        const wn = parseInt(wRaw, 10);
+        const wOk = Number.isFinite(wn) && wn >= 1 && wn <= 100;
+        const ok = (newMilestoneName ?? "").trim().length > 0 && childLevel <= 3 && wOk;
         saveBtn?.setDisabled(!ok);
         milestoneNameInput?.inputEl?.classList.toggle("is-invalid", !(newMilestoneName ?? "").trim());
+        milestoneWeightInput?.inputEl?.classList.toggle("is-invalid", !wOk);
         return ok;
       }
     };
@@ -192,14 +226,34 @@ export class AddProjectTaskModal extends Modal {
         });
       });
 
-    new Setting(contentEl)
-      .setName("到期日期*")
+    new Setting(taskFormContainer)
+      .setName("计划开始日")
+      .setDesc("可选，对应任务行 ⏳（计划开始）")
+      .addText((t) => {
+        t.inputEl.type = "date";
+        t.setValue("");
+        dateTaskRefs.schedEl = t.inputEl;
+        t.onChange((v) => {
+          scheduled = (v ?? "").trim();
+          refresh();
+        });
+        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
+          if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            void doSave();
+          }
+        });
+      });
+
+    new Setting(taskFormContainer)
+      .setName("计划结束日*")
+      .setDesc("必填，对应任务行 📅（计划完成/承诺完成日）")
       .addText((t) => {
         t.inputEl.type = "date";
         t.setValue(today);
+        dateTaskRefs.dueEl = t.inputEl;
         t.onChange((v) => {
           due = (v ?? "").trim();
-          t.inputEl.classList.toggle("is-invalid", !/^\d{4}-\d{2}-\d{2}$/.test(due));
           refresh();
         });
         t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
@@ -210,44 +264,51 @@ export class AddProjectTaskModal extends Modal {
         });
       });
 
+    dateTaskRefs.warnEl = taskFormContainer.createDiv({ cls: "rslatte-task-date-order-warning" });
+    dateTaskRefs.warnEl.style.display = "none";
+
     new Setting(taskFormContainer)
-      .setName("开始日期")
+      .setName("工时评估 h")
+      .setDesc("非必填，单位：小时，可小数")
       .addText((t) => {
-        t.inputEl.type = "date";
-        t.setValue("");
+        t.inputEl.type = "number";
+        t.inputEl.placeholder = "例如 2 或 1.5";
         t.onChange((v) => {
-          start = (v ?? "").trim();
-          t.inputEl.classList.toggle("is-invalid", !isValidYmd(start));
+          estimateH = (v ?? "").trim();
+          t.inputEl.classList.toggle("is-invalid", estimateH && !/^\d+(\.\d)?$/.test(estimateH));
           refresh();
-        });
-        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-          if (ev.key === "Enter" && !ev.shiftKey) {
-            ev.preventDefault();
-            void doSave();
-          }
         });
       });
 
     new Setting(taskFormContainer)
-      .setName("计划日期")
-      .addText((t) => {
-        t.inputEl.type = "date";
-        t.setValue("");
-        t.onChange((v) => {
-          scheduled = (v ?? "").trim();
-          t.inputEl.classList.toggle("is-invalid", !isValidYmd(scheduled));
+      .setName("任务复杂度")
+      .addDropdown((dd) => {
+        dd.addOption("normal", "一般任务");
+        dd.addOption("high", "高脑力 🧠");
+        dd.addOption("light", "轻量任务 🍃");
+        dd.setValue(complexity);
+        dd.onChange((v) => {
+          complexity = (v as "high" | "normal" | "light") || "normal";
           refresh();
-        });
-        t.inputEl.addEventListener("keydown", (ev: KeyboardEvent) => {
-          if (ev.key === "Enter" && !ev.shiftKey) {
-            ev.preventDefault();
-            void doSave();
-          }
         });
       });
 
     const hint = taskFormContainer.createDiv({ cls: "rslatte-project-hint" });
     hint.setText(`将插入到里程碑：${this.milestoneName}`);
+    const importRow = taskFormContainer.createDiv({ cls: "rslatte-inline-insert-row" });
+    importRow.style.display = "flex";
+    importRow.style.justifyContent = "flex-end";
+    importRow.style.marginTop = "6px";
+    new ButtonComponent(importRow)
+      .setButtonText("📥 CSV 批量导入")
+      .onClick(() => {
+        new ImportProjectTasksCsvModal(
+          this.app,
+          this.plugin,
+          this.projectFolderPath,
+          this.milestoneName,
+        ).open();
+      });
 
     // ===== 里程碑表单容器 =====
     milestoneFormContainer = contentEl.createDiv();
@@ -271,6 +332,22 @@ export class AddProjectTaskModal extends Modal {
         });
       });
 
+    new Setting(milestoneFormContainer)
+      .setName("里程碑权重")
+      .setDesc("1～100 整数，默认 1；写入 meta milestone_weight。")
+      .addText((t) => {
+        milestoneWeightInput = t;
+        t.setPlaceholder("1");
+        t.setValue("1");
+        t.inputEl.type = "number";
+        t.inputEl.min = "1";
+        t.inputEl.max = "100";
+        t.onChange((v) => {
+          milestoneWeight = parseInt(String(v ?? "1"), 10) || 1;
+          refresh();
+        });
+      });
+
     const milestoneHint = milestoneFormContainer.createDiv({ cls: "rslatte-project-hint" });
     milestoneHint.innerHTML = `
       <div>将作为 <strong>${"#".repeat(childLevel)}</strong> 级里程碑插入到：<strong>${parentPath}</strong></div>
@@ -288,18 +365,35 @@ export class AddProjectTaskModal extends Modal {
       try {
         if (mode === "task") {
           const dueTrim = (due ?? "").trim();
+          const schedTrim = (scheduled ?? "").trim();
           if (!/^\d{4}-\d{2}-\d{2}$/.test(dueTrim)) {
-            new Notice("到期日期为必填，且格式必须为 YYYY-MM-DD");
+            new Notice("计划结束日为必填，且格式必须为 YYYY-MM-DD");
+            return;
+          }
+          taskDateBounds = resolveProjectTaskDateBounds(
+            this.plugin.projectMgr.getSnapshot().projects,
+            this.projectFolderPath,
+            String(this.milestoneName ?? "").trim(),
+          );
+          const v = validateProjectTaskDates({
+            plannedStart: schedTrim,
+            plannedEnd: dueTrim,
+            bounds: taskDateBounds,
+          });
+          if (!v.ok) {
+            new Notice(v.messages.join("；"));
             return;
           }
 
+          const est = (estimateH ?? "").trim();
           await this.plugin.projectMgr.addTaskToMilestone(
             this.projectFolderPath,
             this.milestoneName,
             (text ?? "").trim(),
             dueTrim,
-            (start ?? "").trim(),
-            (scheduled ?? "").trim()
+            (scheduled ?? "").trim(),
+            est ? Number(est) : undefined,
+            complexity !== "normal" ? complexity : undefined
           );
 
           new Notice("已新增项目任务");
@@ -310,12 +404,18 @@ export class AddProjectTaskModal extends Modal {
             return;
           }
 
+          const wn = parseInt(String(milestoneWeightInput?.inputEl?.value ?? milestoneWeight ?? "1").trim(), 10);
+          if (!Number.isFinite(wn) || wn < 1 || wn > 100) {
+            new Notice("里程碑权重须为 1～100 的整数");
+            return;
+          }
           await this.plugin.projectMgr.addMilestone(
             this.projectFolderPath,
             (newMilestoneName ?? "").trim(),
             {
               level: childLevel,
               parentPath: parentPath || undefined,
+              milestoneWeight: wn,
             }
           );
 

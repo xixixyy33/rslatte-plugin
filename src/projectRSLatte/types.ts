@@ -3,6 +3,8 @@ export type ProjectRSLatteItemStatus = "todo" | "in-progress" | "done" | "cancel
 
 export type ProjectRSLatteMilestone = {
   name: string;
+  /** 多级里程碑全路径，与任务 `milestone` 一致；一级可与 `name` 相同 */
+  path?: string;
   done: number;
   todo: number;
   inprogress: number;
@@ -19,6 +21,8 @@ export type ProjectRSLatteIndexItem = {
   start_date?: string;     // YYYY-MM-DD
   done_date?: string;      // YYYY-MM-DD
   cancelled_date?: string; // YYYY-MM-DD
+  /** 待归档标记日（YYYY-MM-DD），与 frontmatter pending_archive_at 一致 */
+  pending_archive_date?: string;
 
   folder_path: string;
   info_file_path: string;
@@ -26,6 +30,11 @@ export type ProjectRSLatteIndexItem = {
   analysis_file_path?: string;
 
   milestones?: ProjectRSLatteMilestone[];
+
+  /** 快照衍生：risk_*、project_overdue、project_postponed、project_soon_overdue、stale_progress 等 */
+  project_tags?: string[];
+  /** 快照衍生：项目状态中文（如 进行中） */
+  project_status_display_zh?: string;
 
   /** 用于增量判断的 key（mtime 拼接） */
   mtime_key?: string;

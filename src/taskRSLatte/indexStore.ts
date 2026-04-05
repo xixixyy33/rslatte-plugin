@@ -1,5 +1,8 @@
-import { App, TFile, TFolder, normalizePath } from "obsidian";
+import { App, normalizePath } from "obsidian";
+import { ensureFolderChain, readJsonVaultFirst, writeJsonRaceSafe } from "../internal/indexJsonIo";
 import type { RSLatteIndexFile, RSLatteIndexItem, RSLatteItemType, RSLatteScanCacheFile, SyncQueueFile } from "./types";
+
+const INDEX_JSON_IO_CTX = { label: "RSLatteIndexStore" } as const;
 
 export type ArchiveMapFile = {
   version: number;
@@ -18,122 +21,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-async function ensureFolder(app: App, path: string) {
-  const norm = normalizePath(path).replace(/\/+$/g, "");
-  if (!norm) return;
-
-  const parts = norm.split("/").filter(Boolean);
-  let cur = "";
-  for (const p of parts) {
-    cur = cur ? `${cur}/${p}` : p;
-    const af = app.vault.getAbstractFileByPath(cur);
-    // If a file already occupies this path, folder creation will always fail.
-    if (af && af instanceof TFile) {
-      throw new Error(`RSLatteIndexStore: path conflicts with an existing file: ${cur}`);
-    }
-    if (!af) {
-      try {
-        await app.vault.createFolder(cur);
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
-        // Obsidian may throw even if the folder was created concurrently in another call.
-        if (msg.includes("Folder already exists") || msg.includes("EEXIST")) {
-          continue;
-        }
-        throw e;
-      }
-    }
-  }
-}
-
-
-async function ensureFile(app: App, path: string, initialContent: string): Promise<TFile> {
-  const norm = normalizePath(path);
-  const af = app.vault.getAbstractFileByPath(norm);
-
-  if (af instanceof TFile) return af;
-  if (af instanceof TFolder) {
-    throw new Error(`RSLatteIndexStore: file path conflicts with an existing folder: ${norm}`);
-  }
-
-  // Ensure parent folders exist
-  await ensureFolder(app, norm.split("/").slice(0, -1).join("/"));
-
-  try {
-    return await app.vault.create(norm, initialContent);
-  } catch (e: any) {
-    const msg = String(e?.message ?? e);
-    if (msg.includes("File already exists") || msg.includes("EEXIST")) {
-      const af2 = app.vault.getAbstractFileByPath(norm);
-      if (af2 instanceof TFile) return af2;
-    }
-    throw e;
-  }
-}
-
-async function readJsonFile<T>(app: App, path: string, fallback: T): Promise<T> {
-  const norm = normalizePath(path);
-
-  // 1) Try via vault (requires a TFile in the in-memory file map)
-  const af = app.vault.getAbstractFileByPath(norm);
-  if (af instanceof TFile) {
-    try {
-      const raw = await app.vault.read(af);
-      return raw ? (JSON.parse(raw) as T) : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-
-  // 2) During very early onload, Obsidian's file map may not yet contain the file.
-  //    Fall back to adapter read so we don't crash on "File already exists" races.
-  try {
-    // adapter.exists is cheap and avoids throwing on read
-    const exists = await app.vault.adapter.exists(norm);
-    if (!exists) return fallback;
-    const raw = await app.vault.adapter.read(norm);
-    return raw ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJsonFile(app: App, path: string, obj: any): Promise<void> {
-  const norm = normalizePath(path);
-  await ensureFolder(app, norm.split("/").slice(0, -1).join("/"));
-
-  const existing = app.vault.getAbstractFileByPath(norm);
-  const content = JSON.stringify(obj, null, 2);
-
-  if (existing instanceof TFile) {
-    await app.vault.modify(existing, content);
-    return;
-  }
-  if (existing instanceof TFolder) {
-    throw new Error(`RSLatteIndexStore: file path conflicts with an existing folder: ${norm}`);
-  }
-
-  // Create with race-safety
-  try {
-    await app.vault.create(norm, content);
-  } catch (e: any) {
-    const msg = String(e?.message ?? e);
-    if (msg.includes("File already exists") || msg.includes("EEXIST")) {
-      const af2 = app.vault.getAbstractFileByPath(norm);
-      if (af2 instanceof TFile) {
-        await app.vault.modify(af2, content);
-        return;
-      }
-
-      // Obsidian may know the file exists (adapter), but not yet expose it as a TFile.
-      // Write via adapter to make the operation idempotent and avoid init failure.
-      await app.vault.adapter.write(norm, content);
-      return;
-    }
-    throw e;
-  }
-}
-
 export class RSLatteIndexStore {
   private app: App;
   /** index base dir (F2 layout: <centralRoot>/<spaceId>/index) */
@@ -148,7 +35,7 @@ export class RSLatteIndexStore {
   }
 
   public getBaseDir(): string {
-    return normalizePath((this.indexDir ?? "").trim() || "95-Tasks/.rslatte");
+    return normalizePath((this.indexDir ?? "").trim() || "00-System/.rslatte");
   }
 
   public getQueueDir(): string {
@@ -173,15 +60,17 @@ export class RSLatteIndexStore {
 
   public async ensureLayout(): Promise<void> {
     const dir = this.getBaseDir();
-    await ensureFolder(this.app, dir);
-    await ensureFolder(this.app, normalizePath(`${dir}/archive`));
+    await ensureFolderChain(this.app, dir, INDEX_JSON_IO_CTX);
+    await ensureFolderChain(this.app, normalizePath(`${dir}/archive`), INDEX_JSON_IO_CTX);
     const qdir = this.getQueueDir();
-    if (qdir && qdir !== dir) await ensureFolder(this.app, qdir);
+    if (qdir && qdir !== dir) await ensureFolderChain(this.app, qdir, INDEX_JSON_IO_CTX);
   }
 
   private indexPath(type: RSLatteItemType): string {
     const dir = this.getBaseDir();
-    return normalizePath(`${dir}/${type === "task" ? "task-index.json" : "memo-index.json"}`);
+    const name =
+      type === "task" ? "task-index.json" : type === "memo" ? "memo-index.json" : "schedule-index.json";
+    return normalizePath(`${dir}/${name}`);
   }
 
   private queuePath(): string {
@@ -204,7 +93,7 @@ export class RSLatteIndexStore {
     const fallback: RSLatteIndexFile = { version: 1, updatedAt: nowIso(), items: [] };
     try {
       if (await this.app.vault.adapter.exists(p)) {
-        return readJsonFile(this.app, p, fallback);
+        return readJsonVaultFirst(this.app, p, fallback);
       }
     } catch {
       // ignore
@@ -213,10 +102,12 @@ export class RSLatteIndexStore {
     // F2 fallback: legacy (pre-space) central root
     const legacyRoot = this.getLegacyRootDir();
     if (legacyRoot) {
-      const legacyPath = normalizePath(`${legacyRoot}/${type === "task" ? "task-index.json" : "memo-index.json"}`);
+      const legacyName =
+        type === "task" ? "task-index.json" : type === "memo" ? "memo-index.json" : "schedule-index.json";
+      const legacyPath = normalizePath(`${legacyRoot}/${legacyName}`);
       try {
         if (await this.app.vault.adapter.exists(legacyPath)) {
-          return readJsonFile(this.app, legacyPath, fallback);
+          return readJsonVaultFirst(this.app, legacyPath, fallback);
         }
       } catch {
         // ignore
@@ -230,7 +121,7 @@ export class RSLatteIndexStore {
     const p = this.archiveMapPath();
     const fallback: ArchiveMapFile = { version: 1, updatedAt: nowIso(), keys: {} };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -239,7 +130,7 @@ export class RSLatteIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/archive/archive-map.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -250,24 +141,25 @@ export class RSLatteIndexStore {
   public async writeArchiveMap(m: ArchiveMapFile): Promise<void> {
     const p = this.archiveMapPath();
     const out: ArchiveMapFile = { version: 1, updatedAt: nowIso(), keys: m.keys ?? {} };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   public async writeIndex(type: RSLatteItemType, file: RSLatteIndexFile): Promise<void> {
     const p = this.indexPath(type);
     const out: RSLatteIndexFile = {
+      ...file,
       version: 1,
       updatedAt: nowIso(),
       items: file.items ?? [],
     };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   public async readQueue(): Promise<SyncQueueFile> {
     const p = this.queuePath();
     const fallback: SyncQueueFile = { version: 1, updatedAt: nowIso(), ops: [] };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -276,7 +168,7 @@ export class RSLatteIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/sync-queue.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -287,14 +179,14 @@ export class RSLatteIndexStore {
   public async writeQueue(q: SyncQueueFile): Promise<void> {
     const p = this.queuePath();
     const out: SyncQueueFile = { version: 1, updatedAt: nowIso(), ops: q.ops ?? [] };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   public async readScanCache(): Promise<RSLatteScanCacheFile> {
     const p = this.scanCachePath();
     const fallback: RSLatteScanCacheFile = { version: 1, updatedAt: nowIso(), filterKey: "", files: {} };
     try {
-      if (await this.app.vault.adapter.exists(p)) return readJsonFile(this.app, p, fallback);
+      if (await this.app.vault.adapter.exists(p)) return readJsonVaultFirst(this.app, p, fallback);
     } catch {
       // ignore
     }
@@ -303,7 +195,7 @@ export class RSLatteIndexStore {
     if (legacyRoot) {
       const legacyPath = normalizePath(`${legacyRoot}/scan-cache.json`);
       try {
-        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonFile(this.app, legacyPath, fallback);
+        if (await this.app.vault.adapter.exists(legacyPath)) return readJsonVaultFirst(this.app, legacyPath, fallback);
       } catch {
         // ignore
       }
@@ -319,18 +211,23 @@ export class RSLatteIndexStore {
       filterKey: c.filterKey || "",
       files: c.files ?? {},
     };
-    await writeJsonFile(this.app, p, out);
+    await writeJsonRaceSafe(this.app, p, out, INDEX_JSON_IO_CTX);
   }
 
   public archivePath(monthKey: string, type: RSLatteItemType): string {
     const dir = this.getBaseDir();
-    const name = type === "task" ? `task-archive-${monthKey}.json` : `memo-archive-${monthKey}.json`;
+    const name =
+      type === "task"
+        ? `task-archive-${monthKey}.json`
+        : type === "memo"
+          ? `memo-archive-${monthKey}.json`
+          : `schedule-archive-${monthKey}.json`;
     return normalizePath(`${dir}/archive/${name}`);
   }
 
   public async appendToArchive(monthKey: string, type: RSLatteItemType, items: RSLatteIndexItem[]): Promise<void> {
     const p = this.archivePath(monthKey, type);
-    const existed = await readJsonFile<RSLatteIndexFile>(this.app, p, { version: 1, updatedAt: nowIso(), items: [] });
+    const existed = await readJsonVaultFirst<RSLatteIndexFile>(this.app, p, { version: 1, updatedAt: nowIso(), items: [] });
     // Deduplicate defensively. Some flows may attempt to archive the same closed tasks again
     // (e.g. because the original tasks remain in journals and get re-scanned).
     const keyOf = (it: any): string => {
@@ -355,6 +252,6 @@ export class RSLatteIndexStore {
 
     if (!toAdd.length) return;
     const merged = [...(existed.items ?? []), ...toAdd];
-    await writeJsonFile(this.app, p, { version: 1, updatedAt: nowIso(), items: merged });
+    await writeJsonRaceSafe(this.app, p, { version: 1, updatedAt: nowIso(), items: merged }, INDEX_JSON_IO_CTX);
   }
 }

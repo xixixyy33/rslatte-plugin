@@ -6,11 +6,22 @@ import { VIEW_TYPE_CONTACTS, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS } from "../../c
 import { getUiHeaderButtonsVisibility } from "../helpers/uiHeaderButtons";
 import { appendDbSyncIndicator, createHeaderRow } from "../helpers/moduleHeader";
 import type { ContactIndexItem, ContactsIndexFile, ContactsInteractionEntry, ContactsInteractionSourceType } from "../../contactsRSLatte/types";
+import {
+  compactInteractionEventSummaryForDisplay,
+  computeDisplayLastAtFromEntries,
+  computeNewTodayCount,
+  computeOverdueLine,
+  ensureContactsInteractionRollup,
+  formatIsoForDisplay,
+} from "../../services/contacts/contactInteractionDisplay";
+import { contactFrontmatterFieldLabel, formatContactFrontmatterValue } from "../../services/contacts/contactDetailsDisplay";
+import type { TaskPanelSettings } from "../../types/taskTypes";
+import type { RSLatteModuleKey } from "../../services/pipeline/types";
 import { bucketFromSortname, computeSortname } from "../../contactsRSLatte/sortname";
 import { AddContactModal } from "../modals/AddContactModal";
 import { EditContactModal } from "../modals/EditContactModal";
 import { AddContactManualEventModal } from "../modals/AddContactManualEventModal";
-import { replaceContactDynamicGeneratedBlock } from "../../services/contacts/contactNoteWriter";
+import { replaceContactDynamicGeneratedBlock, statusIconForInteractionWithPhase } from "../../services/contacts/contactNoteWriter";
 import { renderTextWithContactRefs } from "../helpers/renderTextWithContactRefs";
 
 type StatusFilter = "all" | "active" | "cancelled";
@@ -46,6 +57,9 @@ export class ContactsSidePanelView extends ItemView {
   private dynLimit: number = 20;
   private dynIncompleteOnly: boolean = false;
   private dynSourceType: ContactsInteractionSourceType | "all" = "all";
+
+  /** 联系人名片：互动记录 / 联系人详细信息 */
+  private contactCardTab: "interactions" | "details" = "interactions";
 
   // Step6: avoid overlapping writes to contact note generated block
   private dynMdWriteInFlight: Set<string> = new Set();
@@ -83,9 +97,16 @@ export class ContactsSidePanelView extends ItemView {
     // nothing
   }
 
+  /** 外部调用：打开联系人侧栏后，聚焦并选中指定联系人名片。 */
+  public async focusContactByUid(uid: string): Promise<void> {
+    const target = String(uid ?? "").trim();
+    if (!target) return;
+    this.selectedUid = target;
+    await this.refresh();
+  }
+
   private isModuleEnabled(): boolean {
-    const me2: any = (this.plugin.settings as any)?.moduleEnabledV2 ?? {};
-    return !!me2.contacts;
+    return this.plugin.isContactsModuleEnabledV2?.() === true;
   }
 
   private getContactsDir(): string {
@@ -203,6 +224,16 @@ export class ContactsSidePanelView extends ItemView {
       new Notice("无法打开：联系人文件不存在");
       return;
     }
+    const mdLeaves = this.app.workspace.getLeavesOfType("markdown");
+    const existing = mdLeaves.find((leaf) => {
+      const v: any = leaf.view as any;
+      return String(v?.file?.path ?? "") === af.path;
+    });
+    if (existing) {
+      await existing.openFile(af);
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      return;
+    }
     await this.app.workspace.getLeaf("tab").openFile(af);
   }
 
@@ -232,17 +263,26 @@ export class ContactsSidePanelView extends ItemView {
   // Step5: Dynamic interactions (read-only)
   // --------------------------------
 
+  /** 与任务管理侧栏一致的图标：按 status + task_phase 返回 ▶/↻/⏸/✅/⛔ 等 */
   private statusIconForInteraction(e: ContactsInteractionEntry): string {
-    const st = String(e.status ?? "").trim();
-    if (!st) return "•";
-    switch (st) {
-      case "done": return "✅";
-      case "cancelled": return "⛔";
-      case "in_progress": return "▶️";
-      case "blocked": return "🛑";
-      case "todo": return "⬜";
-      default: return "❔";
+    if (String(e.source_type ?? "").trim() === "manual_note") return "✅";
+    return statusIconForInteractionWithPhase(String(e.status ?? "").trim(), (e as any).task_phase);
+  }
+
+  /** 与任务管理侧栏一致的状态文案，用于 dot 的 title */
+  private statusDisplayNameForInteraction(e: ContactsInteractionEntry): string {
+    if (String(e.source_type ?? "").trim() === "manual_note") return "手动互动";
+    const st = String((e as any).status ?? "").trim().toLowerCase();
+    const phase = String((e as any).task_phase ?? "").trim();
+    if (st === "done") return "已完成";
+    if (st === "cancelled") return "已取消";
+    if (st === "todo") return "未开始";
+    if (st === "in_progress") {
+      if (phase === "waiting_others") return "跟进中";
+      if (phase === "waiting_until") return "等待中";
+      return "处理中";
     }
+    return String(e.status ?? "").trim() || "—";
   }
 
   private truncateText(s: string, maxLen: number): string {
@@ -272,10 +312,12 @@ export class ContactsSidePanelView extends ItemView {
     if (!p) return;
     
     const sourceType = String(e.source_type ?? "").trim();
+    /** 主索引里 line_no 为「笔记内 1-based 行号」；任务索引与侧栏 DOM 为 0-based */
     const ln1 = Number(e.line_no ?? 0);
+    const line0 = ln1 > 0 ? ln1 - 1 : 0;
     
     // 如果是任务类型，跳转到任务侧边栏并定位到对应任务
-    if (sourceType === "task" && ln1 >= 0) {
+    if (sourceType === "task" && ln1 > 0) {
       try {
         // 激活任务侧边栏
         await this.plugin.activateTaskView();
@@ -287,7 +329,7 @@ export class ContactsSidePanelView extends ItemView {
           if (taskView && typeof taskView.scrollToTask === "function") {
             // 等待一小段时间确保视图已渲染
             await new Promise(resolve => setTimeout(resolve, 100));
-            await taskView.scrollToTask(p, ln1);
+            await taskView.scrollToTask(p, line0);
             return;
           }
         }
@@ -327,10 +369,10 @@ export class ContactsSidePanelView extends ItemView {
                 normalizePath(String(p.folderPath ?? "")) === normalizedProjectPath
               );
               
-              if (project && project.taskItems && ln1 >= 0) {
-                // 查找对应行号的任务
+              if (project && project.taskItems && ln1 > 0) {
+                // 项目任务索引 lineNo 为 0-based，与 contacts 条目 line_no（1-based）对齐
                 const task = project.taskItems.find((t: any) => 
-                  Number(t.lineNo ?? -1) === ln1 && 
+                  Number(t.lineNo ?? -1) === line0 && 
                   normalizePath(String(t.sourceFilePath ?? project.tasklistFilePath ?? "")) === normalizedPath
                 );
                 
@@ -368,7 +410,7 @@ export class ContactsSidePanelView extends ItemView {
               // 等待一小段时间确保视图已渲染
               await new Promise(resolve => setTimeout(resolve, 100));
               // 传递任务文件路径和行号，以便定位到具体的任务项
-              await projectView.scrollToProject(projectFolderPath, milestonePath, normalizedPath, ln1);
+              await projectView.scrollToProject(projectFolderPath, milestonePath, normalizedPath, line0);
               return;
             }
           }
@@ -411,10 +453,52 @@ export class ContactsSidePanelView extends ItemView {
         limit: this.dynLimit,
         incompleteOnly: this.dynIncompleteOnly,
         sourceType: this.dynSourceType,
+        sortMode: "latest_interaction",
       });
     } catch {
       return [];
     }
+  }
+
+  /** 名片区：NEW / 最后互动 / 超期（第六章） */
+  private async buildInteractionStats(it: ContactIndexItem): Promise<{
+    newToday: number;
+    lastDisplay: string;
+    overdue: ReturnType<typeof computeOverdueLine>;
+  }> {
+    const sAny: any = this.plugin.settings as any;
+    const cm: any = sAny.contactsModule ?? {};
+    const tp = sAny.taskPanel as TaskPanelSettings;
+    const { todayKey, changed: rollChanged } = ensureContactsInteractionRollup(cm, tp);
+    let dirty = rollChanged;
+    if (!cm.contactsInteractionFirstEnabledAt) {
+      cm.contactsInteractionFirstEnabledAt = new Date().toISOString();
+      dirty = true;
+    }
+    if (dirty) {
+      sAny.contactsModule = cm;
+      await this.plugin.saveSettings();
+    }
+    const uid = String(it.contact_uid ?? "").trim();
+    const st = this.plugin.contactsIndex.getInteractionsStore();
+    const idx = await st.readIndex();
+    const entries = (idx.by_contact_uid[uid] ?? []).slice();
+    const manualExtra = Number(cm.contactsInteractionManualNewTodayByUid?.[uid] ?? 0) || 0;
+    const newToday = computeNewTodayCount(
+      entries,
+      manualExtra,
+      todayKey,
+      tp,
+      cm.contactsInteractionFirstEnabledAt
+    );
+    const dispIso = computeDisplayLastAtFromEntries(entries) ?? it.last_interaction_at ?? null;
+    const overdueDays = Math.max(1, Math.min(3650, Number(cm.contactFollowupOverdueDays ?? 30) || 30));
+    const overdue = computeOverdueLine(dispIso, it.last_interaction_at, overdueDays, todayKey, tp);
+    return {
+      newToday,
+      lastDisplay: formatIsoForDisplay(String(dispIso ?? ""), tp),
+      overdue,
+    };
   }
 
   private openManualEventModal(it: ContactIndexItem): void {
@@ -425,8 +509,7 @@ export class ContactsSidePanelView extends ItemView {
     }
     new AddContactManualEventModal(this.app, this.plugin, it, filePath, {
       onSaved: () => {
-        // No need to rebuild contacts index (frontmatter unchanged).
-        // Keep UI responsive; user can open note to verify.
+        void this.refresh();
       },
     }).open();
   }
@@ -455,6 +538,8 @@ export class ContactsSidePanelView extends ItemView {
         source_path: String(e.source_path ?? ""),
         line_no: typeof e.line_no === "number" ? e.line_no : Number(e.line_no ?? 0) || undefined,
         heading: String(e.heading ?? "").trim() || undefined,
+        follow_status: (e as any).follow_status === "following" || (e as any).follow_status === "ended" ? (e as any).follow_status : undefined,
+        interaction_events: Array.isArray((e as any).interaction_events) ? (e as any).interaction_events : undefined,
       }));
 
       const sAny: any = this.plugin.settings as any;
@@ -462,7 +547,8 @@ export class ContactsSidePanelView extends ItemView {
       const sectionHeader = String(cm.eventSectionHeader ?? cm.manualEventSectionHeader ?? "## 互动记录").trim() || "## 互动记录";
       const subHeader = String(cm.dynamicEventSubHeader ?? "### 动态互动").trim();
 
-      await replaceContactDynamicGeneratedBlock(this.app, f, items, { limit: 20, sectionHeader, subHeader });
+      const tp = sAny.taskPanel as TaskPanelSettings;
+      await replaceContactDynamicGeneratedBlock(this.app, f, items, { limit: 20, sectionHeader, subHeader, taskPanel: tp });
     } catch (e: any) {
       console.warn("[RSLatte][contacts] refresh dynamic block failed", e);
     } finally {
@@ -524,7 +610,7 @@ export class ContactsSidePanelView extends ItemView {
     
     if (btnVis.rebuild) {
       const rebuildBtn = actions.createEl("button", { text: "🧱", cls: "rslatte-icon-btn" });
-      rebuildBtn.title = "重建联系人索引（全量扫描）";
+      rebuildBtn.title = "重建联系人主索引（仅扫描联系人目录，不含归档目录；归档后由「笔记归档」刷新归档索引）";
       rebuildBtn.onclick = async () => {
         new Notice("开始重建：联系人…");
         try {
@@ -550,7 +636,7 @@ export class ContactsSidePanelView extends ItemView {
 
     if (btnVis.archive) {
       const archiveBtn = actions.createEl("button", { text: "🗄", cls: "rslatte-icon-btn" });
-      archiveBtn.title = "立即归档（仅 cancelled 且超阈值）";
+      archiveBtn.title = "笔记归档：已取消且超阈值的联系人 md 移入归档目录，并刷新主索引与 contacts-archive-index（不扫归档树做日常重建）";
       archiveBtn.onclick = async () => {
         try {
           const r: any = await this.plugin.pipelineEngine.runE2(this.plugin.getSpaceCtx(), "contacts", "manual_archive");
@@ -575,7 +661,8 @@ export class ContactsSidePanelView extends ItemView {
 
     if (btnVis.refresh) {
       const refreshBtn = actions.createEl("button", { text: "🔄", cls: "rslatte-icon-btn" });
-      refreshBtn.title = "刷新联系人列表（重新读取索引）";
+      refreshBtn.title =
+        "刷新联系人列表与动态互动（联系人及任务/提醒/日程/项目均为 manual_refresh）";
       refreshBtn.onclick = async () => {
         new Notice("开始刷新：联系人…");
         try {
@@ -586,6 +673,24 @@ export class ContactsSidePanelView extends ItemView {
             }
           } else {
             new Notice(`联系人刷新失败：${String((r as any)?.error?.message ?? (r as any)?.error?.code ?? "unknown").slice(0, 120)}`);
+          }
+          // 依次 manual_refresh 任务/提醒/日程/项目（与各自侧栏 🔄 一致）
+          const runMod = async (key: RSLatteModuleKey) => {
+            try {
+              await this.plugin.pipelineEngine.runE2(this.plugin.getSpaceCtx(), key, "manual_refresh");
+            } catch (e) {
+              console.warn(`[Contacts][refresh] ${key} manual_refresh failed:`, e);
+            }
+          };
+          await runMod("task");
+          await runMod("memo");
+          await runMod("schedule");
+          await runMod("project");
+          // 按当前主索引重写所有联系人 md 内「动态互动」块（与侧栏同源，避免仅索引更新而正文滞后）
+          try {
+            await (this.plugin as any).refreshAllContactNoteDynamicBlocks?.();
+          } catch (e) {
+            console.warn("[Contacts][refresh] refreshAllContactNoteDynamicBlocks failed:", e);
           }
         } catch (e: any) {
           console.warn("[Contacts][manual_refresh] failed:", e);
@@ -599,6 +704,14 @@ export class ContactsSidePanelView extends ItemView {
     const meta = sec2.createDiv({ cls: "rslatte-muted" });
     const countText = `共 ${index.items.length} 条`;
     meta.setText(countText);
+    // V2 关系中枢：与项目、行动联动入口
+    const relRow = sec2.createDiv({ cls: "rslatte-contacts-rel-links" });
+    relRow.createSpan({ cls: "rslatte-muted", text: "联动 " });
+    const projLink = relRow.createEl("span", { cls: "rslatte-link", text: "项目" });
+    projLink.onclick = () => void this.plugin.activateProjectView?.();
+    relRow.createSpan({ text: " · " });
+    const actionsLink = relRow.createEl("span", { cls: "rslatte-link", text: "任务管理" });
+    actionsLink.onclick = () => void this.plugin.activateTaskView?.();
 
     // Controls
     const ctrl = sec2.createDiv({ cls: "rslatte-contacts-controls" });
@@ -728,6 +841,7 @@ export class ContactsSidePanelView extends ItemView {
       for (let i = 0; i < arr.length; i++) {
         const it = arr[i];
         const row = dayItems.createDiv({ cls: "rslatte-timeline-item rslatte-contacts-timeline-item" });
+        row.setAttr("data-contact-uid", String(it.contact_uid ?? ""));
         if (this.selectedUid && this.selectedUid === it.contact_uid) {
           row.addClass("is-selected");
         }
@@ -748,7 +862,7 @@ export class ContactsSidePanelView extends ItemView {
         const grp = (it.group_name ?? "").trim();
         const s = String(it.status ?? "active").trim() || "active";
         const parts: string[] = [];
-        if (title) parts.push(title);
+        parts.push(title || "-");
         if (grp) parts.push(grp);
         if (s === "cancelled") parts.push("cancelled");
         meta.setText(parts.join(" · "));
@@ -761,7 +875,13 @@ export class ContactsSidePanelView extends ItemView {
     }
   }
 
-  private renderCard(container: HTMLElement, items: ContactIndexItem[], dynEntries?: ContactsInteractionEntry[]) {
+  private renderCard(
+    container: HTMLElement,
+    items: ContactIndexItem[],
+    dynEntries?: ContactsInteractionEntry[],
+    fmExtra?: Record<string, unknown> | null,
+    stats?: { newToday: number; lastDisplay: string; overdue: ReturnType<typeof computeOverdueLine> } | null
+  ): void {
     if (!this.selectedUid) return;
     const it = items.find((x) => x.contact_uid === this.selectedUid);
     if (!it) {
@@ -773,6 +893,10 @@ export class ContactsSidePanelView extends ItemView {
     //sec.createEl("h3", { text: "名片" });
 
     const card = sec.createDiv({ cls: "rslatte-contact-card" });
+    const sAny: any = this.plugin.settings as any;
+    const cm: any = sAny?.contactsModule ?? {};
+    const tp = sAny.taskPanel as TaskPanelSettings;
+    const previewN = Math.max(0, Math.min(20, Number(cm.interactionTimelinePreviewCount ?? 3) || 3));
 
     // Make the whole header area clickable to open the underlying contact file
     const top = card.createDiv({ cls: "rslatte-contact-card-top rslatte-contact-card-top-link" });
@@ -797,16 +921,20 @@ export class ContactsSidePanelView extends ItemView {
     }
 
     const head = top.createDiv({ cls: "rslatte-contact-head" });
-    const nameEl = head.createDiv({ cls: "rslatte-contact-name rslatte-contact-name-link", text: it.display_name });
+    head.createDiv({ cls: "rslatte-contact-name rslatte-contact-name-link", text: it.display_name });
     const meta = head.createDiv({ cls: "rslatte-contact-meta" });
     const metaParts: string[] = [];
-    if (isTruthyStr(it.title)) metaParts.push(it.title.trim());
+    metaParts.push(String(it.title ?? "").trim() || "-");
     if (isTruthyStr(it.group_name)) metaParts.push(it.group_name.trim());
     const s = String(it.status ?? "active").trim() || "active";
     if (s === "cancelled") metaParts.push("cancelled");
     meta.setText(metaParts.join(" · "));
 
     const body = card.createDiv({ cls: "rslatte-contact-body" });
+
+    const titleRow = body.createDiv({ cls: "rslatte-contact-field" });
+    titleRow.createDiv({ cls: "rslatte-contact-field-k", text: "title" });
+    titleRow.createDiv({ cls: "rslatte-contact-field-v", text: String(it.title ?? "").trim() || "-" });
 
     // aliases
     if ((it.aliases ?? []).length > 0) {
@@ -832,6 +960,19 @@ export class ContactsSidePanelView extends ItemView {
     sv.createSpan({ cls: "rslatte-contact-chip", text: s });
     if (s === "cancelled" && isTruthyStr(it.cancelled_at)) {
       sv.createSpan({ cls: "rslatte-muted", text: `  (${it.cancelled_at})` });
+    }
+
+    if (stats) {
+      const nToday = Math.max(0, stats.newToday);
+      const rowNew = body.createDiv({ cls: "rslatte-contact-field" });
+      rowNew.createDiv({ cls: "rslatte-contact-field-k", text: "今日新增互动记录" });
+      rowNew.createDiv({ cls: "rslatte-contact-field-v", text: String(nToday) });
+      const rowLast = body.createDiv({ cls: "rslatte-contact-field" });
+      rowLast.createDiv({ cls: "rslatte-contact-field-k", text: "最后互动" });
+      rowLast.createDiv({ cls: "rslatte-contact-field-v", text: stats.lastDisplay || "—" });
+      const rowOd = body.createDiv({ cls: "rslatte-contact-field" });
+      rowOd.createDiv({ cls: "rslatte-contact-field-k", text: "超期" });
+      rowOd.createDiv({ cls: "rslatte-contact-field-v", text: stats.overdue.text });
     }
 
     const actions = card.createDiv({ cls: "rslatte-contact-actions" });
@@ -869,11 +1010,69 @@ export class ContactsSidePanelView extends ItemView {
       });
     }
 
-    // Step5: dynamic interactions (read-only, rendered from index)
+    // Step5 / 第六章：互动记录页签 + 联系人详细信息
     const dynWrap = card.createDiv({ cls: "rslatte-contact-dynamic" });
-    const dynTitleRow = dynWrap.createDiv({ cls: "rslatte-contact-dynamic-title" });
-    dynTitleRow.createDiv({ text: "动态互动", cls: "rslatte-contact-dynamic-title-text" });
+    const tabRow = dynWrap.createDiv({ cls: "rslatte-contact-card-tabs" });
+    const tIntr = tabRow.createEl("button", { cls: "rslatte-contact-card-tab", type: "button", text: "互动记录" });
+    const tDet = tabRow.createEl("button", { cls: "rslatte-contact-card-tab", type: "button", text: "联系人详细信息" });
+    if (this.contactCardTab === "interactions") tIntr.addClass("is-active");
+    else tDet.addClass("is-active");
+    tIntr.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      this.contactCardTab = "interactions";
+      void this.refresh();
+    });
+    tDet.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      this.contactCardTab = "details";
+      void this.refresh();
+    });
 
+    if (this.contactCardTab === "details") {
+      const det = dynWrap.createDiv({ cls: "rslatte-contact-details-tab" });
+      const fm = fmExtra ?? {};
+      const blacklist = new Set(
+        (Array.isArray(cm.contactDetailsFieldBlacklist) ? cm.contactDetailsFieldBlacklist : [])
+          .map((x: any) => String(x ?? "").trim())
+          .filter(Boolean)
+      );
+      const cardShown = new Set([
+        "display_name",
+        "contact_uid",
+        "aliases",
+        "tags",
+        "title",
+        "group_name",
+        "status",
+        "cancelled_at",
+        "avatar_path",
+        "sortname",
+        "created_at",
+        "updated_at",
+        "last_interaction_at",
+        "extra",
+        "archived",
+        "archived_at",
+        "archive_path",
+        "mtime_key",
+      ]);
+      const keys = Object.keys(fm).filter((k) => !blacklist.has(k) && !cardShown.has(k));
+      keys.sort((a, b) => a.localeCompare(b));
+      if (keys.length === 0) {
+        det.createDiv({ cls: "rslatte-muted", text: "暂无额外 frontmatter（或已被黑名单屏蔽）" });
+      } else {
+        for (const k of keys) {
+          const row = det.createDiv({ cls: "rslatte-contact-field rslatte-contact-details-field" });
+          row.createDiv({ cls: "rslatte-contact-field-k", text: contactFrontmatterFieldLabel(k) });
+          const v = (fm as any)[k];
+          const text = formatContactFrontmatterValue(k, v);
+          const maxLen = 4000;
+          const shown = text.length > maxLen ? text.slice(0, maxLen) + "…" : text;
+          const vEl = row.createDiv({ cls: "rslatte-contact-field-v rslatte-contact-details-value" });
+          vEl.setText(shown);
+        }
+      }
+    } else {
     const ctrlRow = dynWrap.createDiv({ cls: "rslatte-contact-dynamic-controls" });
 
     // source type
@@ -881,7 +1080,10 @@ export class ContactsSidePanelView extends ItemView {
     const typeOptions: Array<{ v: ContactsInteractionSourceType | "all"; label: string }> = [
       { v: "all", label: "全部" },
       { v: "task", label: "任务" },
+      { v: "memo", label: "提醒" },
+      { v: "schedule" as any, label: "日程" },
       { v: "project_task", label: "项目任务" },
+      { v: "manual_note", label: "手动" },
     ];
     for (const o of typeOptions) {
       const opt = typeSel.createEl("option", { value: o.v, text: o.label });
@@ -916,7 +1118,7 @@ export class ContactsSidePanelView extends ItemView {
     const list = dynWrap.createDiv({ cls: "rslatte-contact-dynamic-list" });
     const entries = dynEntries ?? [];
     if (entries.length === 0) {
-      list.createDiv({ cls: "rslatte-muted", text: "暂无动态互动（来自任务/项目任务的联系人引用）" });
+      list.createDiv({ cls: "rslatte-muted", text: "暂无互动记录（任务/提醒/项目任务引用或手动记互动）" });
     } else {
       for (const e of entries) {
         // Render with the same timeline look as task/project task lists.
@@ -926,17 +1128,46 @@ export class ContactsSidePanelView extends ItemView {
         const gutter = row.createDiv({ cls: "rslatte-timeline-gutter" });
         const dot = gutter.createDiv({ cls: "rslatte-timeline-dot" });
         dot.setText(this.statusIconForInteraction(e));
-        dot.title = String(e.status ?? "");
+        dot.title = this.statusDisplayNameForInteraction(e);
         gutter.createDiv({ cls: "rslatte-timeline-line" });
 
         const content = row.createDiv({ cls: "rslatte-timeline-content" });
         const titleRow = content.createDiv({ cls: "rslatte-timeline-title-row rslatte-task-row" });
+
+        const followStatus = (e as any).follow_status as "following" | "ended" | undefined;
+        if (followStatus && (e.source_type === "task" || e.source_type === "project_task")) {
+          const badge = titleRow.createSpan({ cls: `rslatte-follow-badge rslatte-follow-badge-${followStatus}` });
+          badge.setText(followStatus === "following" ? "关注中" : "已结束");
+          badge.title = followStatus === "following" ? "联系人需关注此任务/项目任务（跟进中或等待中）" : "任务已结束或非跟进/等待状态";
+        }
 
         const snFull = this.normalizeInteractionSnippetForDisplay(String(e.snippet ?? ""));
         const sn = this.truncateText(snFull, 160);
         const snEl = titleRow.createDiv({ cls: "rslatte-timeline-text rslatte-task-title" });
         renderTextWithContactRefs(this.app, snEl, sn, { highlightUid: this.selectedUid });
         snEl.title = snFull;
+
+        const evs = [...(e.interaction_events ?? [])].sort(
+          (a, b) =>
+            Date.parse(String((b as { occurred_at?: string }).occurred_at ?? "")) -
+            Date.parse(String((a as { occurred_at?: string }).occurred_at ?? ""))
+        );
+        const evPreview = evs.slice(0, previewN);
+        if (evPreview.length > 0) {
+          const prevRow = content.createDiv({ cls: "rslatte-contact-interaction-preview" });
+          for (const ev of evPreview) {
+            const line = prevRow.createDiv({ cls: "rslatte-contact-interaction-preview-line rslatte-muted" });
+            const t = formatIsoForDisplay(String((ev as { occurred_at?: string }).occurred_at ?? ""), tp);
+            const sum = compactInteractionEventSummaryForDisplay(
+              String((ev as { summary?: string }).summary ?? "").trim(),
+              snFull
+            );
+            const full = sum ? `${t} · ${sum}` : t;
+            const shown = this.truncateText(full, 220);
+            line.setText(shown);
+            line.title = full;
+          }
+        }
 
         const actions = titleRow.createDiv({ cls: "rslatte-task-actions rslatte-task-actions-compact" });
         const srcBtn = actions.createEl("button", { cls: "rslatte-icon-only-btn", text: "↗" });
@@ -948,7 +1179,15 @@ export class ContactsSidePanelView extends ItemView {
 
         const meta = content.createDiv({ cls: "rslatte-timeline-meta rslatte-task-meta" });
         const metaParts: string[] = [];
-        metaParts.push(String(e.source_type ?? ""));
+        const sourceLabelMap: Record<string, string> = {
+          task: "任务",
+          memo: "提醒",
+          schedule: "日程",
+          project_task: "项目任务",
+          manual_note: "手动",
+        };
+        const sourceType = String(e.source_type ?? "");
+        metaParts.push(sourceLabelMap[sourceType] ?? sourceType);
         if (isTruthyStr(e.heading)) metaParts.push(e.heading.trim());
         meta.setText(metaParts.join(" · "));
 
@@ -963,6 +1202,7 @@ export class ContactsSidePanelView extends ItemView {
           if ((ev as KeyboardEvent).key === "Enter") open();
         });
       }
+    }
     }
 
     // Step6: mirror a compact dynamic summary into the contact note (controlled generated block).
@@ -979,13 +1219,34 @@ export class ContactsSidePanelView extends ItemView {
     }
 
     const nowIso = new Date().toISOString();
+    let birthMemoUidList: string[] = [];
 
     try {
       await this.app.fileManager.processFrontMatter(af, (fm) => {
         (fm as any).status = cancelled ? "cancelled" : "active";
         (fm as any).cancelled_at = cancelled ? nowIso : null;
         (fm as any).updated_at = nowIso;
+        const extra = ((fm as any)?.extra && typeof (fm as any).extra === "object") ? (fm as any).extra : {};
+        const rawList = (extra as any).birth_memo_uids;
+        const list = Array.isArray(rawList)
+          ? rawList.map((x: any) => String(x ?? "").trim()).filter(Boolean)
+          : String(rawList ?? "").split(/[|,;\s]+/g).map((x) => x.trim()).filter(Boolean);
+        const single = String((extra as any).birth_memo_uid ?? "").trim();
+        if (single) list.push(single);
+        birthMemoUidList = [...new Set(list)];
       });
+
+      // 联系人快捷取消：仅对白名单中的生日提醒做失效（且仅处理 - [/]）
+      if (cancelled && birthMemoUidList.length > 0) {
+        try {
+          const changed = await this.plugin.taskRSLatte.invalidateMemosByUids(birthMemoUidList);
+          if (changed > 0) {
+            await this.plugin.taskRSLatte.refreshIndexAndSync({ sync: false, noticeOnError: false, modules: { memo: true } as any });
+          }
+        } catch (e) {
+          console.warn("[Contacts][setCancelled] invalidate birth memos failed", e);
+        }
+      }
 
       // Step C8: DB sync (best-effort)
       try {
@@ -1069,7 +1330,19 @@ export class ContactsSidePanelView extends ItemView {
 
       const dyn = await this.readDynamicInteractionsForSelected();
       if (seq !== this.refreshSeq) return;
-      this.renderCard(container, filtered, dyn);
+      let fmForCard: Record<string, unknown> | null = null;
+      let statsForCard: Awaited<ReturnType<ContactsSidePanelView["buildInteractionStats"]>> | null = null;
+      const selIt = this.selectedUid ? filtered.find((x) => x.contact_uid === this.selectedUid) : undefined;
+      if (selIt) {
+        const af = this.app.vault.getAbstractFileByPath(selIt.file_path);
+        if (af instanceof TFile) {
+          const c = this.app.metadataCache.getFileCache(af);
+          fmForCard = (c?.frontmatter as Record<string, unknown>) ?? null;
+        }
+        statsForCard = await this.buildInteractionStats(selIt);
+      }
+      if (seq !== this.refreshSeq) return;
+      this.renderCard(container, filtered, dyn, fmForCard, statsForCard);
       this.renderList(container, filtered);
     } finally {
       this.refreshRunning = false;

@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "exported_at": "2026-03-25T07:11:40.593Z",
+  "items": [
+    {
+      "id": "CW_0WZ8E8",
+      "name": "爱好支出",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "拼图",
+        "电视剧",
+        "电子游戏",
+        "技术研究"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_4QTHCN",
+      "name": "食物",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "外卖",
+        "食材",
+        "外出就餐",
+        "零食"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_6IEN1J",
+      "name": "家用电器",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "日用电器",
+        "厨用电器",
+        "身体管理类电器"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_O9OBRS",
+      "name": "儿童支出",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "玩具",
+        "日常消耗",
+        "教育支出"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_SAL",
+      "name": "工资",
+      "type": "income",
+      "active": true,
+      "subCategories": [
+        "固定工资",
+        "绩效奖励",
+        "副业收入"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_TRAN",
+      "name": "交通",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "打车",
+        "地铁"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_UZGMNY",
+      "name": "日用品",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "清洁用品",
+        "消耗品",
+        "衣服"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_WW71EH",
+      "name": "电子会员",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "AI",
+        "服务器类",
+        "影视类",
+        "卡类年费"
+      ],
+      "institutionNames": []
+    },
+    {
+      "id": "CW_X8Z8OS",
+      "name": "咖啡",
+      "type": "expense",
+      "active": true,
+      "subCategories": [
+        "奶茶",
+        "牛奶",
+        "咖啡",
+        "甜品"
+      ],
+      "institutionNames": []
+    }
+  ]
+}

@@ -13,25 +13,27 @@ const momentFn = moment as any;
 
 import { RSLatteApiClient, apiTry, ApiCheckinRecord, ApiFinanceRecord, ApiFinanceSummaryStats, ContactsUpsertItem, ContactsUpsertBatchReq } from "./api";
 
-import { VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_PUBLISH, VIEW_TYPE_FINANCE, VIEW_TYPE_CHECKIN, VIEW_TYPE_HUB, VIEW_TYPE_DASHBOARD, VIEW_TYPE_TIMELINE, VIEW_TYPE_MONTHLY_STATS, VIEW_TYPE_CALENDAR, VIEW_TYPE_MOBILE_OPS } from "./constants/viewTypes";
-import { DEFAULT_SETTINGS } from "./constants/defaults";
+import { VIEW_TYPE_RSLATTE, VIEW_TYPE_TASKS, VIEW_TYPE_SCHEDULE, VIEW_TYPE_PROJECTS, VIEW_TYPE_OUTPUTS, VIEW_TYPE_FINANCE, VIEW_TYPE_HEALTH, VIEW_TYPE_CHECKIN, VIEW_TYPE_HUB, VIEW_TYPE_TIMELINE, VIEW_TYPE_CALENDAR, VIEW_TYPE_CAPTURE, VIEW_TYPE_TODAY, VIEW_TYPE_KNOWLEDGE, VIEW_TYPE_KNOWLEDGE_PANEL, VIEW_TYPE_REVIEW } from "./constants/viewTypes";
+import { clampModuleArchiveThresholdsInSettings, DEFAULT_SETTINGS, normalizeArchiveThresholdDays } from "./constants/defaults";
 import { UI_STATS_WHITELIST } from "./ui/uiStatsWhitelist";
 
 import type { RSLattePluginSettings } from "./types/settings";
+import type { TaskPanelSettings } from "./types/taskTypes";
 import type { CheckinItemDef } from "./types/rslatteTypes";
+import { normalizeOutputTemplateDef } from "./types/outputTypes";
+import { DEFAULT_KNOWLEDGE_SECONDARY_SUBDIRS, withoutRemovedLegacyKnowledgeSubdirs } from "./types/knowledgeTypes";
 
 import { SettingsService } from "./services/settingsService";
 import { AuditService } from "./services/auditService";
 import { WorkEventService } from "./services/workEventService";
-import { DashboardService } from "./services/dashboardService";
 import { WorkEventReader } from "./services/stats/WorkEventReader";
-import { MonthlyStatsGenerator } from "./services/stats/MonthlyStatsGenerator";
 import { VaultService } from "./services/vaultService";
 import { JournalService } from "./services/journalService";
 import { FinanceSummaryService } from "./services/financeSummary";
 import { NoteNavigator } from "./services/noteNavigator";
 import { migrateJumpHeadingsToPanelsIfNeeded } from "./services/legacyMigrations";
-import { migrateSpacesIfNeeded } from "./services/spaceMigrations";
+import { migrateSpacesIfNeeded } from "./services/space/spaceMigrations";
+import { arePluginModulesUnlocked } from "./services/envCheck/pluginEnvCheck";
 // 这些导入可能通过 mixin 或其他动态方式使用，保留以备将来使用
 // @ts-ignore - Reserved for future use
 import {
@@ -44,13 +46,13 @@ import {
   resolveSpaceIndexDir,
   resolveSpaceQueueDir,
   resolveSpaceStatsDir,
-} from "./services/spaceContext";
-import { SpacesIndexService } from "./services/spacesIndexService";
+} from "./services/space/spaceContext";
+import { SpacesIndexService } from "./services/space/spacesIndexService";
 import { DEFAULT_SPACE_ID, RSLATTE_EVENT_DB_SYNC_STATUS_CHANGED, RSLATTE_EVENT_SPACE_CHANGED } from "./constants/space";
 import { TaskRSLatteService } from "./taskRSLatte/service";
 import { ProjectManagerService } from "./projectManager/service";
+import { registerKnowledgeOutputUpdatedLedgerHook } from "./outputRSLatte/knowledgeOutputUpdatedLedgerHook";
 import { OutputRSLatteService } from "./outputRSLatte/service";
-import { PublishRSLatteService } from "./publishRSLatte/service";
 import { RecordRSLatteService } from "./recordRSLatte/service";
 
 import { PipelineEngine } from "./services/pipeline/pipelineEngine";
@@ -60,35 +62,55 @@ import type { ModuleRegistry } from "./services/pipeline/moduleRegistry";
 // @ts-ignore - Reserved for future use
 import type { ModuleSpec, ModuleSpecAny, ModuleSpecAtomic, RSLatteModuleOpContext, RSLatteAtomicOpContext, RSLatteModuleOpSummary, RSLatteModuleStats, RSLatteReconcileGate } from "./services/pipeline/moduleSpec";
 import type { RSLatteModuleKey } from "./services/pipeline/types";
-
+import { buildPipelineModuleIsEnabled } from "./plugin/pipelineModuleEnabled";
+import { runContactsPostPhysicalArchiveSteps, runContactsPreArchiveEnsureMainIndex } from "./services/pipeline/helpers/archiveOrchestration";
 
 import { debounce } from "./utils/debounce";
+import { yieldIfArchiveBatchBoundary } from "./utils/archiveBatchYield";
+import { toLocalOffsetIsoString } from "./utils/localCalendarYmd";
 
 import { RSLatteSidePanelView } from "./ui/views/RSLatteSidePanelView";
 import { TaskSidePanelView } from "./ui/views/TaskSidePanelView";
 import { ProjectSidePanelView } from "./ui/views/ProjectSidePanelView";
 import { OutputSidePanelView } from "./ui/views/OutputSidePanelView";
-import { PublishSidePanelView } from "./ui/views/PublishSidePanelView";
 import { FinanceSidePanelView } from "./ui/views/FinanceSidePanelView";
+import { HealthSidePanelView } from "./ui/views/HealthSidePanelView";
 import { CheckinSidePanelView } from "./ui/views/CheckinSidePanelView";
 import { SpaceHubView } from "./ui/views/SpaceHubView";
-import { DashboardView } from "./ui/views/DashboardView";
 import { TimelineView } from "./ui/views/stats/TimelineView";
-import { MonthlyStatsView } from "./ui/views/stats/MonthlyStatsView";
 import { CalendarView } from "./ui/views/CalendarView";
-import { MobileOpsSidePanelView } from "./ui/views/MobileOpsSidePanelView";
+import { CaptureView } from "./ui/views/CaptureView";
+import { TodayView } from "./ui/views/TodayView";
+import { KnowledgeView } from "./ui/views/KnowledgeView";
+import { ReviewView } from "./ui/views/ReviewView";
 import { ContactsIndexService } from "./contactsRSLatte/indexService";
+import { rebuildTaskProjectInteractionEventsFromWorkEvents } from "./services/contacts/rebuildTaskProjectInteractionEventsFromWorkEvents";
 import { ContactsIndexStore } from "./contactsRSLatte/indexStore";
 import type { ContactIndexItem } from "./contactsRSLatte/types";
 import { RSLatteSettingTab } from "./ui/settings/RSLatteSettingTab";
 import { InsertContactReferenceModal } from "./ui/modals/InsertContactReferenceModal";
+import { buildProjectTaskContactEntriesForFile } from "./services/contacts/projectTaskContactInteractions";
+import { replaceContactDynamicGeneratedBlock, statusIconForInteractionWithPhase } from "./services/contacts/contactNoteWriter";
 // 这些类型可能通过 mixin 或其他动态方式使用，保留以备将来使用
 // @ts-ignore - Reserved for future use
 import type { SpaceCtx, RSLatteSpaceConfig } from "./types/space";
 
 import { createAllModules } from "./plugin/index";
+import { applyRslatteBundledWorkspaceLayout } from "./plugin/applyBundledWorkspaceLayout";
+import { clearLeftRightSidebarsFromCommand } from "./plugin/quadrantWorkspaceLayout";
+import { isWorkspacesCorePluginEnabled } from "./plugin/obsidianCorePluginGate";
 
-type DbSyncModuleKey = "record" | "checkin" | "finance" | "task" | "memo" | "output" | "project" | "contacts";
+type DbSyncModuleKey =
+  | "record"
+  | "checkin"
+  | "finance"
+  | "health"
+  | "knowledge"
+  | "task"
+  | "memo"
+  | "output"
+  | "project"
+  | "contacts";
 
 export default class RSLattePlugin extends Plugin {
   settings!: RSLattePluginSettings;
@@ -101,14 +123,15 @@ export default class RSLattePlugin extends Plugin {
   workEventSvc!: WorkEventService;
   /** Stats: Work Event Reader（用于统计功能）*/
   workEventReader!: WorkEventReader;
-  /** Stats: Monthly Stats Generator（用于统计功能）*/
-  monthlyStatsGenerator!: MonthlyStatsGenerator;
   public vaultSvc!: VaultService;
   public journalSvc!: JournalService;
   private financeSummarySvc!: FinanceSummaryService;
-  // NoteNavigator 已初始化但当前未使用，保留以备将来使用
-  // @ts-ignore - Reserved for future use
   private noteNav!: NoteNavigator;
+
+  /** 打开笔记并按行定位（Review 周报/月报子窗口等） */
+  get noteNavigator(): NoteNavigator {
+    return this.noteNav;
+  }
 
   // Contacts Side Panel view is registered only when module is enabled (C1).
    protected _contactsViewRegistered: boolean = false;
@@ -133,16 +156,10 @@ export default class RSLattePlugin extends Plugin {
   // Output manager service (central index for output docs)
   outputRSLatte!: OutputRSLatteService;
 
-  // 发布管理中央索引
-  publishRSLatte!: PublishRSLatteService;
-
   // 打卡/财务记录中央索引（可 DB 同步 + 索引归档）
   recordRSLatte!: RecordRSLatteService;
 
-  // 工作台服务
-  private dashboardSvc!: DashboardService;
-
-  // PipelineEngine（统一入口：View 按钮 -> engine.run）
+  // PipelineEngine（主路径：侧栏/coordinator -> runE2；legacy engine.run 仅兼容）
   pipelineEngine!: PipelineEngine;
 
   /** D1: coordinator 驱动 timer 的模块级自动刷新/自动归档调度 */
@@ -159,11 +176,20 @@ export default class RSLattePlugin extends Plugin {
     try {
       const fn = (this as any)?._pipelineIsEnabled;
       if (typeof fn === "function") return fn(moduleKey) !== false;
+      return buildPipelineModuleIsEnabled(this as any)(moduleKey) !== false;
     } catch {
-      // ignore
+      return false;
     }
-    return true;
   }
+
+  /** 初始化环境检查已确认且当前强制项均通过时，业务模块才按设置启用 */
+  public isPluginEnvInitModuleGateOpen(): boolean {
+    return arePluginModulesUnlocked(this.app, this);
+  }
+
+  /** 仅当核心插件「工作区」启用时显示「一键载入内置工作区」ribbon */
+  protected _rslatteWorkspaceLayoutRibbonEl: HTMLElement | null = null;
+  protected _rslatteWorkspaceRibbonPollLast: boolean = false;
 
   protected _lastListsSyncKey: string = "";
   protected _debouncedSyncListsToDb: (() => void) | null = null;
@@ -199,7 +225,18 @@ export default class RSLattePlugin extends Plugin {
 
   /** DB Sync 状态灯模块 key（v6-3b：record 拆分为 checkin/finance；v6-5.5：task/memo 拆分）*/
   // @ts-ignore - Reserved for future use
-  private static readonly DB_SYNC_KEYS = ["record", "checkin", "finance", "task", "memo", "output", "project", "contacts"] as const;
+  private static readonly DB_SYNC_KEYS = [
+    "record",
+    "checkin",
+    "finance",
+    "health",
+    "knowledge",
+    "task",
+    "memo",
+    "output",
+    "project",
+    "contacts",
+  ] as const;
   // 财务汇总缓存（事实来源：DB /stats）
   protected _financeSummaryKey: string = ""; // as_of
   protected _financeSummaryFetchedAt: number = 0;
@@ -215,10 +252,10 @@ export default class RSLattePlugin extends Plugin {
   protected _todayCheckinsFetchedAt: number = 0;
   protected _todayCheckinsMap: Map<string, ApiCheckinRecord> = new Map();
 
-  // 今日财务记录缓存（事实来源：DB）
+  // 今日财务记录缓存（事实来源：DB 或本地索引）；同分类可多条（entry_id 区分）
   protected _todayFinancesKey: string = "";
   protected _todayFinancesFetchedAt: number = 0;
-  protected _todayFinancesMap: Map<string, ApiFinanceRecord> = new Map();
+  protected _todayFinancesMap: Map<string, ApiFinanceRecord[]> = new Map();
 
   // 今日日志子窗口预览缓存（用于一次渲染里避免重复读文件）
   protected _todayPanelPreviewKey: string = "";
@@ -243,6 +280,7 @@ export default class RSLattePlugin extends Plugin {
     // services that don't depend on loaded settings
     this.settingsSvc = new SettingsService(this, DEFAULT_SETTINGS);
 
+    const rawPluginData = await this.loadData();
     this.settings = await this.settingsSvc.load();
 
     // Step F0：space schema migration (default space + currentSpaceId)
@@ -272,15 +310,55 @@ export default class RSLattePlugin extends Plugin {
       if (!Array.isArray((this.settings as any).outputPanel.archiveRoots)) {
         (this.settings as any).outputPanel.archiveRoots = [];
       }
+      const op: any = (this.settings as any).outputPanel;
+      op.templateCreateCounts = { ...(defOp.templateCreateCounts ?? {}), ...(op.templateCreateCounts ?? {}) };
+      if (typeof op.listFilterShowGeneral !== "boolean") op.listFilterShowGeneral = defOp.listFilterShowGeneral !== false;
+      if (typeof op.listFilterShowProject !== "boolean") op.listFilterShowProject = defOp.listFilterShowProject !== false;
+      if (!Array.isArray(op.createOutputExtraFields)) op.createOutputExtraFields = [];
+      if (op.sidePanelMainTab !== "list" && op.sidePanelMainTab !== "knowledge_publish") {
+        op.sidePanelMainTab = defOp.sidePanelMainTab ?? "list";
+      }
+      for (const tpl of op.templates ?? []) {
+        try {
+          normalizeOutputTemplateDef(tpl);
+        } catch {
+          // ignore
+        }
+      }
       // showStatuses 已移除：侧边栏现在按三个清单（进行中/已完成/取消）分类显示所有状态
     } catch (e) {
       console.warn("RSLatte outputPanel defaults merge failed", e);
+    }
+
+    try {
+      const defKp: any = (DEFAULT_SETTINGS as any).knowledgePanel ?? {};
+      const curKp: any = (this.settings as any).knowledgePanel ?? {};
+      const mergedKp = { ...defKp, ...curKp };
+      if (!Array.isArray(mergedKp.secondarySubdirs)) {
+        mergedKp.secondarySubdirs = DEFAULT_KNOWLEDGE_SECONDARY_SUBDIRS.map((r) => ({ ...r }));
+      }
+      if (!mergedKp.legacyDefaultSubdirsPruned2026) {
+        mergedKp.secondarySubdirs = withoutRemovedLegacyKnowledgeSubdirs(mergedKp.secondarySubdirs);
+        mergedKp.legacyDefaultSubdirsPruned2026 = true;
+      }
+      (this.settings as any).knowledgePanel = mergedKp;
+    } catch (e) {
+      console.warn("RSLatte knowledgePanel defaults merge failed", e);
     }
 
     
     // v6-2：checkinPanel / financePanel / moduleEnabledV2 新增字段（SettingsService 为浅合并，需补齐默认字段 + 兼容旧配置）
     try {
       const s: any = this.settings as any;
+
+      // 新库首次安装：须先在「插件初始化环境检查」中完成确认后业务模块才生效；已有 data.json 且无此键的升级用户视为已放行
+      {
+        const rawObj = rawPluginData != null && typeof rawPluginData === "object" ? (rawPluginData as object) : null;
+        if (!rawObj || !("pluginEnvInitGateCompleted" in rawObj)) {
+          const keys = rawObj ? Object.keys(rawObj) : [];
+          s.pluginEnvInitGateCompleted = keys.length > 0;
+        }
+      }
 
       // moduleEnabledV2
       const defME2: any = (DEFAULT_SETTINGS as any).moduleEnabledV2 ?? {};
@@ -293,12 +371,11 @@ export default class RSLattePlugin extends Plugin {
       if (s.moduleEnabledV2.finance === undefined) s.moduleEnabledV2.finance = meOld.record ?? true;
       if (s.moduleEnabledV2.task === undefined) s.moduleEnabledV2.task = meOld.task ?? true;
       if (s.moduleEnabledV2.memo === undefined) s.moduleEnabledV2.memo = meOld.task ?? true;
+      if (s.moduleEnabledV2.schedule === undefined) s.moduleEnabledV2.schedule = s.moduleEnabledV2.memo ?? true;
       if (s.moduleEnabledV2.project === undefined) s.moduleEnabledV2.project = meOld.project ?? true;
       if (s.moduleEnabledV2.output === undefined) s.moduleEnabledV2.output = meOld.output ?? true;
       if (s.moduleEnabledV2.journal === undefined) s.moduleEnabledV2.journal = true;
-      if (s.moduleEnabledV2.mobile === undefined) s.moduleEnabledV2.mobile = true;
-
-      if (!s.mobileModuleBySpace || typeof s.mobileModuleBySpace !== "object") s.mobileModuleBySpace = {};
+      if (s.moduleEnabledV2.health === undefined) s.moduleEnabledV2.health = true;
 
       // checkinPanel / financePanel
       const defCk: any = (DEFAULT_SETTINGS as any).checkinPanel ?? {};
@@ -318,6 +395,20 @@ export default class RSLattePlugin extends Plugin {
       if (s.financePanel.autoArchiveEnabled === undefined) s.financePanel.autoArchiveEnabled = (s.rslattePanelAutoArchiveEnabled ?? false);
       if (s.financePanel.archiveThresholdDays === undefined) s.financePanel.archiveThresholdDays = (s.rslattePanelArchiveThresholdDays ?? 90);
 
+      const defHp: any = (DEFAULT_SETTINGS as any).healthPanel ?? {};
+      const curHp: any = s.healthPanel ?? {};
+      s.healthPanel = Object.assign({}, defHp, curHp);
+      if (s.healthPanel.enableDbSync === undefined) s.healthPanel.enableDbSync = s.rslattePanelEnableDbSync ?? false;
+      if (s.healthPanel.autoArchiveEnabled === undefined) s.healthPanel.autoArchiveEnabled = s.rslattePanelAutoArchiveEnabled ?? true;
+      if (s.healthPanel.archiveThresholdDays === undefined) s.healthPanel.archiveThresholdDays = s.rslattePanelArchiveThresholdDays ?? 90;
+      if (s.healthPanel.waterCupVolumeMl === undefined) s.healthPanel.waterCupVolumeMl = (defHp as any).waterCupVolumeMl ?? 500;
+
+      // 健康：日记追加规则（旧库可能无此项，否则 appendJournalByModule("health") 静默失败）
+      const jRules: any[] = Array.isArray(s.journalAppendRules) ? s.journalAppendRules : (s.journalAppendRules = []);
+      if (!jRules.some((r) => r?.module === "health")) {
+        jRules.push({ module: "health", enabled: true, h1: "# 操作日志", h2: "## 健康记录" });
+      }
+
       // v6-4：taskModule / memoModule（仅设置拆分；运行仍然以 taskPanel 为统一入口）
       const defTM: any = (DEFAULT_SETTINGS as any).taskModule ?? {};
       const curTM: any = s.taskModule ?? {};
@@ -326,6 +417,15 @@ export default class RSLattePlugin extends Plugin {
       const defMM: any = (DEFAULT_SETTINGS as any).memoModule ?? {};
       const curMM: any = s.memoModule ?? {};
       s.memoModule = Object.assign({}, defMM, curMM);
+      const defSM: any = (DEFAULT_SETTINGS as any).scheduleModule ?? {};
+      const curSM: any = s.scheduleModule ?? {};
+      s.scheduleModule = Object.assign({}, defSM, curSM);
+      if (!Array.isArray(s.scheduleModule.scheduleCategoryDefs) || s.scheduleModule.scheduleCategoryDefs.length === 0) {
+        s.scheduleModule.scheduleCategoryDefs = JSON.parse(JSON.stringify(defSM.scheduleCategoryDefs ?? []));
+      }
+      if (!String(s.scheduleModule.defaultScheduleCategoryId ?? "").trim()) {
+        s.scheduleModule.defaultScheduleCategoryId = defSM.defaultScheduleCategoryId ?? "meeting";
+      }
 
       // vC1：contactsModule（仅设置拆分；运行暂不依赖）
       const defCM: any = (DEFAULT_SETTINGS as any).contactsModule ?? {};
@@ -345,14 +445,34 @@ export default class RSLattePlugin extends Plugin {
       if (s.memoModule.enableDbSync === undefined) s.memoModule.enableDbSync = legacyTaskEnableDb;
       if (s.memoModule.autoArchiveEnabled === undefined) s.memoModule.autoArchiveEnabled = legacyTaskAutoArc;
       if (s.memoModule.archiveThresholdDays === undefined) s.memoModule.archiveThresholdDays = legacyTaskDays;
+      if (s.scheduleModule.enableDbSync === undefined) s.scheduleModule.enableDbSync = legacyTaskEnableDb;
+      if (s.scheduleModule.autoArchiveEnabled === undefined) s.scheduleModule.autoArchiveEnabled = legacyTaskAutoArc;
+      if (s.scheduleModule.archiveThresholdDays === undefined) s.scheduleModule.archiveThresholdDays = legacyTaskDays;
 
-      // v6-5：预留字段（暂不影响运行逻辑；仅用于后续“任务备忘独立 autoArchive/增量刷新”）
+      // v6-5：预留字段（暂不影响运行逻辑；仅用于后续“任务提醒独立 autoArchive/增量刷新”）
       if (s.taskModule.archiveLastRunKey === undefined) s.taskModule.archiveLastRunKey = legacyTaskArcKey;
       if (s.memoModule.archiveLastRunKey === undefined) s.memoModule.archiveLastRunKey = legacyTaskArcKey;
+      if (s.scheduleModule.archiveLastRunKey === undefined) s.scheduleModule.archiveLastRunKey = legacyTaskArcKey;
       if (s.taskModule.lastDiaryScanMs === undefined) s.taskModule.lastDiaryScanMs = 0;
       if (s.memoModule.lastDiaryScanMs === undefined) s.memoModule.lastDiaryScanMs = 0;
+      if (s.scheduleModule.lastDiaryScanMs === undefined) s.scheduleModule.lastDiaryScanMs = 0;
+
+      clampModuleArchiveThresholdsInSettings(s);
     } catch (e) {
       console.warn("RSLatte checkin/finance panel defaults merge failed", e);
+    }
+
+    // 项目管理侧栏 projectPanel 深合并（第九节）
+    try {
+      const s: any = this.settings as any;
+      const defPp: any = (DEFAULT_SETTINGS as any).projectPanel ?? {};
+      const curPp: any = s.projectPanel ?? {};
+      s.projectPanel = Object.assign({}, defPp, curPp);
+      // 每次启动 Obsidian：默认打开「项目清单」页签（非「项目进度管理」）；同一会话内的页签状态仍写入 settings，在视图未卸载时保留
+      s.projectPanel.mainTab = "list";
+      await this.settingsSvc.saveRaw(this.settings);
+    } catch (e) {
+      console.warn("RSLatte projectPanel defaults merge failed", e);
     }
 
 // v25：统一中央索引目录（四个模块共用）
@@ -374,7 +494,7 @@ export default class RSLattePlugin extends Plugin {
         s.projectRSLatteIndexDir,
         s.outputPanel?.rslatteIndexDir,
         s.rslattePanelIndexDir,
-        "95-Tasks/.rslatte"
+        "00-System/.rslatte"
       );
       if (!String(s.centralIndexDir ?? "").trim()) s.centralIndexDir = resolved;
 
@@ -388,6 +508,28 @@ export default class RSLattePlugin extends Plugin {
     }
 
     this.api = new RSLatteApiClient(this.settings.apiBaseUrl);
+    try {
+      const tok = String((this.settings as any)?.apiAuthAccessToken ?? "").trim();
+      this.api.setAuthToken(tok || null);
+    } catch {
+      this.api.setAuthToken(null);
+    }
+    this.api.setAuthRefreshSupport({
+      getCredentials: () => {
+        const s: any = this.settings as any;
+        const u = String(s?.apiBackendUserName ?? "").trim();
+        const p = String(s?.apiBackendPassword ?? "");
+        if (!u || !p) return null;
+        return { userName: u, password: p };
+      },
+      persistAccessToken: async (token: string) => {
+        const s: any = this.settings as any;
+        const t = String(token ?? "").trim();
+        if (!t || String(s?.apiAuthAccessToken ?? "").trim() === t) return;
+        s.apiAuthAccessToken = t;
+        await this.saveSettings();
+      },
+    });
     // Step F4: always attach space scope header (X-Space-Id)
     try {
       this.api.setSpaceId(this.getCurrentSpaceId());
@@ -399,12 +541,9 @@ export default class RSLattePlugin extends Plugin {
 
     // Work Event Stream（统计用“工作事件流”，失败不阻断）
     this.workEventSvc = new WorkEventService(this.app, () => this.settings, this.auditSvc);
-    this.dashboardSvc = new DashboardService(this);
-    
     // 初始化统计服务
     this.workEventReader = new WorkEventReader(this.app, this.settings);
-    this.monthlyStatsGenerator = new MonthlyStatsGenerator(this.app, this.settings, this.workEventReader);
-    
+
     try {
       await this.workEventSvc.ensureReady();
     } catch {
@@ -430,7 +569,23 @@ export default class RSLattePlugin extends Plugin {
         return String(sAny?.contactsModule?.archiveDir ?? defArc);
       },
       // F2: bucket by space -> contacts interactions/index live under <centralRoot>/<spaceId>/index
-      () => this.getSpaceIndexDir()
+      () => this.getSpaceIndexDir(),
+      () => {
+        const cm: any = (this.settings as any)?.contactsModule ?? {};
+        return {
+          trim: {
+            maxPerContact: Math.max(10, Math.min(5000, Number(cm.interactionEventsMaxPerContactInIndex ?? 100) || 100)),
+            maxPerSource: Math.max(1, Math.min(500, Number(cm.interactionEventsMaxPerSourcePerContact ?? 10) || 10)),
+          },
+          archiveShardMaxBytes: Math.max(4096, Math.min(20 * 1024 * 1024, Number(cm.contactInteractionArchiveShardMaxBytes ?? 1048576) || 1048576)),
+          refreshContactNoteDynamicBlocksForUids: (uids: string[]) => this.refreshContactNoteDynamicBlockForUids(uids),
+          syncContactsIndexLastInteractionAtForUids: (uids: string[]) =>
+            this.contactsIndex.syncLastInteractionAtForContactUids(uids),
+          rebuildTaskProjectInteractionEventsFromWork: (entries) =>
+            rebuildTaskProjectInteractionEventsFromWorkEvents(this.workEventSvc, entries),
+        };
+      },
+      () => (this.settings as any)?.taskPanel as TaskPanelSettings | undefined
     );
 
     // Step0: ensure contacts-interactions index exists (best-effort, never block plugin load)
@@ -454,6 +609,7 @@ export default class RSLattePlugin extends Plugin {
         settings: this.settings,
         api: this.api,
         refreshSidePanel: () => this.refreshSidePanel(),
+        isPluginEnvInitModuleGateOpen: () => this.isPluginEnvInitModuleGateOpen(),
         setBackendDbReady: (ready: boolean, reason?: string) => this.setBackendDbReady(ready, reason),
         getVaultSyncPayload: () => ({
           vault_name: this.app.vault.getName(),
@@ -494,6 +650,7 @@ export default class RSLattePlugin extends Plugin {
       // 状态灯：project 模块同步状态（pending/failed/ok     
       reportDbSyncWithCounts: (meta: { pendingCount?: number; failedCount?: number; ok?: boolean; err?: string }) =>
         this.markDbSyncWithCounts("project", meta),
+      getPluginVersion: () => String(this.manifest?.version ?? "0.0.1"),
     });
 
     // Output manager (central index over archive roots)
@@ -502,13 +659,15 @@ export default class RSLattePlugin extends Plugin {
       settingsRef: () => this.settings,
       refreshSidePanel: () => this.refreshSidePanel(),
       workEventSvc: this.workEventSvc,
+      ledgerPluginRef: () => this,
+      syncOutputToDbBestEffort: async (reason) => {
+        const enableDbSync = !!this.settings.outputPanel?.enableDbSync;
+        if (enableDbSync) await this.syncOutputFilesToDb({ reason });
+        else await ((this as any).writeTodayOutputProgressToJournalFromIndex?.() ?? Promise.resolve());
+      },
     });
 
-    this.publishRSLatte = new PublishRSLatteService({
-      app: this.app,
-      settingsRef: () => this.settings,
-      refreshSidePanel: () => this.refreshSidePanel(),
-    });
+    registerKnowledgeOutputUpdatedLedgerHook(this);
 
     // Record rslatte (checkin/finance central index + optional archive)
     this.recordRSLatte = new RecordRSLatteService({
@@ -539,22 +698,43 @@ export default class RSLattePlugin extends Plugin {
     // Register views and settings tab as early as possible so UI stays usable even if API init fails.
     this.registerView(VIEW_TYPE_RSLATTE, (leaf) => new RSLatteSidePanelView(leaf, this));
     this.registerView(VIEW_TYPE_TASKS, (leaf) => new TaskSidePanelView(leaf, this));
+    this.registerView(VIEW_TYPE_SCHEDULE, (leaf) => new TaskSidePanelView(leaf, this));
     this.registerView(VIEW_TYPE_PROJECTS, (leaf) => new ProjectSidePanelView(leaf, this));
     this.registerView(VIEW_TYPE_OUTPUTS, (leaf) => new OutputSidePanelView(leaf, this));
-    this.registerView(VIEW_TYPE_PUBLISH, (leaf) => new PublishSidePanelView(leaf, this));
     this.registerView(VIEW_TYPE_FINANCE, (leaf) => new FinanceSidePanelView(leaf, this));
+    this.registerView(VIEW_TYPE_HEALTH, (leaf) => new HealthSidePanelView(leaf, this));
     this.registerView(VIEW_TYPE_CHECKIN, (leaf) => new CheckinSidePanelView(leaf, this));
     this.registerView(VIEW_TYPE_HUB, (leaf) => new SpaceHubView(leaf, this));
-    this.registerView(VIEW_TYPE_DASHBOARD, (leaf) => new DashboardView(leaf, this));
     this.registerView(VIEW_TYPE_TIMELINE, (leaf) => new TimelineView(leaf, this));
-    this.registerView(VIEW_TYPE_MONTHLY_STATS, (leaf) => new MonthlyStatsView(leaf, this));
     this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
-    this.registerView(VIEW_TYPE_MOBILE_OPS, (leaf) => new MobileOpsSidePanelView(leaf, this));
+    this.registerView(VIEW_TYPE_CAPTURE, (leaf) => new CaptureView(leaf, this));
+    this.registerView(VIEW_TYPE_TODAY, (leaf) => new TodayView(leaf, this));
+    this.registerView(VIEW_TYPE_KNOWLEDGE, (leaf) => new KnowledgeView(leaf, this));
+    this.registerView(VIEW_TYPE_KNOWLEDGE_PANEL, (leaf) => new KnowledgeView(leaf, this, "sidepanel"));
+    this.registerView(VIEW_TYPE_REVIEW, (leaf) => new ReviewView(leaf, this));
     // Contacts（C1）默认关闭：仅在开启时才注册视图，避免vault “undefined=enabled误开启   
     // 始终注册联系人视图，即使模块关闭也保持侧边栏可用
     // 侧边栏内容会在模块未启用时显示"联系人模块未启用"提示
     this.ensureContactsPanelRegistered();
     this.addSettingTab(new RSLatteSettingTab(this.app, this));
+
+    this.app.workspace.onLayoutReady(() => {
+      try {
+        if (!this.isPluginEnvInitModuleGateOpen()) {
+          const sAny: any = this.settings as any;
+          const needInit = sAny.pluginEnvInitGateCompleted !== true;
+          new Notice(
+            needInit
+              ? "RSLatte：请先打开 设置 → RSLatte → 全局配置 → 插件初始化环境检查，Obsidian 强制项、全部目录与模板强制项均通过后点击「完成初始化」。完成前业务模块均不会启用。"
+              : "RSLatte：当前仍有强制环境项未满足（Obsidian「文件与链接」、必选目录、模板或人工确认项等），业务模块已暂停。请修复后在「插件初始化环境检查」中重新检测或再次完成初始化。",
+            20000,
+          );
+        }
+      } catch (e) {
+        console.warn("[RSLatte] blocking env check notice failed", e);
+      }
+      this.syncRslatteWorkspaceLayoutRibbon();
+    });
 
     // Step F1: Global Space switcher (Ribbon + command)
     try {
@@ -608,52 +788,76 @@ export default class RSLattePlugin extends Plugin {
     try {
       this.addRibbonIcon(
         "layout-dashboard",
-        "打开RSLatte视图",
+        "打开 RSLatte工作台",
         () => void this.activateHubView()
       );
     } catch (e) {
       console.warn("[RSLatte][hub] addRibbonIcon failed", e);
     }
 
+    try {
+      const ip = (this.app as any).internalPlugins;
+      if (ip && typeof ip.on === "function") {
+        this.registerEvent(ip.on("change", () => this.syncRslatteWorkspaceLayoutRibbon()));
+      }
+    } catch (e) {
+      console.warn("[RSLatte][workspace-layout] internalPlugins.on failed", e);
+    }
+    this.registerInterval(
+      window.setInterval(() => {
+        const on = isWorkspacesCorePluginEnabled(this.app);
+        if (on !== this._rslatteWorkspaceRibbonPollLast) {
+          this.syncRslatteWorkspaceLayoutRibbon();
+        }
+      }, 2000),
+    );
+    this.syncRslatteWorkspaceLayoutRibbon();
+
+    this.addCommand({
+      id: "rslatte-load-bundled-workspace",
+      name: "载入 RSLatte 内置工作区布局",
+      callback: () => void applyRslatteBundledWorkspaceLayout(this),
+    });
+    this.addCommand({
+      id: "rslatte-clear-left-right-sidebars",
+      name: "清空左右侧栏（关闭侧栏内所有视图，不载入四象限）",
+      callback: () => void clearLeftRightSidebarsFromCommand(this),
+    });
+
     this.addCommand({
       id: "rslatte-hub-open",
-      name: "打开侧边栏：RSLatte视图",
+      name: "打开侧边栏：RSLatte工作台",
       callback: () => void this.activateHubView(),
     });
 
-    // 工作台按钮
-    try {
-      this.addRibbonIcon(
-        "layout-dashboard",
-        "打开 RSLatte 工作台",
-        () => void this.activateDashboardView()
-      );
-    } catch (e) {
-      console.warn("[RSLatte][dashboard] addRibbonIcon failed", e);
-    }
-
     this.addCommand({
-      id: "rslatte-dashboard-open",
-      name: "打开 RSLatte 工作台",
-      callback: () => void this.activateDashboardView(),
+      id: "rslatte-capture-open",
+      name: "打开侧边栏：快速记录",
+      callback: () => (this as any).activateWorkflowView?.("capture"),
     });
 
-    // Stats: 添加统计视图命令
+    this.addCommand({
+      id: "rslatte-open-today-view",
+      name: "打开侧边栏：今天",
+      callback: () => (this as any).activateWorkflowView?.("today"),
+    });
+
+    this.addCommand({
+      id: "rslatte-open-review-panel",
+      name: "打开侧边栏：回顾",
+      callback: () => this.activateReviewView(),
+    });
+
+    // Stats: 操作日志（原时间轴视图）
     this.addCommand({
       id: "rslatte-open-timeline",
-      name: "打开侧边栏：时间轴视图",
+      name: "打开侧边栏：操作日志",
       callback: () => void this.activateTimelineView(),
     });
 
     this.addCommand({
-      id: "rslatte-open-monthly-stats",
-      name: "打开侧边栏：月度统计视图",
-      callback: () => void this.activateMonthlyStatsView(),
-    });
-
-    this.addCommand({
       id: "rslatte-open-calendar",
-      name: "打开侧边栏：日历",
+      name: "打开侧边栏：日程日历",
       callback: () => void this.activateCalendarView(),
     });
 
@@ -715,22 +919,27 @@ export default class RSLattePlugin extends Plugin {
           // 方法3: 如果是 RSLatte 自己的命令，直接调用对应的方法
           const commandMap: Record<string, () => void | Promise<void>> = {
             "rslatte-hub-open": () => this.activateHubView(),
-            "rslatte-dashboard-open": () => this.activateDashboardView(),
+            /** 旧 ID：命令面板已合并，此处保留供 URI/脚本等仍引用时可用 */
+            "rslatte-dashboard-open": () => void this.activateHubView(),
             "rslatte-open-sidepanel": () => this.activateRSLatteView(),
             "rslatte-open-project-panel": () => this.activateProjectView(),
             "rslatte-open-taskpanel": () => this.activateTaskView(),
             "rslatte-open-output-panel": () => this.activateOutputView(),
-            "rslatte-open-publish-panel": () => this.activatePublishView(),
+            "rslatte-open-publish-panel": () => this.activateKnowledgeView(),
             "rslatte-open-finance-panel": () => this.activateFinanceView(),
+            "rslatte-open-health-panel": () => this.activateHealthView(),
             "rslatte-open-checkin-panel": () => this.activateCheckinView(),
             "rslatte-open-contacts-panel": () => this.activateContactsView(),
-            "rslatte-open-mobile-ops-panel": () => this.activateMobileOpsView(),
             "rslatte-open-timeline": () => this.activateTimelineView(),
-            "rslatte-open-monthly-stats": () => this.activateMonthlyStatsView(),
+            "rslatte-open-today-view": () => (this as any).activateWorkflowView?.("today"),
+            "rslatte-open-review-panel": () => this.activateReviewView(),
             "rslatte-open-calendar": () => this.activateCalendarView(),
             "rslatte-space-switch": () => this.openSpaceSwitcher(),
             "rslatte-open-settings": () => this.openSettings(),
-            "rslatte-sync-from-mobile": () => (this as any).syncFromMobile?.(),
+            "rslatte-load-bundled-workspace": () => applyRslatteBundledWorkspaceLayout(this),
+            /** 旧 ID：命令面板已合并，此处保留供 URI/脚本等仍引用该 ID 时可用 */
+            "rslatte-apply-recommended-workspace": () => applyRslatteBundledWorkspaceLayout(this),
+            "rslatte-clear-left-right-sidebars": () => void clearLeftRightSidebarsFromCommand(this),
           };
           
           const handler = commandMap[commandId];
@@ -747,7 +956,7 @@ export default class RSLattePlugin extends Plugin {
     });
 
     // ✅ 注册模块跳转 URI 处理器（支持通过模块名称打开对应侧边栏）
-    // 用法：obsidian://rslatte-open?module=今日检查
+    // 用法：obsidian://rslatte-open?module=今日打卡（仍兼容 module=今日检查）
     this.registerObsidianProtocolHandler("rslatte-open", async (params) => {
       const moduleName = params.module || params.name;
       if (moduleName && typeof moduleName === "string") {
@@ -755,8 +964,11 @@ export default class RSLattePlugin extends Plugin {
           // 模块名称映射表（支持中文名称和英文名称）
           const moduleMap: Record<string, () => void | Promise<void>> = {
             // 中文名称
+            "今日打卡": () => this.activateRSLatteView(),
             "今日检查": () => this.activateRSLatteView(),
+            "0.今日打卡": () => this.activateRSLatteView(),
             "0.今日检查": () => this.activateRSLatteView(),
+            "0. 今日打卡": () => this.activateRSLatteView(),
             "0. 今日检查": () => this.activateRSLatteView(),
             "任务管理": () => this.activateTaskView(),
             "1.任务管理": () => this.activateTaskView(),
@@ -765,15 +977,29 @@ export default class RSLattePlugin extends Plugin {
             "2.项目管理": () => this.activateProjectView(),
             "2. 项目管理": () => this.activateProjectView(),
             "输出管理": () => this.activateOutputView(),
-            "发布管理": () => this.activatePublishView(),
+            "发布管理": () => this.activateKnowledgeView(),
+            "知识库": () => this.activateKnowledgeView(),
+            "Knowledge": () => this.activateKnowledgeView(),
             "财务": () => this.activateFinanceView(),
+            "健康": () => this.activateHealthView(),
             "打卡": () => this.activateCheckinView(),
             "联系人": () => this.activateContactsView(),
-            "未同步操作队列": () => this.activateMobileOpsView(),
             "Hub": () => this.activateHubView(),
-            "工作台": () => this.activateDashboardView(),
+            "工作台": () => void this.activateHubView(),
             "时间轴": () => this.activateTimelineView(),
-            "月度统计": () => this.activateMonthlyStatsView(),
+            "操作日志": () => this.activateTimelineView(),
+            "今天": () => (this as any).activateWorkflowView?.("today"),
+            "Today": () => (this as any).activateWorkflowView?.("today"),
+            "今日执行": () => (this as any).activateWorkflowView?.("today"),
+            "回顾": () => this.activateReviewView(),
+            "Review": () => this.activateReviewView(),
+            "快速记录": () => (this as any).activateWorkflowView?.("capture"),
+            "Capture": () => (this as any).activateWorkflowView?.("capture"),
+            "知识管理（工作台）": () => this.activateKnowledgeView(),
+            // 以下兼容旧名称，均打开知识管理（工作台）
+            "知识管理（阅览）": () => this.activateKnowledgeView(),
+            "知识库阅览": () => this.activateKnowledgeView(),
+            "日程日历": () => this.activateCalendarView(),
             "日历": () => this.activateCalendarView(),
             "设置": () => this.openSettings(),
             // 英文名称（兼容）
@@ -781,15 +1007,19 @@ export default class RSLattePlugin extends Plugin {
             "task": () => this.activateTaskView(),
             "project": () => this.activateProjectView(),
             "output": () => this.activateOutputView(),
-            "publish": () => this.activatePublishView(),
+            "publish": () => this.activateKnowledgeView(),
+            "knowledge": () => this.activateKnowledgeView(),
             "finance": () => this.activateFinanceView(),
+            "health": () => this.activateHealthView(),
             "checkin": () => this.activateCheckinView(),
             "contacts": () => this.activateContactsView(),
-            "mobile-ops": () => this.activateMobileOpsView(),
             "hub": () => this.activateHubView(),
-            "dashboard": () => this.activateDashboardView(),
+            "dashboard": () => void this.activateHubView(),
             "timeline": () => this.activateTimelineView(),
-            "monthly-stats": () => this.activateMonthlyStatsView(),
+            "worklog": () => this.activateTimelineView(),
+            "capture": () => (this as any).activateWorkflowView?.("capture"),
+            "today": () => (this as any).activateWorkflowView?.("today"),
+            "review": () => this.activateReviewView(),
             "calendar": () => this.activateCalendarView(),
             "settings": () => this.openSettings(),
           };
@@ -847,10 +1077,6 @@ export default class RSLattePlugin extends Plugin {
       .ensureReady()
             .catch((e) => console.warn("RSLatte outputRSLatte init failed:", e));
 
-    void this.publishRSLatte
-      .ensureReady()
-            .catch((e) => console.warn("RSLatte publishRSLatte init failed:", e));
-
     void this.recordRSLatte
       .ensureReady()
             .catch((e) => console.warn("RSLatte recordRSLatte init failed:", e));
@@ -858,16 +1084,10 @@ export default class RSLattePlugin extends Plugin {
     // Step4：按设置调度自动增量刷新（增量索引更新DB sync 开启则增量同步   
     this.setupAutoRefreshTimer();
 
-    // Stats: 检查是否需要生成月度统计
-    const statsSettings = (this.settings as any)?.statsSettings;
-    if (statsSettings?.autoGenerateMonthlyStats !== false) {
-      void this.checkAndGenerateMonthlyStats();
-    }
-
     // Command: Open RSLatte Side Panel
     this.addCommand({
       id: "rslatte-open-sidepanel",
-      name: "打开侧边栏：今日检查",
+      name: "打开侧边栏：今日打卡",
       callback: () => this.activateRSLatteView(),
     });
 
@@ -885,20 +1105,26 @@ export default class RSLattePlugin extends Plugin {
 
     this.addCommand({
       id: "rslatte-open-output-panel",
-      name: "打卡侧边栏：输出",
+      name: "打开侧边栏：输出",
       callback: () => this.activateOutputView(),
     });
 
     this.addCommand({
       id: "rslatte-open-publish-panel",
-      name: "打开侧边栏：发布管理",
-      callback: () => this.activatePublishView(),
+      name: "打开侧边栏：知识管理（工作台）",
+      callback: () => this.activateKnowledgeView(),
     });
 
     this.addCommand({
       id: "rslatte-open-finance-panel",
       name: "打开侧边栏：财务",
       callback: () => this.activateFinanceView(),
+    });
+
+    this.addCommand({
+      id: "rslatte-open-health-panel",
+      name: "打开侧边栏：健康",
+      callback: () => this.activateHealthView(),
     });
 
     this.addCommand({
@@ -911,12 +1137,6 @@ export default class RSLattePlugin extends Plugin {
       id: "rslatte-open-contacts-panel",
       name: "打开侧边栏：联系人",
       callback: () => this.activateContactsView(),
-    });
-
-    this.addCommand({
-      id: "rslatte-open-mobile-ops-panel",
-      name: "打开侧边栏：未同步操作队列",
-      callback: () => this.activateMobileOpsView(),
     });
 
     // Contacts: insert reference (C7 design: [[C_<uid>|Name]])
@@ -956,16 +1176,6 @@ export default class RSLattePlugin extends Plugin {
       callback: () => this.openSettings(),
     });
 
-    // ✅ 从手机同步命令
-    this.addCommand({
-      id: "rslatte-sync-from-mobile",
-      name: "从手机同步",
-      callback: async () => {
-        const syncFromMobile = (this as any).syncFromMobile;
-        if (typeof syncFromMobile !== "function") return;
-        await syncFromMobile.call(this);
-      },
-    });
   }
 
   onunload() {
@@ -1009,6 +1219,7 @@ export default class RSLattePlugin extends Plugin {
   }
 
   private isModuleEnabled(key: "record" | "task" | "project" | "output"): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const me: any = (this.settings as any)?.moduleEnabled ?? {};
     const v = me[key];
     return v === undefined ? true : Boolean(v);
@@ -1022,11 +1233,12 @@ export default class RSLattePlugin extends Plugin {
   }
 
   // ==========================
-  // v6-5.1：任务备忘“拆分配置”的运行getter（本步仅提供能力，不改变现有行为
+  // v6-5.1：任务提醒“拆分配置”的运行getter（本步仅提供能力，不改变现有行为
   // ==========================
 
   /** v6-5.1：任务模块是否启用（优先 moduleEnabledV2.task，fallback 到 moduleEnabled.task）*/
   isTaskModuleEnabledV2(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const s: any = this.settings as any;
     const v2 = s?.moduleEnabledV2;
     if (typeof v2?.task === "boolean") return v2.task;
@@ -1035,8 +1247,9 @@ export default class RSLattePlugin extends Plugin {
     return true;
   }
 
-  /** v6-5.1：备忘模块是否启用（优先 moduleEnabledV2.memo，fallback 到 moduleEnabled.task）*/
+  /** v6-5.1：提醒模块是否启用（优先 moduleEnabledV2.memo，fallback 到 moduleEnabled.task）*/
   isMemoModuleEnabledV2(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const s: any = this.settings as any;
     const v2 = s?.moduleEnabledV2;
     if (typeof v2?.memo === "boolean") return v2.memo;
@@ -1066,7 +1279,7 @@ export default class RSLattePlugin extends Plugin {
     return this.isTaskDbSyncEnabled();
   }
 
-  /** v6-5.1：备忘模块 DB sync 是否启用（优先 memoModule.enableDbSync，fallback 到 taskPanel.enableDbSync）*/
+  /** v6-5.1：提醒模块 DB sync 是否启用（优先 memoModule.enableDbSync，fallback 到 taskPanel.enableDbSync）*/
   isMemoDbSyncEnabledV2(): boolean {
     if (!this.isMemoModuleEnabledV2()) return false;
 
@@ -1087,24 +1300,46 @@ export default class RSLattePlugin extends Plugin {
     return this.isTaskDbSyncEnabled();
   }
 
+  /** 日程模块是否启用（moduleEnabledV2.schedule；undefined 视为开启） */
+  isScheduleModuleEnabledV2(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
+    const s: any = this.settings as any;
+    const v2 = s?.moduleEnabledV2;
+    if (typeof v2?.schedule === "boolean") return v2.schedule;
+    const old = s?.moduleEnabled;
+    if (typeof old?.task === "boolean") return old.task;
+    return true;
+  }
+
+  /** 日程 DB 同步（scheduleModule.enableDbSync；与任务/提醒拆分，合并写回仍反映在 taskPanel.enableDbSync） */
+  isScheduleDbSyncEnabledV2(): boolean {
+    if (!this.isScheduleModuleEnabledV2()) return false;
+
+    const apiBaseUrl = String((this.settings as any)?.apiBaseUrl ?? "").trim();
+    if (!apiBaseUrl) return false;
+    const lower = apiBaseUrl.toLowerCase();
+    if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false;
+    try {
+      // eslint-disable-next-line no-new
+      new URL(apiBaseUrl);
+    } catch {
+      return false;
+    }
+
+    const v = (this.settings as any)?.scheduleModule?.enableDbSync;
+    if (typeof v === "boolean") return v;
+    return this.isTaskDbSyncEnabledV2();
+  }
+
 
   /** v6-x：project 模块是否启用（优化moduleEnabledV2.project，fallback moduleEnabled.project*/
 
   /** vC1：contacts 模块是否启用（仅moduleEnabledV2.contacts；undefined 视为关闭，避免旧 vault 误开启） */
   isContactsModuleEnabledV2(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const s: any = this.settings as any;
     const v2 = s?.moduleEnabledV2;
     return v2?.contacts === true;
-  }
-
-  /** 手机模块是否启用（按空间：先查 mobileModuleBySpace[spaceId]，再 fallback 到 moduleEnabledV2.mobile；不传 spaceId 时为当前空间） */
-  isMobileModuleEnabledV2(spaceId?: string): boolean {
-    const s: any = this.settings as any;
-    const sid = (spaceId ?? s?.currentSpaceId ?? "").trim() || "00000000-0000-0000-0000-000000000000";
-    const bySpace = s?.mobileModuleBySpace;
-    if (bySpace && typeof bySpace[sid] === "boolean") return bySpace[sid] === true;
-    const v2 = s?.moduleEnabledV2;
-    return v2?.mobile !== false && (v2?.mobile === true || v2?.mobile === undefined);
   }
 
   /** vC1：contacts DB sync 是否启用 */
@@ -1128,6 +1363,7 @@ export default class RSLattePlugin extends Plugin {
   }
 
   isProjectModuleEnabledV2(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const s: any = this.settings as any;
     const v2 = s?.moduleEnabledV2;
     if (typeof v2?.project === "boolean") return v2.project;
@@ -1157,6 +1393,7 @@ export default class RSLattePlugin extends Plugin {
   }
 
   private isOutputDbSyncEnabled(): boolean {
+  if (!this.isPluginEnvInitModuleGateOpen()) return false;
   // output module enabled?
   const s: any = this.settings as any;
   const v2 = s?.moduleEnabledV2;
@@ -1249,6 +1486,7 @@ export default class RSLattePlugin extends Plugin {
 
   /** v6-3b：checkin 模块是否启用 */
   isCheckinModuleEnabled(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const s: any = this.settings as any;
     const v2 = s?.moduleEnabledV2;
     if (typeof v2?.checkin === "boolean") return v2.checkin;
@@ -1259,12 +1497,85 @@ export default class RSLattePlugin extends Plugin {
 
   /** v6-3b：finance 模块是否启用 */
   isFinanceModuleEnabled(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
     const s: any = this.settings as any;
     const v2 = s?.moduleEnabledV2;
     if (typeof v2?.finance === "boolean") return v2.finance;
     const old = s?.moduleEnabled;
     if (typeof old?.record === "boolean") return old.record;
     return true;
+  }
+
+  /** 健康模块：显式开启（默认关） */
+  isHealthModuleEnabled(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
+    const v2 = (this.settings as any)?.moduleEnabledV2;
+    return v2?.health === true;
+  }
+
+  /** 健康模块 DB 同步开关（`health_records` 入库与 `recordSync` / `healthSpecAtomic` 对齐） */
+  isHealthDbSyncEnabled(): boolean {
+    if (!this.isHealthModuleEnabled()) return false;
+    const apiBaseUrl = String((this.settings as any)?.apiBaseUrl ?? "").trim();
+    const urlCheckable = (() => {
+      if (!apiBaseUrl) return false;
+      const lower = apiBaseUrl.toLowerCase();
+      if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false;
+      try {
+        // eslint-disable-next-line no-new
+        new URL(apiBaseUrl);
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    if (!urlCheckable) return false;
+    const v = (this.settings as any)?.healthPanel?.enableDbSync;
+    return v === true;
+  }
+
+  /** 知识库：`knowledge-index.json` → `knowledge_docs`；需合法 `apiBaseUrl` + `knowledgePanel.enableDbSync` */
+  isKnowledgeDbSyncEnabled(): boolean {
+    if (!this.isPluginEnvInitModuleGateOpen()) return false;
+    const apiBaseUrl = String((this.settings as any)?.apiBaseUrl ?? "").trim();
+    const urlCheckable = (() => {
+      if (!apiBaseUrl) return false;
+      const lower = apiBaseUrl.toLowerCase();
+      if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false;
+      try {
+        // eslint-disable-next-line no-new
+        new URL(apiBaseUrl);
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    if (!urlCheckable) return false;
+    return (this.settings as any)?.knowledgePanel?.enableDbSync === true;
+  }
+
+  /**
+   * WorkEvent JSONL → `rslatte_work_event`；非实时，随自动刷新 tick 批量 upsert。
+   * 需合法 `apiBaseUrl` + `workEventDbSyncEnabled` + `workEventEnabled`。
+   */
+  isWorkEventDbSyncEnabled(): boolean {
+    const s: any = this.settings as any;
+    if (s?.workEventDbSyncEnabled !== true) return false;
+    try {
+      if (this.workEventSvc && !this.workEventSvc.isEnabled()) return false;
+    } catch {
+      return false;
+    }
+    const apiBaseUrl = String(s?.apiBaseUrl ?? "").trim();
+    if (!apiBaseUrl) return false;
+    const lower = apiBaseUrl.toLowerCase();
+    if (!(lower.startsWith("http://") || lower.startsWith("https://"))) return false;
+    try {
+      new URL(apiBaseUrl);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** v6-3b：checkin DB sync 是否启用 */
@@ -1318,6 +1629,8 @@ export default class RSLattePlugin extends Plugin {
     if (moduleKey === "record") return this.isRSLatteDbSyncEnabled();
     if (moduleKey === "checkin") return this.isCheckinDbSyncEnabled();
     if (moduleKey === "finance") return this.isFinanceDbSyncEnabled();
+    if (moduleKey === "health") return this.isHealthDbSyncEnabled();
+    if (moduleKey === "knowledge") return this.isKnowledgeDbSyncEnabled();
     if (moduleKey === "task") return this.isTaskDbSyncEnabledV2();
     if (moduleKey === "memo") return this.isMemoDbSyncEnabledV2();
     if (moduleKey === "output") return this.isOutputDbSyncEnabled();
@@ -1413,7 +1726,7 @@ export default class RSLattePlugin extends Plugin {
   }
 
   private markDbSync(moduleKey: DbSyncModuleKey, ok: boolean, err?: string) {
-    const at = new Date().toISOString();
+    const at = toLocalOffsetIsoString();
     this._dbSyncMeta[moduleKey] = ok
       ? { status: "ok", at, pendingCount: 0, failedCount: 0 }
       : { status: "error", at, err: err || "", pendingCount: 0, failedCount: 0 };
@@ -1424,7 +1737,7 @@ export default class RSLattePlugin extends Plugin {
     moduleKey: DbSyncModuleKey,
     meta: { pendingCount?: number; failedCount?: number; ok?: boolean; err?: string }
   ) {
-    const at = new Date().toISOString();
+    const at = toLocalOffsetIsoString();
     const pending = Number(meta.pendingCount ?? 0);
     const failed = Number(meta.failedCount ?? 0);
     const ok = meta.ok ?? (failed === 0);
@@ -1505,7 +1818,6 @@ export default class RSLattePlugin extends Plugin {
     try {
       this.recordRSLatte?.clearAllSnapshots?.();
       this.outputRSLatte?.clearAllSnapshots?.();
-      this.publishRSLatte?.clearAllSnapshots?.();
       this.projectMgr?.clearAllSnapshots?.();
       
       // 清理其他可能的缓存
@@ -1571,6 +1883,11 @@ export default class RSLattePlugin extends Plugin {
     return "";
   }
 
+  /** 获取昨天的日期键 YYYY-MM-DD（由 createPluginHelpers 提供实现） */
+  getYesterdayKey(): string {
+    return "";
+  }
+
   /** 获取或创建今日状态（由 createPluginHelpers 提供实现，这里仅声明类型） */
   getOrCreateTodayState(): any {
     // 实际实现由 createPluginHelpers 通过 Object.assign 混入
@@ -1617,6 +1934,35 @@ export default class RSLattePlugin extends Plugin {
   /** 打开空间切换器（由 createSpaceManagement 提供实现，这里仅声明类型） */
   openSpaceSwitcher(): void {
     // 实际实现由 createSpaceManagement 通过 Object.assign 混入
+  }
+
+  /**
+   * 核心插件「工作区」未启用时不显示一键载入布局 ribbon；启用后再显示（随用户开关同步）。
+   */
+  syncRslatteWorkspaceLayoutRibbon(): void {
+    const on = isWorkspacesCorePluginEnabled(this.app);
+    try {
+      if (on) {
+        if (this._rslatteWorkspaceLayoutRibbonEl?.isConnected) {
+          this._rslatteWorkspaceRibbonPollLast = on;
+          return;
+        }
+        if (this._rslatteWorkspaceLayoutRibbonEl && !this._rslatteWorkspaceLayoutRibbonEl.isConnected) {
+          this._rslatteWorkspaceLayoutRibbonEl = null;
+        }
+        this._rslatteWorkspaceLayoutRibbonEl = this.addRibbonIcon(
+          "layout-grid",
+          "一键载入 RSLatte 工作区",
+          () => void applyRslatteBundledWorkspaceLayout(this),
+        ) as HTMLElement;
+      } else {
+        this._rslatteWorkspaceLayoutRibbonEl?.remove();
+        this._rslatteWorkspaceLayoutRibbonEl = null;
+      }
+    } catch (e) {
+      console.warn("[RSLatte][workspace-layout] syncRslatteWorkspaceLayoutRibbon failed", e);
+    }
+    this._rslatteWorkspaceRibbonPollLast = on;
   }
 
   /**
@@ -1680,7 +2026,7 @@ export default class RSLattePlugin extends Plugin {
 
     new Notice(`开始刷新 ${enabledModules.length} 个模块...`);
     
-    // 依次刷新每个模块
+    // 依次刷新：统一 manual_refresh（增量写索引；门控通过时可 reconcile）
     for (let i = 0; i < enabledModules.length; i++) {
       const moduleKey = enabledModules[i];
       try {
@@ -1715,7 +2061,7 @@ export default class RSLattePlugin extends Plugin {
   private getModuleLabel(moduleKey: string): string {
     const labels: Record<string, string> = {
       task: "任务",
-      memo: "备忘",
+      memo: "提醒",
       checkin: "打卡",
       finance: "财务",
       project: "项目",
@@ -1731,7 +2077,16 @@ export default class RSLattePlugin extends Plugin {
   }
 
   /** 激活 RSLatte 视图（由 createUiNavigation 提供实现，这里仅声明类型） */
-  async activateRSLatteView(): Promise<void> {
+  async activateRSLatteView(_opts?: { inspectSection?: "checkin" | "finance" | "health" | "journal" }): Promise<void> {
+    // 实际实现由 createUiNavigation 通过 Object.assign 混入
+  }
+
+  /** 激活健康视图（由 createUiNavigation 提供实现，这里仅声明类型） */
+  async activateHealthView(_opts?: {
+    contentTab?: "ledger" | "stats";
+    entryId?: string;
+    recordDate?: string;
+  }): Promise<void> {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
@@ -1741,7 +2096,12 @@ export default class RSLattePlugin extends Plugin {
   }
 
   /** 激活任务视图（由 createUiNavigation 提供实现，这里仅声明类型） */
-  async activateTaskView(): Promise<void> {
+  async activateTaskView(_opts?: { subTab?: "memo" | "schedule" | "task" }): Promise<void> {
+    // 实际实现由 createUiNavigation 通过 Object.assign 混入
+  }
+
+  /** 激活 Capture 视图（由 createUiNavigation 提供实现，这里仅声明类型） */
+  async activateCaptureView(): Promise<void> {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
@@ -1750,55 +2110,46 @@ export default class RSLattePlugin extends Plugin {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
-  /** 激活发布视图（由 createUiNavigation 提供实现，这里仅声明类型） */
+  /** 激活发布视图（§4：已重定向到 Knowledge，由 createUiNavigation 提供实现） */
   async activatePublishView(): Promise<void> {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
+  /** 激活 Knowledge 工作台视图（由 createUiNavigation 提供实现，这里仅声明类型） */
+  async activateKnowledgeView(): Promise<void> {
+    // 实际实现由 createUiNavigation 通过 Object.assign 混入
+  }
+
+  /** 兼容旧调用：与 `activateKnowledgeView` 相同，仅打开知识管理（工作台） */
+  async activateKnowledgePanelView(): Promise<void> {
+    // 实际实现由 createUiNavigation 通过 Object.assign 混入
+  }
+
   /** 激活财务视图（由 createUiNavigation 提供实现，这里仅声明类型） */
-  async activateFinanceView(): Promise<void> {
+  async activateFinanceView(_opts?: {
+    contentTab?: "ledger" | "stats";
+    entryId?: string;
+    recordDate?: string;
+  }): Promise<void> {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
   /** 激活打卡视图（由 createUiNavigation 提供实现，这里仅声明类型） */
-  async activateCheckinView(): Promise<void> {
+  async activateCheckinView(_opts?: { recordDate?: string; checkinId?: string }): Promise<void> {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
-  /** 激活工作台视图 */
-  async activateDashboardView(): Promise<void> {
-    if (!this.app.workspace) return;
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_DASHBOARD);
-    let targetLeaf: any = null;
-    if (leaves.length === 0) {
-      const leaf = this.app.workspace.getRightLeaf(false);
-      if (leaf) {
-        await leaf.setViewState({
-          type: VIEW_TYPE_DASHBOARD,
-          active: true,
-        });
-        targetLeaf = leaf;
-      }
-    } else {
-      this.app.workspace.revealLeaf(leaves[0]);
-      targetLeaf = leaves[0];
-    }
-    if (targetLeaf) {
-      // 等待视图渲染完成后再高亮
-      window.setTimeout(() => {
-        // 尝试多种方式访问容器元素
-        const containerEl = (targetLeaf as any).view?.containerEl || (targetLeaf as any).containerEl || (targetLeaf as any).viewEl;
-        if (containerEl) {
-          containerEl.addClass("rslatte-sidebar-highlight");
-          window.setTimeout(() => {
-            containerEl.removeClass("rslatte-sidebar-highlight");
-          }, 1500);
-        }
-      }, 200); // 增加延迟时间，确保视图完全渲染
-    }
+  /** Review 侧栏（由 createUiNavigation 提供实现；可选粒度/周期键/子页签，见 `Review侧边栏优化方案.md` §4.3） */
+  async activateReviewView(_opts?: {
+    grain?: "week" | "month" | "quarter";
+    periodKey?: string;
+    periodOffset?: number;
+    subTab?: "execute" | "reconcile" | "records";
+  }): Promise<void> {
+    // 实际实现由 createUiNavigation 通过 Object.assign 混入
   }
 
-  /** 激活时间轴视图 */
+  /** 激活操作日志视图（WorkEvent 时间轴） */
   async activateTimelineView(): Promise<void> {
     if (!this.app.workspace) return;
     let leaf: any = this.app.workspace.getLeavesOfType(VIEW_TYPE_TIMELINE)[0];
@@ -1825,34 +2176,7 @@ export default class RSLattePlugin extends Plugin {
     }
   }
 
-  /** 激活月度统计视图 */
-  async activateMonthlyStatsView(): Promise<void> {
-    if (!this.app.workspace) return;
-    let leaf: any = this.app.workspace.getLeavesOfType(VIEW_TYPE_MONTHLY_STATS)[0];
-    if (!leaf) {
-      const newLeaf = this.app.workspace.getRightLeaf(false);
-      if (newLeaf) {
-        await newLeaf.setViewState({ type: VIEW_TYPE_MONTHLY_STATS, active: true });
-        leaf = newLeaf;
-      }
-    }
-    if (leaf) {
-      this.app.workspace.revealLeaf(leaf);
-      // 等待视图渲染完成后再高亮
-      window.setTimeout(() => {
-        // 尝试多种方式访问容器元素
-        const containerEl = (leaf as any).view?.containerEl || (leaf as any).containerEl || (leaf as any).viewEl;
-        if (containerEl) {
-          containerEl.addClass("rslatte-sidebar-highlight");
-          window.setTimeout(() => {
-            containerEl.removeClass("rslatte-sidebar-highlight");
-          }, 1500);
-        }
-      }, 200); // 增加延迟时间，确保视图完全渲染
-    }
-  }
-
-  /** 激活日历视图 */
+  /** 激活日程日历侧栏（schedule-index 月历 + 选日展开） */
   async activateCalendarView(): Promise<void> {
     if (!this.app.workspace) return;
     let leaf: any = this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR)[0];
@@ -1880,29 +2204,6 @@ export default class RSLattePlugin extends Plugin {
   /** 激活联系人视图（由 createUiNavigation 提供实现，这里仅声明类型） */
   async activateContactsView(): Promise<void> {
     // 实际实现由 createUiNavigation 通过 Object.assign 混入
-  }
-
-  /** 激活未同步操作队列视图（由 createUiNavigation 提供实现，这里仅声明类型） */
-  async activateMobileOpsView(): Promise<void> {
-    // 实际实现由 createUiNavigation 通过 Object.assign 混入
-  }
-
-  /** 检查并生成月度统计（每月1号自动生成上月数据） */
-  async checkAndGenerateMonthlyStats() {
-    const now = new Date();
-    const today = now.getDate();
-    
-    // 只在每月1号检查
-    if (today !== 1) return;
-
-    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const yearMonth = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, "0")}`;
-    
-    try {
-      await this.monthlyStatsGenerator.generateForMonth(yearMonth);
-    } catch (e) {
-      console.warn("[RSLatte Stats] Failed to auto-generate monthly stats:", e);
-    }
   }
 
   /** 确保联系人面板已注册（由 createUiNavigation 提供实现，这里仅声明类型） */
@@ -2009,9 +2310,18 @@ export default class RSLattePlugin extends Plugin {
   // Today finance sync (DB as source of truth)
   // =========================
 
-  /** 获取缓存中的今日财务记录（可能为空） */
+  /** 获取缓存中的今日财务记录（可能为空）；同分类多条时返回最近一条未删除，否则最后一条 */
   getTodayFinanceRecord(categoryId: string): ApiFinanceRecord | undefined {
-    return this._todayFinancesMap.get((categoryId ?? "").trim());
+    const list = this.getTodayFinanceRecords(categoryId);
+    const active = list.filter((x) => !x.is_delete);
+    if (active.length > 0) return active[active.length - 1];
+    return list.length > 0 ? list[list.length - 1] : undefined;
+  }
+
+  /** 今日该分类下全部缓存明细（按 created_at / 原顺序排列） */
+  getTodayFinanceRecords(categoryId: string): ApiFinanceRecord[] {
+    const k = (categoryId ?? "").trim();
+    return [...(this._todayFinancesMap.get(k) ?? [])];
   }
 
 
@@ -2079,6 +2389,17 @@ export default class RSLattePlugin extends Plugin {
     const now = Date.now();
 
     if (!force && this._financeSummaryKey === todayKey && (now - this._financeSummaryFetchedAt) < minIntervalMs) {
+      return;
+    }
+
+    const vaultOk = await this.vaultSvc?.ensureVaultReadySafe?.("refreshFinanceSummaryFromApi");
+    if (!vaultOk) {
+      await this.refreshFinanceSummaryFromNotes(force, minIntervalMs);
+      return;
+    }
+    const db = await this.vaultSvc?.checkDbReadySafe?.("refreshFinanceSummaryFromApi");
+    if (!db?.ok) {
+      await this.refreshFinanceSummaryFromNotes(force, minIntervalMs);
       return;
     }
 
@@ -2150,11 +2471,22 @@ export default class RSLattePlugin extends Plugin {
       this._todayFinancesMap = new Map();
     }
 
-    this._todayFinancesMap.set(String(record.category_id), record);
+    const cat = String(record.category_id);
+    const eid = String(record.entry_id ?? "").trim();
+    let arr = [...(this._todayFinancesMap.get(cat) ?? [])];
+    if (eid) {
+      arr = arr.filter((x) => String(x.entry_id ?? "").trim() !== eid);
+    } else {
+      arr = arr.filter((x) => String(x.entry_id ?? "").trim().length > 0);
+    }
+    arr.push(record);
+    arr.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
+    this._todayFinancesMap.set(cat, arr);
     this._todayFinancesFetchedAt = Date.now();
 
     const st = this.getOrCreateTodayState();
-    st.financeDone[String(record.category_id)] = !record.is_delete;
+    const cur = this._todayFinancesMap.get(cat) ?? [];
+    st.financeDone[cat] = cur.some((x) => !x.is_delete);
   }
 
 
@@ -2236,7 +2568,7 @@ export default class RSLattePlugin extends Plugin {
           checkin_id: item.id,
           note,
           is_delete: targetIsDelete,
-          created_at: new Date().toISOString(),
+          created_at: toLocalOffsetIsoString(),
         } };
       }
 
@@ -2251,7 +2583,7 @@ export default class RSLattePlugin extends Plugin {
         checkin_id: item.id,
         note,
         is_delete: targetIsDelete,
-        created_at: new Date().toISOString(),
+        created_at: toLocalOffsetIsoString(),
       };
       this.applyTodayCheckinRecord(appliedRecord);
     }
@@ -2268,6 +2600,26 @@ export default class RSLattePlugin extends Plugin {
       });
     } catch (e) {
       console.warn("recordRSLatte upsertCheckinRecord failed", e);
+    }
+
+    // ✅ 打卡时更新连续打卡天数：昨日有记录则 +1，否则置 1（避免刷新异常时纠正为非 0 却昨日无记录的状态）
+    if (!targetIsDelete && this.recordRSLatte) {
+      try {
+        const yesterdayKey = (this as any).getYesterdayKey?.() ?? "";
+        if (/^\d{4}-\d{2}-\d{2}$/.test(yesterdayKey)) {
+          const yesterdayHad = await this.recordRSLatte.hasEffectiveCheckinRecordOnDate(item.id, yesterdayKey);
+          const newContinuous = yesterdayHad ? (Math.max(0, item.continuousDays ?? 0) + 1) : 1;
+          const list = this.settings.checkinItems ?? [];
+          const idx = list.findIndex((x) => String(x.id) === String(item.id));
+          if (idx >= 0) {
+            list[idx] = { ...list[idx], continuousDays: newContinuous };
+            await this.saveSettings();
+            await this.recordRSLatte.syncListsIndexFromSettings?.({ reason: "checkin_continuous_days" });
+          }
+        }
+      } catch (e) {
+        console.warn("update checkin continuousDays failed", e);
+      }
     }
 
     // ✅ 以索引为准回填"今日状态"（按钮是否变绿等）
@@ -2302,7 +2654,7 @@ export default class RSLattePlugin extends Plugin {
 
     // ✅ Work Event (success only)
     void this.workEventSvc?.append({
-      ts: new Date().toISOString(),
+      ts: toLocalOffsetIsoString(),
       kind: "checkin",
       action: targetIsDelete ? "delete" : "create",
       source: "ui",
@@ -2320,6 +2672,83 @@ export default class RSLattePlugin extends Plugin {
     new Notice(targetIsDelete ? "已取消打卡" : "已打卡");
   }
 
+  /**
+   * 轻量归一化连续打卡天数：昨日无记录时，若今日有打卡则置 1，否则置 0；昨日有记录则**不改动**（可能滞后）。
+   * 打卡侧栏「🔄 刷新」与今日统一刷新已改为 {@link recomputeCheckinContinuousDaysFromIndex}，避免补打卡后 streak 仍被旧值卡住。
+   */
+  async normalizeCheckinContinuousDays(): Promise<void> {
+    if (!this.recordRSLatte) return;
+    const yesterdayKey = (this as any).getYesterdayKey?.() ?? "";
+    const todayKey = (this as any).getTodayKey?.() ?? "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(yesterdayKey) || !/^\d{4}-\d{2}-\d{2}$/.test(todayKey)) return;
+    const list = this.settings.checkinItems ?? [];
+    let changed = false;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      try {
+        const hasYesterday = await this.recordRSLatte.hasEffectiveCheckinRecordOnDate(item.id, yesterdayKey);
+        if (hasYesterday) continue; // 昨日有记录，保持当前连续天数
+        const hasToday = await this.recordRSLatte.hasEffectiveCheckinRecordOnDate(item.id, todayKey);
+        const target = hasToday ? 1 : 0;
+        if ((item.continuousDays == null ? 0 : item.continuousDays) !== target) {
+          list[i] = { ...item, continuousDays: target };
+          changed = true;
+        }
+      } catch {
+        // best-effort，单条失败不阻断
+      }
+    }
+    if (changed) {
+      await this.saveSettings();
+      try {
+        await this.recordRSLatte.syncListsIndexFromSettings?.({ reason: "normalize_continuous_days" });
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  /**
+   * 根据打卡索引的完整历史重算每个打卡项的连续打卡天数（从今天起向前数连续有打卡的天数）。
+   * 用于重建索引后、或补打卡历史数据后，保证连续天数与真实记录一致。
+   */
+  async recomputeCheckinContinuousDaysFromIndex(): Promise<void> {
+    if (!this.recordRSLatte) return;
+    const todayKey = (this as any).getTodayKey?.() ?? "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(todayKey)) return;
+    const list = this.settings.checkinItems ?? [];
+    let changed = false;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      try {
+        const dates = await this.recordRSLatte.getEffectiveCheckinRecordDates(item.id);
+        const dateSet = new Set(dates);
+        let streak = 0;
+        if (dateSet.has(todayKey)) {
+          streak = 1;
+          let d = momentFn(todayKey, "YYYY-MM-DD").subtract(1, "day").format("YYYY-MM-DD");
+          while (dateSet.has(d)) {
+            streak++;
+            d = momentFn(d, "YYYY-MM-DD").subtract(1, "day").format("YYYY-MM-DD");
+          }
+        }
+        if ((item.continuousDays == null ? 0 : item.continuousDays) !== streak) {
+          list[i] = { ...item, continuousDays: streak };
+          changed = true;
+        }
+      } catch (e) {
+        console.warn("recomputeCheckinContinuousDays item failed", item.id, e);
+      }
+    }
+    if (changed) {
+      await this.saveSettings();
+      try {
+        await this.recordRSLatte.syncListsIndexFromSettings?.({ reason: "recompute_continuous_days_from_index" });
+      } catch {
+        // ignore
+      }
+    }
+  }
 
   /** ===================== Journal / Navigator façade ===================== */
 
@@ -2351,6 +2780,16 @@ export default class RSLattePlugin extends Plugin {
   private extractYamlFrontmatterBlock(text: string): string | null {
     const m = text.match(/^---\s*\n([\s\S]*?)\n---\s*(\n|$)/);
     return m ? m[1] : null;
+  }
+
+  /** 联系人入库侧栏摘要：与契约 `profile.meta_sync` 对齐，白名单扩展在此追加 */
+  private buildContactMetaSyncForDb(obj: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { schema_version: 1 };
+    const li = obj?.last_interaction_at;
+    if (li != null && String(li).trim() !== "") {
+      out.last_interaction_at = String(li).trim();
+    }
+    return out;
   }
 
   private async buildContactUpsertItemFromFile(file: TFile): Promise<ContactsUpsertItem | null> {
@@ -2386,6 +2825,7 @@ export default class RSLattePlugin extends Plugin {
         birthday: (obj?.birthday ?? null) as any,
         last_interaction_at: (obj?.last_interaction_at ?? null) as any,
         extra: (obj?.extra ?? null) as any,
+        meta_sync: this.buildContactMetaSyncForDb(obj as Record<string, unknown>),
         archived_at: (obj?.archived_at ?? null) as any,
         is_delete: Boolean(obj?.is_delete ?? false),
         created_at: (obj?.created_at ?? null) as any,
@@ -2535,7 +2975,10 @@ export default class RSLattePlugin extends Plugin {
     return r as any;
   }
 
-  /** Step X2 helper: collect contactsDir + archiveDir all C_*.md paths for DB sync (recursive). */
+  /**
+   * Step X2：列举 **contactsDir + archiveDir** 下全部 `C_*.md`（递归），供 DB upsert / `contactsSpecAtomic.buildOps`。
+   * §8.5：与 Pipeline 本地 **`rebuildAndWrite`（仅 active、不扫归档）** 范围**有意不一致**，详 `contactsSpecAtomic.ts` 文件头。
+   */
   private async listAllContactMdPathsForDbSync(): Promise<string[]> {
     const roots = [
       normalizePath((this.getContactsDir() ?? "").trim() || "90-Contacts"),
@@ -2610,6 +3053,108 @@ export default class RSLattePlugin extends Plugin {
     }
   }
 
+  /**
+   * 项目任务清单文件更新后，刷新该文件对应的联系人互动索引，并重写受影响联系人的笔记内「动态互动」块，使联系人笔记立即显示最新项目任务状态。
+   * 在 setProjectTaskStatus / setProjectTaskPhase 等修改项目任务后调用。
+   */
+  public async refreshContactInteractionsForTasklistFile(tasklistPath: string): Promise<void> {
+    const path = String(tasklistPath ?? "").trim();
+    if (!path) return;
+    try {
+      const store = this.contactsIndex?.getInteractionsStore?.();
+      if (!store || typeof (store as any).applyFileUpdates !== "function") return;
+      const { mtime, entries } = await buildProjectTaskContactEntriesForFile(this.app, path);
+      await (store as any).applyFileUpdates({ upserts: [{ source_path: path, mtime, entries }] });
+    } catch (e) {
+      console.warn("[RSLatte] refreshContactInteractionsForTasklistFile failed", path, e);
+    }
+  }
+
+  /**
+   * 针对单个任务/日记文件刷新 contacts-interactions 并更新受影响联系人的笔记动态块。
+   * 在新增任务写入日记后调用，确保新任务立即出现在联系人的「动态互动」与 contacts-interactions.json。
+   */
+  public async refreshContactInteractionsForTaskFile(taskFilePath: string): Promise<void> {
+    const path = String(taskFilePath ?? "").trim();
+    if (!path) return;
+    try {
+      const store = this.contactsIndex?.getInteractionsStore?.();
+      if (!store || typeof (store as any).applyFileUpdates !== "function") return;
+      const { mtime, entries } = await this.taskRSLatte.buildContactInteractionsForFile(path);
+      await (store as any).applyFileUpdates({ upserts: [{ source_path: path, mtime, entries }] });
+    } catch (e) {
+      console.warn("[RSLatte] refreshContactInteractionsForTaskFile failed", path, e);
+    }
+  }
+
+  /**
+   * 根据最新互动索引重写指定联系人的笔记内「动态互动」块（用于项目任务更新后立即更新联系人笔记）。
+   */
+  public async refreshContactNoteDynamicBlockForUids(uids: string[]): Promise<void> {
+    if (!uids?.length) return;
+    try {
+      const idx = await this.contactsIndex.getIndexStore().readIndex();
+      const items = (idx.items ?? []) as ContactIndexItem[];
+      const byUid = new Map<string, ContactIndexItem>();
+      for (const it of items) {
+        const uid = String(it.contact_uid ?? "").trim();
+        if (uid && !byUid.has(uid)) byUid.set(uid, it);
+      }
+      const store = this.contactsIndex?.getInteractionsStore?.();
+      if (!store || typeof (store as any).queryByContactUid !== "function") return;
+      const sAny: any = this.settings as any;
+      const cm: any = sAny?.contactsModule ?? {};
+      const sectionHeader = String(cm.eventSectionHeader ?? cm.manualEventSectionHeader ?? "## 互动记录").trim() || "## 互动记录";
+      const subHeader = String(cm.dynamicEventSubHeader ?? "### 动态互动").trim();
+      const tp = sAny.taskPanel as TaskPanelSettings;
+      for (const uid of uids) {
+        const it = byUid.get(uid);
+        if (!it?.file_path) continue;
+        const af = this.app.vault.getAbstractFileByPath(it.file_path);
+        if (!af || !(af instanceof TFile)) continue;
+        try {
+          const entries = await (store as any).queryByContactUid(uid, { limit: 20, incompleteOnly: false, sourceType: "all" }) as any[];
+          const summaryItems = (entries ?? []).map((e: any) => ({
+            statusIcon: statusIconForInteractionWithPhase(String(e.status ?? "").trim(), e.task_phase),
+            source_type: String(e.source_type ?? "").trim(),
+            snippet: String(e.snippet ?? ""),
+            source_path: String(e.source_path ?? ""),
+            line_no: typeof e.line_no === "number" ? e.line_no : Number(e.line_no ?? 0) || undefined,
+            heading: String(e.heading ?? "").trim() || undefined,
+            follow_status: e.follow_status === "following" || e.follow_status === "ended" ? e.follow_status : undefined,
+            interaction_events: Array.isArray(e.interaction_events) ? e.interaction_events : undefined,
+          }));
+          await replaceContactDynamicGeneratedBlock(this.app, af, summaryItems, { limit: 20, sectionHeader, subHeader, taskPanel: tp });
+        } catch (e) {
+          console.warn("[RSLatte] refreshContactNoteDynamicBlockForUids failed for", uid, e);
+        }
+      }
+    } catch (e) {
+      console.warn("[RSLatte] refreshContactNoteDynamicBlockForUids failed", e);
+    }
+  }
+
+  /**
+   * 按当前 contacts-interactions 主索引，重写**所有**联系人笔记中的「动态互动」块。
+   * 用于侧栏「刷新联系人」等场景：索引已与侧栏一致时，仍可能未回写 md（此前仅增量路径会写块）。
+   */
+  public async refreshAllContactNoteDynamicBlocks(): Promise<void> {
+    try {
+      const idx = await this.contactsIndex.getIndexStore().readIndex();
+      const uids = [
+        ...new Set(
+          (idx.items ?? [])
+            .map((it) => String((it as ContactIndexItem).contact_uid ?? "").trim())
+            .filter(Boolean),
+        ),
+      ];
+      if (uids.length === 0) return;
+      await this.refreshContactNoteDynamicBlockForUids(uids);
+    } catch (e) {
+      console.warn("[RSLatte] refreshAllContactNoteDynamicBlocks failed", e);
+    }
+  }
+
   // =========================
   // Contacts: cancel/restore + archive (C6)
   // =========================
@@ -2628,8 +3173,7 @@ export default class RSLattePlugin extends Plugin {
 
   private getContactsArchiveThresholdDays(): number {
     const sAny: any = this.settings as any;
-    const n = Math.floor(Number(sAny?.contactsModule?.archiveThresholdDays ?? 90));
-    return Number.isFinite(n) ? Math.max(1, n) : 90;
+    return normalizeArchiveThresholdDays(sAny?.contactsModule?.archiveThresholdDays ?? 90);
   }
 
   private isContactsAutoArchiveEnabled(): boolean {
@@ -2637,8 +3181,16 @@ export default class RSLattePlugin extends Plugin {
     return (sAny?.contactsModule?.autoArchiveEnabled ?? false) === true;
   }
 
-  /** Move eligible cancelled contacts into {contactsArchiveDir}/{group}/C_<uid>.md (and best-effort move avatar file) */
-  public async archiveContactsNow(opts?: { reason?: "manual" | "auto"; quiet?: boolean; skipDbSync?: boolean }): Promise<{ moved: number; skipped: number; movedPaths?: string[] }> {
+  /**
+   * Move eligible cancelled contacts into {contactsArchiveDir}/{group}/C_<uid>.md (and best-effort move avatar file).
+   * **§8.7**：`batchLimit` 每成功归档 N 个联系人笔记后让出主线程一次（默认不限制）。
+   */
+  public async archiveContactsNow(opts?: {
+    reason?: "manual" | "auto";
+    quiet?: boolean;
+    skipDbSync?: boolean;
+    batchLimit?: number;
+  }): Promise<{ moved: number; skipped: number; movedPaths?: string[] }> {
     const reason = opts?.reason ?? "manual";
     const quiet = opts?.quiet === true;
     const skipDbSync = opts?.skipDbSync === true;
@@ -2648,8 +3200,8 @@ export default class RSLattePlugin extends Plugin {
     const days = this.getContactsArchiveThresholdDays();
     const cutoff = (moment as any)().subtract(Math.floor(days), "days");
 
-    // Ensure index is current (best-effort)
-    try { await this.rebuildContactsIndex(); } catch {}
+    // §8.2：归档前主索引（best-effort）
+    await runContactsPreArchiveEnsureMainIndex(this);
 
     const idx = await this.contactsIndex.getIndexStore().readIndex();
     const items = (idx.items ?? []) as any[];
@@ -2657,6 +3209,7 @@ export default class RSLattePlugin extends Plugin {
     let moved = 0;
     let skipped = 0;
     const movedPaths: string[] = [];// for DB sync
+    const tArchiveMoves = performance.now();
 
     const exists = async (p: string) => {
       try { return await this.app.vault.adapter.exists(normalizePath(p)); } catch { return false; }
@@ -2795,7 +3348,7 @@ export default class RSLattePlugin extends Plugin {
 
       // Step C8: mark archived_at (best-effort) and collect for DB sync
       try {
-        const nowIso = new Date().toISOString();
+        const nowIso = toLocalOffsetIsoString();
         await this.app.fileManager.processFrontMatter(af, (fm) => {
           (fm as any).archived_at = nowIso;
           (fm as any).updated_at = nowIso;
@@ -2805,40 +3358,28 @@ export default class RSLattePlugin extends Plugin {
       movedPaths.push(af.path);
 
       moved++;
+      await yieldIfArchiveBatchBoundary({ batchLimit: opts?.batchLimit, successCount: moved });
     }
 
-    // Step C8: DB sync for moved contacts (best-effort)
-    if (!skipDbSync) {
-      try {
-      await this.tryContactsDbSyncByPaths(movedPaths, `archive:${reason}`, { quiet });
-      } catch {
-        // ignore
-      }
+    if (this.isDebugLogEnabled()) {
+      this.dbg("perf", "archiveContactsNow:move phase", {
+        moved,
+        skipped,
+        movePhaseMs: +(performance.now() - tArchiveMoves).toFixed(1),
+        batchLimit: opts?.batchLimit ?? null,
+        reason,
+      });
     }
 
-    // rebuild both indexes so UI becomes consistent
-    try { await this.rebuildContactsAllIndexes(); } catch {}
-
-    // Work events: archive summary (best-effort)
-    try {
-      if (moved > 0) {
-        await (this as any).workEventSvc?.append({
-          ts: new Date().toISOString(),
-          kind: "contact",
-          action: "archive",
-          source: reason === "auto" ? "auto" : "ui",
-          ref: {
-            moved,
-            reason,
-            archive_dir: archiveRoot,
-          },
-          summary: `🗄 归档联系人：${moved} 个（原因=${reason}）`,
-          metrics: { moved },
-        });
-      }
-    } catch {
-      // ignore
-    }
+    // §8.2：搬迁后固定顺序 — DB 同步（可选）→ 双索引重建 → WorkEvent
+    await runContactsPostPhysicalArchiveSteps(this, {
+      movedPaths,
+      moved,
+      reason,
+      quiet,
+      skipDbSync,
+      archiveRoot,
+    });
 
     if (!quiet) {
       new Notice(`Contacts 归档完成：移动${moved} 个（阈值${days} 天，原因=${reason}）`);

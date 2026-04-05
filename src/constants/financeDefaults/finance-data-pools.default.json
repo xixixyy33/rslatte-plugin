@@ -1,0 +1,598 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-03-25T08:10:34.841Z",
+  "items": [
+    {
+      "poolId": "DP_INCOME_TOTAL",
+      "poolName": "全部收入",
+      "nodes": [
+        {
+          "financeTypeId": "CW_SAL",
+          "financeTypeName": "工资",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_INCOME_FIXED_SALARY",
+      "poolName": "固定工资",
+      "nodes": [
+        {
+          "financeTypeId": "CW_SAL",
+          "financeTypeName": "工资",
+          "subCategories": ["固定工资"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_INCOME_BONUS",
+      "poolName": "绩效奖励",
+      "nodes": [
+        {
+          "financeTypeId": "CW_SAL",
+          "financeTypeName": "工资",
+          "subCategories": ["绩效奖励"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_INCOME_SIDE_JOB",
+      "poolName": "副业收入",
+      "nodes": [
+        {
+          "financeTypeId": "CW_SAL",
+          "financeTypeName": "工资",
+          "subCategories": ["副业收入"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_EXPENSE_TOTAL",
+      "poolName": "全部支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_6IEN1J",
+          "financeTypeName": "家用电器",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_TRAN",
+          "financeTypeName": "交通",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_UZGMNY",
+          "financeTypeName": "日用品",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_FOOD_TOTAL",
+      "poolName": "食物总支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_FOOD_DELIVERY",
+      "poolName": "外卖",
+      "nodes": [
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": ["外卖"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_FOOD_DINE_OUT",
+      "poolName": "外出就餐",
+      "nodes": [
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": ["外出就餐"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_FOOD_GROCERY",
+      "poolName": "食材",
+      "nodes": [
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": ["食材"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_FOOD_SNACK",
+      "poolName": "零食",
+      "nodes": [
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": ["零食"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_TRANSPORT_TOTAL",
+      "poolName": "交通总支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_TRAN",
+          "financeTypeName": "交通",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_TRANSPORT_TAXI",
+      "poolName": "打车",
+      "nodes": [
+        {
+          "financeTypeId": "CW_TRAN",
+          "financeTypeName": "交通",
+          "subCategories": ["打车"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_TRANSPORT_SUBWAY",
+      "poolName": "地铁",
+      "nodes": [
+        {
+          "financeTypeId": "CW_TRAN",
+          "financeTypeName": "交通",
+          "subCategories": ["地铁"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_DAILY_TOTAL",
+      "poolName": "日用品总支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_UZGMNY",
+          "financeTypeName": "日用品",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_DAILY_CLEANING",
+      "poolName": "清洁用品",
+      "nodes": [
+        {
+          "financeTypeId": "CW_UZGMNY",
+          "financeTypeName": "日用品",
+          "subCategories": ["清洁用品"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_DAILY_CONSUMABLE",
+      "poolName": "消耗品",
+      "nodes": [
+        {
+          "financeTypeId": "CW_UZGMNY",
+          "financeTypeName": "日用品",
+          "subCategories": ["消耗品"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_DAILY_CLOTHES",
+      "poolName": "衣服",
+      "nodes": [
+        {
+          "financeTypeId": "CW_UZGMNY",
+          "financeTypeName": "日用品",
+          "subCategories": ["衣服"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_HOBBY_TOTAL",
+      "poolName": "爱好支出总额",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_HOBBY_PUZZLE",
+      "poolName": "拼图",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": ["拼图"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_HOBBY_TV",
+      "poolName": "电视剧",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": ["电视剧"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_HOBBY_GAME",
+      "poolName": "电子游戏",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": ["电子游戏"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_HOBBY_RESEARCH",
+      "poolName": "技术研究",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": ["技术研究"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_APPLIANCE_TOTAL",
+      "poolName": "家用电器总支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_6IEN1J",
+          "financeTypeName": "家用电器",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_APPLIANCE_DAILY",
+      "poolName": "日用电器",
+      "nodes": [
+        {
+          "financeTypeId": "CW_6IEN1J",
+          "financeTypeName": "家用电器",
+          "subCategories": ["日用电器"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_APPLIANCE_KITCHEN",
+      "poolName": "厨用电器",
+      "nodes": [
+        {
+          "financeTypeId": "CW_6IEN1J",
+          "financeTypeName": "家用电器",
+          "subCategories": ["厨用电器"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_APPLIANCE_BODYCARE",
+      "poolName": "身体管理类电器",
+      "nodes": [
+        {
+          "financeTypeId": "CW_6IEN1J",
+          "financeTypeName": "家用电器",
+          "subCategories": ["身体管理类电器"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_CHILD_TOTAL",
+      "poolName": "儿童支出总额",
+      "nodes": [
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_CHILD_TOY",
+      "poolName": "玩具",
+      "nodes": [
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": ["玩具"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_CHILD_DAILY",
+      "poolName": "儿童日常消耗",
+      "nodes": [
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": ["日常消耗"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_CHILD_EDUCATION",
+      "poolName": "教育支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": ["教育支出"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_MEMBER_TOTAL",
+      "poolName": "电子会员总额",
+      "nodes": [
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_MEMBER_AI",
+      "poolName": "AI会员",
+      "nodes": [
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": ["AI"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_MEMBER_SERVICE",
+      "poolName": "服务类会员",
+      "nodes": [
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": ["服务类"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_MEMBER_MEDIA",
+      "poolName": "影视类会员",
+      "nodes": [
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": ["影视类"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_MEMBER_CARD_ANNUAL",
+      "poolName": "卡类年费",
+      "nodes": [
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": ["卡类年费"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_COFFEE_TOTAL",
+      "poolName": "咖啡总支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_COFFEE_MILK_TEA",
+      "poolName": "奶茶",
+      "nodes": [
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": ["奶茶"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_COFFEE_MILK",
+      "poolName": "牛奶",
+      "nodes": [
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": ["牛奶"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_COFFEE_COFFEE",
+      "poolName": "咖啡",
+      "nodes": [
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": ["咖啡"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_COFFEE_DESSERT",
+      "poolName": "甜点",
+      "nodes": [
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": ["甜点"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+
+    {
+      "poolId": "DP_EXPENSE_ESSENTIAL",
+      "poolName": "刚需支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_4QTHCN",
+          "financeTypeName": "食物",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_TRAN",
+          "financeTypeName": "交通",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_UZGMNY",
+          "financeTypeName": "日用品",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": ["日常消耗"],
+          "institutionNames": "ALL"
+        }
+      ]
+    },
+    {
+      "poolId": "DP_EXPENSE_FREE",
+      "poolName": "自由支出",
+      "nodes": [
+        {
+          "financeTypeId": "CW_0WZ8E8",
+          "financeTypeName": "爱好支出",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_WW71EH",
+          "financeTypeName": "电子会员",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_X8Z8OS",
+          "financeTypeName": "咖啡",
+          "subCategories": "ALL",
+          "institutionNames": "ALL"
+        },
+        {
+          "financeTypeId": "CW_O9OBRS",
+          "financeTypeName": "儿童支出",
+          "subCategories": ["玩具"],
+          "institutionNames": "ALL"
+        }
+      ]
+    }
+  ]
+}

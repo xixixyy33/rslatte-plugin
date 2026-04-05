@@ -2,57 +2,60 @@
 
 > Build Your Life with Flavor
 
-RSLatte 是 Obsidian 插件，用于管理任务、项目、输出文档、财务、打卡、联系人、备忘等，并提供数据同步、统计分析与自动归档。
+RSLatte 是面向 Obsidian 桌面端的个人管理插件，围绕「执行 + 产出 + 生活记录」构建一体化工作流：  
+任务、项目、输出、知识、财务、打卡、健康、联系人、日程、回顾、操作日志等能力统一在同一笔记库中协同运行。
 
-## 功能概览
+## 当前版本能力
 
-| 模块 | 说明 |
-|------|------|
-| 任务 | 任务追踪、状态管理、自动归档 |
-| 项目 | 项目、里程碑、任务清单 |
-| 输出 | 输出文档管理、模板创建 |
-| 发布 | 发布记录与渠道追踪 |
-| 打卡 | 日常打卡、热力图 |
-| 财务 | 收支流水、分类统计 |
-| 联系人 | 联系人信息、生日提醒 |
-| 备忘 | 备忘事项 |
-| 工作台 | 信息概览、统计分析 |
-| 同步 | 与后端数据库 / 手机端同步 |
+- **工作流入口**：工作台（Hub）、快速记录（Capture）、今天（Today）、回顾（Review）
+- **业务侧边栏**：任务、项目、输出、知识管理、日程日历、今日打卡、财务、健康、打卡、联系人、操作日志
+- **知识与输出联动**：输出发布到知识库、知识视图浏览
+- **空间与索引**：多空间、中央索引目录、刷新/重建/归档
+- **可选后端同步**：按模块控制 DB 同步（需配置 API Base URL 与 Vault ID）
 
 ## 安装
 
-1. 打开 Obsidian → 设置 → 第三方插件 → 关闭安全模式
-2. 浏览社区插件，搜索 **RSLatte** 安装；或从 [Releases](https://github.com/xixixyy33/rslatte-plugin/releases) 下载 `main.js`、`manifest.json`、`styles.css`，放入库的 `/.obsidian/plugins/rslatte-plugin/` 目录
+1. 打开 Obsidian → **设置** → **第三方插件**（按需关闭安全模式）
+2. 社区插件搜索 **RSLatte** 安装；或从 [Releases](https://github.com/xixixyy33/rslatte-plugin/releases) 下载发布文件手动安装
 3. 启用插件
 
 ## 快速开始
 
-- **中央索引目录**：默认 `95-Tasks/.rslatte`，可在设置中修改
-- **API 同步**：设置 → RSLatte → 填写 API 基础地址、Vault ID
-- **模块开关**：在设置中按需启用任务、项目、财务等模块
+1. 打开 **RSLatte 设置**，先完成 **插件初始化环境检查**
+2. 完成初始化后，按需启用模块（任务/项目/输出/财务等）
+3. 建议先执行一次 **载入 RSLatte 内置工作区布局**
+4. 从 **RSLatte 工作台** 或命令面板开始使用
 
 ## 文档
 
-- [用户手册](docs/用户手册.md) — 功能说明与使用技巧
-- [集成指南](docs/INTEGRATION_GUIDE.md) — 嵌入其他插件 / 二次开发
-- [侧边栏快捷键](docs/SIDEBAR_SHORTCUTS.md) — 命令与快捷键
+- [用户指南 / 用户手册](docs/用户指南/用户手册.md)（推荐入口）
+- [用户指南 / 特性详解索引](docs/用户指南/特性详解/README.md)
+- [侧边栏与工作流快捷方式](docs/SIDEBAR_SHORTCUTS.md)
+- [产品介绍](docs/产品介绍.md)
+- [代码地图](docs/CODE_MAP.md)
 
 ## 开发与构建
 
 ```bash
 npm install
-npm run build          # 构建插件
-npm run build:release  # 构建并同步到 plugin-release / code-release
+npm run build          # 构建 main.js
+npm run build:release  # 构建并执行 sync-release.js
 ```
+
+`build:release` 默认会同步到：
+
+- `plugin-release/rslatte-plugin`（构建产物）
+- `public-release/rslatte-plugin`（分发目录 + zip）
+- `code-release/rslatte-plugin`（源码发布目录，已按规则过滤敏感/历史方案内容）
 
 ## 环境要求
 
-- Obsidian 1.5.0+
-- 仅桌面端（`isDesktopOnly`）
+- Obsidian `1.5.0+`
+- 仅桌面端（`isDesktopOnly: true`）
 
 ## 许可证
 
-ISC
+[ISC](LICENSE)
 
 ## 作者
 

@@ -10,9 +10,9 @@ class FilePathSuggest extends AbstractInputSuggest<string> {
   private files: TFile[];
   private onSelectCb?: (path: string) => void;
 
-  constructor(app: App, inputEl: HTMLInputElement, onSelect?: (path: string) => void) {
+  constructor(app: App, inputEl: HTMLInputElement, files: TFile[], onSelect?: (path: string) => void) {
     super(app, inputEl);
-    this.files = app.vault.getMarkdownFiles();
+    this.files = files;
     this.onSelectCb = onSelect;
   }
 
@@ -46,11 +46,9 @@ class FolderPathSuggest extends AbstractInputSuggest<string> {
   private folders: string[];
   private onSelectCb?: (path: string) => void;
 
-  constructor(app: App, inputEl: HTMLInputElement, onSelect?: (path: string) => void) {
+  constructor(app: App, inputEl: HTMLInputElement, folders: string[], onSelect?: (path: string) => void) {
     super(app, inputEl);
-    this.folders = [""].concat(
-      app.vault.getAllFolders().map(f => f.path)
-    );
+    this.folders = ["", ...folders];
     this.onSelectCb = onSelect;
   }
 
@@ -84,20 +82,24 @@ export class AddOutputTemplateModal extends Modal {
   private docCategory: string = "";
   private templatePath: string = "";
   private archiveDir: string = "";
-  private tags: string = "output";
+  private outputRootRel: string = "00-Inbox";
+  private templateRootRel: string = "00-System/01-Templates";
   private type: string = "";
+  private templateScope: "general" | "project" = "general";
+  private enabledTpl: boolean = true;
+  private projectTargetRelPath: string = "";
   
   private buttonNameError: string = "";
   private docCategoryError: string = "";
   private templatePathError: string = "";
   private archiveDirError: string = "";
-  private tagsError: string = "";
   private typeError: string = "";
+  private projectTargetRelPathError: string = "";
   
   private readonly newId: string;
   private existingTypes: Set<string> = new Set();
 
-  constructor(app: App, private plugin: RSLattePlugin) {
+  constructor(app: App, private plugin: RSLattePlugin, private onSaved?: () => Promise<void>) {
     super(app);
     this.newId = this.generateId();
   }
@@ -114,9 +116,9 @@ export class AddOutputTemplateModal extends Modal {
     this.existingTypes = new Set(templates.map(t => t.type).filter(Boolean));
     
     // 设置默认存档目录
-    if (!this.archiveDir && op.archiveRoots && op.archiveRoots.length > 0) {
-      this.archiveDir = op.archiveRoots[0];
-    }
+    if (op.archiveRoots && op.archiveRoots.length > 0) this.outputRootRel = normalizePath(String(op.archiveRoots[0] ?? "").trim()) || "00-Inbox";
+    if (!this.archiveDir) this.archiveDir = "";
+    this.templateRootRel = "00-System/01-Templates";
   }
 
   private async render() {
@@ -163,7 +165,7 @@ export class AddOutputTemplateModal extends Modal {
     // 文档模板（必填，使用 Obsidian 的文件路径自动补全）
     const templateSetting = new Setting(contentEl)
       .setName("文档模板")
-      .setDesc("必填，选择已有的模板文件（.md 文件），支持自动补全");
+      .setDesc(`必填，仅允许 ${this.templateRootRel} 下的 .md 模板文件（含其子目录）`);
     
     const templateInput = templateSetting.controlEl.createEl("input", {
       type: "text",
@@ -179,8 +181,14 @@ export class AddOutputTemplateModal extends Modal {
       this.updateErrorDisplay();
     };
 
+    const templateFiles = this.app.vault
+      .getMarkdownFiles()
+      .filter((f) => {
+        const p = normalizePath(f.path);
+        return p === this.templateRootRel || p.startsWith(this.templateRootRel + "/");
+      });
     // 使用文件路径自动补全；选择时通过 onSelect 同步写入并校验
-    new FilePathSuggest(this.app, templateInput, (path) => {
+    new FilePathSuggest(this.app, templateInput, templateFiles, (path) => {
       // 规范化路径并更新输入框和状态
       const normalized = normalizePath(path.trim());
       // 去掉前导斜杠
@@ -196,7 +204,7 @@ export class AddOutputTemplateModal extends Modal {
     // 存档目录（必填，使用 Obsidian 的文件夹路径自动补全）
     const archiveSetting = new Setting(contentEl)
       .setName("存档目录")
-      .setDesc("必填，文档保存的目录路径（可以手动输入不存在的目录），支持自动补全");
+      .setDesc(`仅填写输出目录下子目录（不需要写 ${this.outputRootRel}），最终会拼接为 ${this.outputRootRel}/你填写的目录`);
     
     const archiveInput = archiveSetting.controlEl.createEl("input", {
       type: "text",
@@ -206,12 +214,21 @@ export class AddOutputTemplateModal extends Modal {
     archiveInput.value = this.archiveDir;
     archiveInput.style.width = "100%";
 
+    const folderCandidates = this.app.vault
+      .getAllFolders()
+      .map((f) => normalizePath(f.path))
+      .filter((p) => p === this.outputRootRel || p.startsWith(this.outputRootRel + "/"))
+      .map((p) => (p === this.outputRootRel ? "" : p.slice(this.outputRootRel.length + 1)));
+
     // 使用文件夹路径自动补全；选择时通过 onSelect 同步写入并校验
-    new FolderPathSuggest(this.app, archiveInput, (path) => {
+    new FolderPathSuggest(this.app, archiveInput, folderCandidates, (path) => {
       // 规范化路径并更新输入框和状态
       const normalized = normalizePath(path.trim());
-      // 去掉前导斜杠
-      const cleanPath = normalized.startsWith("/") ? normalized.substring(1) : normalized;
+      const cleanPath = normalized === this.outputRootRel
+        ? ""
+        : normalized.startsWith(this.outputRootRel + "/")
+          ? normalized.slice(this.outputRootRel.length + 1)
+          : (normalized.startsWith("/") ? normalized.substring(1) : normalized);
       archiveInput.value = cleanPath;
       this.archiveDir = cleanPath;
       this.validateArchiveDir();
@@ -219,24 +236,12 @@ export class AddOutputTemplateModal extends Modal {
     });
 
     archiveInput.addEventListener("input", () => {
-      this.archiveDir = normalizePath(archiveInput.value);
+      const raw = normalizePath(archiveInput.value);
+      const rootPrefix = `${this.outputRootRel}/`;
+      this.archiveDir = raw === this.outputRootRel ? "" : raw.startsWith(rootPrefix) ? raw.slice(rootPrefix.length) : raw;
       this.validateArchiveDir();
       this.updateErrorDisplay();
     });
-
-    // tags（必填，默认为output，可以通过","提供多个tags）
-    new Setting(contentEl)
-      .setName("tags")
-      .setDesc("必填，多个标签用逗号分隔，默认为 output（如果没有写 output，存档时会自动加上 output）")
-      .addText((text) => {
-        text.setPlaceholder("output")
-          .setValue(this.tags)
-          .onChange((v) => {
-            this.tags = (v ?? "").trim();
-            this.validateTags();
-            this.updateErrorDisplay();
-          });
-      });
 
     // type（必填，默认为空字符串，不能写清单中已经存在的type）
     new Setting(contentEl)
@@ -250,6 +255,44 @@ export class AddOutputTemplateModal extends Modal {
             this.validateType();
             this.updateErrorDisplay();
           });
+      });
+
+    new Setting(contentEl)
+      .setName("模板范围")
+      .setDesc("「一般」可出现在输出侧栏快速创建；「项目」仅能在项目侧栏创建存档文件（需在模板表中填写项目内相对路径）")
+      .addDropdown((dd) => {
+        dd.addOption("general", "一般");
+        dd.addOption("project", "项目");
+        dd.setValue(this.templateScope);
+        dd.onChange((v) => {
+          this.templateScope = v === "project" ? "project" : "general";
+          void this.render();
+        });
+      });
+
+    if (this.templateScope === "project") {
+      new Setting(contentEl)
+        .setName("项目内路径")
+        .setDesc("当模板范围为「项目」时必填，相对项目目录（后续会拼接到 pro_files 下）")
+        .addText((text) => {
+          text.setPlaceholder("例如：交付材料");
+          text.setValue(this.projectTargetRelPath);
+          text.onChange((v) => {
+            this.projectTargetRelPath = normalizePath(String(v ?? "").trim()).replace(/^\/+|\/+$/g, "");
+            this.validateProjectTargetRelPath();
+            this.updateErrorDisplay();
+          });
+        });
+    }
+
+    new Setting(contentEl)
+      .setName("启用")
+      .setDesc("关闭后不出现在任何创建入口")
+      .addToggle((tg) => {
+        tg.setValue(this.enabledTpl);
+        tg.onChange((v) => {
+          this.enabledTpl = !!v;
+        });
       });
 
     // 错误提示
@@ -277,8 +320,8 @@ export class AddOutputTemplateModal extends Modal {
         this.docCategoryError,
         this.templatePathError,
         this.archiveDirError,
-        this.tagsError,
-        this.typeError
+        this.typeError,
+        this.projectTargetRelPathError,
       ].filter(Boolean);
       
       if (allErrors.length > 0) {
@@ -288,7 +331,7 @@ export class AddOutputTemplateModal extends Modal {
       } else {
         errorEl.style.display = "none";
         const isValid = this.buttonName && this.docCategory && this.templatePath && 
-                       this.archiveDir && this.tags;
+                       this.archiveDir !== undefined;
         saveBtn.disabled = !isValid;
       }
     };
@@ -353,6 +396,11 @@ export class AddOutputTemplateModal extends Modal {
       normalized = normalized.substring(1);
     }
 
+    if (!(normalized === this.templateRootRel || normalized.startsWith(this.templateRootRel + "/"))) {
+      this.templatePathError = `模板文件必须位于 ${this.templateRootRel} 下`;
+      return false;
+    }
+
     const candidates: string[] = [normalized];
     // 如果没有 .md 扩展名，添加它
     if (!/\.md$/i.test(normalized)) {
@@ -371,26 +419,6 @@ export class AddOutputTemplateModal extends Modal {
     }
 
     if (!exists) {
-      // 如果还是找不到，尝试在所有 markdown 文件中搜索（处理路径不匹配的情况）
-      const allFiles = this.app.vault.getMarkdownFiles();
-      const searchName = normalized.split("/").pop()?.replace(/\.md$/i, "") || "";
-      if (searchName) {
-        const matched = allFiles.find(f => {
-          const fileName = f.basename.toLowerCase();
-          const pathLower = f.path.toLowerCase();
-          return fileName === searchName.toLowerCase() || 
-                 pathLower.includes(searchName.toLowerCase());
-        });
-        if (matched) {
-          exists = true;
-          foundPath = matched.path;
-          // 更新 templatePath 为实际找到的路径
-          this.templatePath = matched.path;
-        }
-      }
-    }
-
-    if (!exists) {
       this.templatePathError = "模板文件不存在，请选择已有的文件";
       return false;
     }
@@ -405,23 +433,6 @@ export class AddOutputTemplateModal extends Modal {
 
   private validateArchiveDir(): boolean {
     this.archiveDirError = "";
-    
-    if (!this.archiveDir) {
-      this.archiveDirError = "存档目录不能为空";
-      return false;
-    }
-
-    return true;
-  }
-
-  private validateTags(): boolean {
-    this.tagsError = "";
-    
-    if (!this.tags) {
-      this.tagsError = "tags 不能为空";
-      return false;
-    }
-
     return true;
   }
 
@@ -439,41 +450,47 @@ export class AddOutputTemplateModal extends Modal {
     return true;
   }
 
+  private validateProjectTargetRelPath(): boolean {
+    this.projectTargetRelPathError = "";
+    if (this.templateScope !== "project") return true;
+    if (!this.projectTargetRelPath.trim()) {
+      this.projectTargetRelPathError = "项目模板必须填写项目内路径";
+      return false;
+    }
+    return true;
+  }
+
   private validateAll(): boolean {
     const buttonNameValid = this.validateButtonName();
     const docCategoryValid = this.validateDocCategory();
     const templatePathValid = this.validateTemplatePath();
     const archiveDirValid = this.validateArchiveDir();
-    const tagsValid = this.validateTags();
     const typeValid = this.validateType();
+    const relPathValid = this.validateProjectTargetRelPath();
     
     return buttonNameValid && docCategoryValid && templatePathValid && 
-           archiveDirValid && tagsValid && typeValid;
+           archiveDirValid && typeValid && relPathValid;
   }
 
   private updateErrorDisplay: () => void = () => {};
 
   private async save() {
     try {
-      // 解析 tags（逗号分隔）
-      const tagsArray = this.tags
-        .split(/[,，]+/)
-        .map(t => t.trim())
-        .filter(Boolean);
-      
-      // 确保包含 output
-      if (!tagsArray.includes("output")) {
-        tagsArray.push("output");
-      }
+      const tagsArray = ["output"];
+      const relArchive = normalizePath(String(this.archiveDir ?? "").trim());
+      const fullArchive = relArchive ? normalizePath(`${this.outputRootRel}/${relArchive}`) : this.outputRootRel;
 
       const newTemplate: OutputTemplateDef = {
         id: this.newId,
         buttonName: this.buttonName,
         docCategory: this.docCategory,
         templatePath: normalizePath(this.templatePath),
-        archiveDir: normalizePath(this.archiveDir),
+        archiveDir: fullArchive,
         tags: tagsArray,
         type: this.type,
+        templateScope: this.templateScope,
+        enabled: this.enabledTpl,
+        projectTargetRelPath: this.templateScope === "project" ? this.projectTargetRelPath : undefined,
       };
 
       const op = this.plugin.settings.outputPanel || ({} as any);
@@ -488,6 +505,7 @@ export class AddOutputTemplateModal extends Modal {
       await this.plugin.saveSettings();
 
       new Notice(`输出文档模板"${this.buttonName}"已添加`);
+      await this.onSaved?.();
       this.close();
 
       // 刷新侧边栏

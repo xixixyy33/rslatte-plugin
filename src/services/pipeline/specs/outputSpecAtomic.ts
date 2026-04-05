@@ -11,7 +11,9 @@ import { TFile, TFolder, normalizePath } from "obsidian";
 import { readFrontmatter } from "../../../utils/frontmatter";
 import { OutputIndexStore } from "../../../outputRSLatte/indexStore";
 import { apiTry } from "../../../api";
-import { resolveSpaceIndexDir } from "../../spaceContext";
+import { resolveSpaceIndexDir } from "../../space/spaceContext";
+import { rebuildKnowledgeIndexJson } from "../../knowledgeIndexWriter";
+import { localYmdFromInstant, toLocalOffsetIsoString } from "../../../utils/localCalendarYmd";
 
 function ok<T>(data: T, warnings?: string[]): RSLatteResult<T> {
   return warnings?.length ? { ok: true, data, warnings } : { ok: true, data };
@@ -32,7 +34,7 @@ function mkNoopSummary(ctx: RSLatteAtomicOpContext, startedAt: string, message: 
     mode: ctx.mode,
     op: ctx.op === "reconcile" ? "reconcile" : "stats",
     startedAt,
-    finishedAt: new Date().toISOString(),
+    finishedAt: toLocalOffsetIsoString(),
     metrics: { noop: 1 },
     message,
     gate,
@@ -79,7 +81,7 @@ function toIsoDateTime(v: any): string | undefined {
   if (v === null || v === undefined) return undefined;
   if (typeof v === "number" && Number.isFinite(v)) {
     try {
-      return new Date(v).toISOString();
+      return toLocalOffsetIsoString(new Date(v));
     } catch {
       return undefined;
     }
@@ -88,7 +90,7 @@ function toIsoDateTime(v: any): string | undefined {
   if (!s) return undefined;
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return undefined;
-  return d.toISOString();
+  return toLocalOffsetIsoString(d);
 }
 
 async function buildOutputIndexItem(app: any, file: TFile): Promise<any | null> {
@@ -118,10 +120,14 @@ async function buildOutputIndexItem(app: any, file: TFile): Promise<any | null> 
           fm?.completed
       ) ??
       (toIsoDate(fm?.done_date ?? fm?.completed_date)
-        ? new Date(String(toIsoDate(fm?.done_date ?? fm?.completed_date)) + "T00:00:00").toISOString()
+        ? toLocalOffsetIsoString(
+            new Date(String(toIsoDate(fm?.done_date ?? fm?.completed_date)) + "T00:00:00"),
+          )
         : undefined);
 
-    const doneDate = doneTime ? toIsoDate(doneTime) : toIsoDate(fm?.done ?? fm?.done_date ?? fm?.completed ?? fm?.completed_date);
+    const doneDate = doneTime
+      ? localYmdFromInstant(doneTime) ?? toIsoDate(doneTime)
+      : toIsoDate(fm?.done ?? fm?.done_date ?? fm?.completed ?? fm?.completed_date);
 
     let cancelledTime = toIsoDateTime(
       fm?.cancelled_time ??
@@ -136,10 +142,10 @@ async function buildOutputIndexItem(app: any, file: TFile): Promise<any | null> 
 
     if (!cancelledTime && String(status) === "cancelled") {
       const ms = file.stat?.mtime;
-      if (ms && Number.isFinite(ms)) cancelledTime = new Date(ms).toISOString();
+      if (ms && Number.isFinite(ms)) cancelledTime = toLocalOffsetIsoString(new Date(ms));
     }
     if (!cancelledDate && cancelledTime) {
-      cancelledDate = toIsoDate(cancelledTime) ?? undefined;
+      cancelledDate = localYmdFromInstant(cancelledTime) ?? toIsoDate(cancelledTime) ?? undefined;
     }
 
     return {
@@ -165,10 +171,21 @@ async function buildOutputIndexItem(app: any, file: TFile): Promise<any | null> 
 }
 
 /**
- * Create Output ModuleSpecAtomic.
+ * Output ModuleSpecAtomic.
  *
- * Step P1: only rebuild path is guaranteed, and it delegates to existing output rebuild logic
- * (refreshIndexNow(full) + optional DB sync / journal write).
+ * ## §8.1 语义标签
+ *
+ * - **`rebuildActiveOnly`**：`replaceAll` → **`refreshIndexNow({ mode: "full" })`**；扩展是否遍历旧物理归档树由 **`outputPanel.fullRebuildScanLegacyArchiveDirs`** 控制（见 `outputRSLatte`）。
+ * - **`rebuildAfterPhysicalArchive`**：`archiveOutOfRange` → **`archiveOutputFilesNow`**（搬迁）后索引与台账由 **`outputRSLatte` / 管线** 后续步骤对齐（含 **`archiveIndexForArchivedFiles`** 等，与实现一致）。
+ * - **`scanFull`**：用于门控/差分的文件枚举**可能**含 `archiveRoots`、`done` 归档根、`cancelledArchiveDirs` 等，与上项 **`replaceAll` 的 I/O 范围**不必逐文件一致；以 `refreshIndexNow` 为准。
+ *
+ * ## §8.4 台账与扫描集合（单一说明入口）
+ *
+ * - **`types/outputTypes.ts` 文件头**：`archiveRoots` / `fullRebuildScanLegacyArchiveDirs` / `.history/output-ledger.json` 分工与执行顺序。
+ * - **`outputRefreshScanPlan.ts`**：`buildOutputRefreshScanPlan`、`mergeOutputPrimaryScanRoots`（与 `refreshIndexNow` 对齐）。
+ * - **《索引优化方案》§10.6**：索引归档与时间窗、台账事件类型。
+ *
+ * 登记：`PIPELINE_ATOMIC_REBUILD_SCOPE_REGISTRY.output`（`rebuildScopeSemantics.ts`）。
  */
 export function createOutputSpecAtomic(plugin: any): ModuleSpecAtomic {
 
@@ -406,7 +423,7 @@ const readSyncCounts = async (): Promise<{ pendingCount: number; failedCount: nu
       }
     },
     async applyDelta(_ctx, scan) {
-      const startedAt = new Date().toISOString();
+      const startedAt = toLocalOffsetIsoString();
       try {
         const app = plugin?.app;
         const settings = plugin?.settings;
@@ -457,7 +474,7 @@ const readSyncCounts = async (): Promise<{ pendingCount: number; failedCount: nu
 
         const next = {
           version: Number((prev as any)?.version ?? 2),
-          updatedAt: new Date().toISOString(),
+          updatedAt: toLocalOffsetIsoString(),
           items: Array.from(byPath.values()),
           cancelledArchiveDirs: Array.isArray((prev as any)?.cancelledArchiveDirs) ? (prev as any).cancelledArchiveDirs : [],
         };
@@ -517,7 +534,7 @@ const readSyncCounts = async (): Promise<{ pendingCount: number; failedCount: nu
                   if (file instanceof TFile) {
                     // append 方法会自动处理时间戳转换，直接传入 ISO 字符串即可
                     void workEventSvc.append({
-                      ts: new Date(newMtime).toISOString(), // append 方法会自动转换为本地时间
+                      ts: toLocalOffsetIsoString(new Date(newMtime)),
                       kind: "output",
                       action: "update",
                       source: "auto",
@@ -556,7 +573,7 @@ const readSyncCounts = async (): Promise<{ pendingCount: number; failedCount: nu
       }
     },
 
-    // --- rebuild scan (P2) ---
+    // --- rebuild scan (P2)：差分元数据；范围见文件头 §8.1（与 `replaceAll`→`refreshIndexNow` 可不完全一致）---
     async scanFull(ctx) {
       try {
         const app = plugin?.app;
@@ -737,9 +754,9 @@ const readSyncCounts = async (): Promise<{ pendingCount: number; failedCount: nu
     },
 
 async replaceAll(ctx, scan) {
-  const startedAt = new Date().toISOString();
+  const startedAt = toLocalOffsetIsoString();
   try {
-    // Keep legacy guard wrapper (concurrency + notice behavior)
+    // §8.1 `rebuildActiveOnly`：`refreshIndexNow(full)` + fullRebuildScanLegacyArchiveDirs
     const okRun = await plugin.runOutputManualOp?.("重建", async () => {
       await plugin.outputRSLatte?.ensureReady?.();
       await plugin.outputRSLatte?.refreshIndexNow?.({ mode: "full" });
@@ -750,6 +767,12 @@ async replaceAll(ctx, scan) {
         await (plugin as any).writeTodayOutputProgressToJournalFromIndex?.();
       } catch (e: any) {
         console.warn("[rslatte] writeTodayOutputProgressToJournalFromIndex failed in replaceAll", e);
+      }
+
+      try {
+        await rebuildKnowledgeIndexJson(plugin);
+      } catch (e: any) {
+        console.warn("[rslatte] rebuildKnowledgeIndexJson after output replaceAll failed", e);
       }
     });
 
@@ -770,9 +793,9 @@ async replaceAll(ctx, scan) {
   }
 },
 
-    // --- archive (P6) ---
+    // --- archive (P6) — §8.1 `rebuildAfterPhysicalArchive`：物理搬迁 + 索引/台账对齐（见 outputRSLatte / pipelineManager）---
     async archiveOutOfRange(ctx) {
-      const startedAt = new Date().toISOString();
+      const startedAt = toLocalOffsetIsoString();
       try {
         const enabled = typeof plugin?.isPipelineModuleEnabled === "function" ? plugin.isPipelineModuleEnabled("output") !== false : true;
         const uiAny: any = (plugin?.settings as any)?.uiHeaderButtons ?? {};
@@ -950,7 +973,7 @@ async getReconcileGate(ctx) {
 },
 
     async reconcile(ctx, _input) {
-      const startedAt = new Date().toISOString();
+      const startedAt = toLocalOffsetIsoString();
       try {
         const gateR = await (this as any).getReconcileGate(ctx);
         const gate = gateR?.ok ? gateR.data : ({ dbSyncEnabled: false } as any);
@@ -1001,7 +1024,7 @@ async getReconcileGate(ctx) {
           mode: ctx.mode,
           op: "reconcile",
           startedAt,
-          finishedAt: new Date().toISOString(),
+          finishedAt: toLocalOffsetIsoString(),
           metrics: {
             keep_paths: Number(resp?.keep_paths ?? 0),
             marked_deleted: Number(resp?.marked_deleted ?? 0),

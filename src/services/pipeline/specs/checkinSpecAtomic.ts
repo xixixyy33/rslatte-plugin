@@ -17,7 +17,7 @@ function fail(code: string, message: string, detail?: unknown): RSLatteResult<ne
   return { ok: false, error };
 }
 
-const CHECKIN_MODULES = { checkin: true, finance: false } as const;
+const CHECKIN_MODULES = { checkin: true, finance: false, health: false } as const;
 
 function legacyCtxFromAtomic(ctx: RSLatteAtomicOpContext, op: any) {
   return {
@@ -131,7 +131,11 @@ export function createCheckinSpecAtomic(plugin: any): ModuleSpecAtomic {
     async scanFull(_ctx) {
       try {
         await plugin?.recordRSLatte?.ensureReady?.();
-        const scan: any = await plugin?.recordRSLatte?.scanFullFromDiaryRange?.({ reconcileMissingDays: false, modules: CHECKIN_MODULES });
+        const scan: any = await plugin?.recordRSLatte?.scanFullFromDiaryRange?.({
+          reconcileMissingDays: true,
+          modules: CHECKIN_MODULES,
+          scanAllDiaryDates: _ctx?.mode === "rebuild",
+        });
         return ok(scan ?? { empty: true, modules: CHECKIN_MODULES, kind: "full" });
       } catch (e: any) {
         return fail("CHECKIN_SCAN_FULL_FAILED", "Checkin scanFull failed", { message: e?.message ?? String(e) });
@@ -353,12 +357,12 @@ export function createCheckinSpecAtomic(plugin: any): ModuleSpecAtomic {
           } catch (e: any) {
             // ✅ 如果增量扫描失败，仍然进行全量重建（保守策略）
             console.warn(`[RSLatte][checkin][reconcile] Incremental scan failed, falling back to full rebuild:`, e);
-            r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, CHECKIN_MODULES);
+            r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, CHECKIN_MODULES, true);
           }
         } else {
           // ✅ rebuild 模式：直接进行全量重建
           await plugin?.recordRSLatte?.ensureReady?.();
-          r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, CHECKIN_MODULES);
+          r = await plugin?.recordRSLatte?.rebuildIndexFromDiaryRange?.(true, true, CHECKIN_MODULES, true);
         }
         
         // ✅ 调用后端 reconcile API 校准数据库中的记录（只有在需要时才调用）

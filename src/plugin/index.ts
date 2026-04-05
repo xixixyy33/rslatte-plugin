@@ -12,8 +12,9 @@ import { createCore } from "./core";
 import { createJournalWriter } from "./journalWriter";
 import { createOutputManager } from "./outputManager";
 import { createRecordSync } from "./recordSync";
+import { createKnowledgeSync } from "./knowledgeSync";
+import { createWorkEventDbSync } from "./workEventDbSync";
 import { createPipelineManager } from "./pipelineManager";
-import { createMobileSync } from "./mobileSync";
 
 /**
  * 将所有模块混入到主插件类
@@ -40,7 +41,8 @@ export function createAllModules(plugin: RSLattePlugin) {
     ...createJournalWriter(plugin),
     ...createOutputManager(plugin),
     ...createRecordSync(plugin),
+    ...createKnowledgeSync(plugin),
+    ...createWorkEventDbSync(plugin),
     ...createPipelineManager(plugin),
-    ...createMobileSync(plugin),
   };
 }

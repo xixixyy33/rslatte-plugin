@@ -11,10 +11,18 @@ import { TFile, TFolder, normalizePath } from "obsidian";
 import { readFrontmatter } from "../../../utils/frontmatter";
 import { ProjectIndexStore } from "../../../projectRSLatte/indexStore";
 import { apiTry } from "../../../api";
-import { extractContactUidFromWikiTarget, parseContactRefsFromMarkdown } from "../../contacts/contactRefParser";
-import { getNearestHeadingTitle } from "../../markdown/headingLocator";
+import { buildProjectTaskContactEntriesFromMarkdownContent } from "../../contacts/projectTaskContactInteractions";
 import type { ContactsInteractionEntry } from "../../../contactsRSLatte/types";
-import { resolveSpaceIndexDir, resolveSpaceQueueDir } from "../../spaceContext";
+import { resolveSpaceIndexDir, resolveSpaceQueueDir } from "../../space/spaceContext";
+
+/**
+ * ## §8.1 语义标签
+ *
+ * - **`rebuildActiveOnly`**：`replaceAll` → `projectMgr.refreshAll`：只枚举 **`projectRootDir`** 下直接子文件夹，**排除** **`projectArchiveDir`**（与 `scanFull` 差分逻辑一致）。
+ * - **`rebuildAfterPhysicalArchive`**：`archiveOutOfRange` → `archiveDoneAndCancelledNow`：搬迁项目夹后 **`archiveIndexNow`**（`archiveProjectIndexByMonths`）。
+ *
+ * 登记：`PIPELINE_ATOMIC_REBUILD_SCOPE_REGISTRY.project`（`rebuildScopeSemantics.ts`）。
+ */
 
 function ok<T>(data: T, warnings?: string[]): RSLatteResult<T> {
   return warnings?.length ? { ok: true, data, warnings } : { ok: true, data };
@@ -45,10 +53,8 @@ function mkNoopSummary(ctx: RSLatteAtomicOpContext, startedAt: string, message: 
 /**
  * Create Project ModuleSpecAtomic.
  *
- * Thin adapter rules (Step P1):
- * - rebuild: call existing plugin.projectMgr.manualRefreshAndSync() + writeTodayProjectProgressToJournal()
- * - other atomic ops: no-op placeholders (Step P1 does not migrate incremental/archive)
- * - getReconcileGate: reflect module enable + dbSync setting; engine will run buildOps/flushQueue when enabled
+ * - **rebuild**：`manualRefreshAndSync` + `writeTodayProjectProgressToJournal`（见 `replaceAll` 内链）。
+ * - **§8.1**：见文件头 `rebuildActiveOnly` / `rebuildAfterPhysicalArchive`。
  */
 export function createProjectSpecAtomic(plugin: any): ModuleSpecAtomic {
 
@@ -415,6 +421,7 @@ try {
       analysis_file_path: p?.analysisFilePath,
       milestones: (p?.milestones ?? []).map((m: any) => ({
         name: m?.name,
+        path: String(m?.path ?? m?.name ?? "").trim() || undefined,
         done: m?.done,
         todo: m?.todo,
         inprogress: m?.inprogress,
@@ -425,6 +432,8 @@ try {
       db_synced_at: (p as any)?.dbSyncedAt,
       db_last_error: (p as any)?.dbLastError,
       db_pending_ops: (p as any)?.dbPendingOps,
+      project_tags: Array.isArray(p?.project_tags) ? [...p.project_tags] : undefined,
+      project_status_display_zh: String(p?.project_status_display_zh ?? "").trim() || undefined,
       updated_at: new Date().toISOString(),
     });
 
@@ -506,19 +515,6 @@ try {
     const nowIso = new Date().toISOString();
     const byFile: Record<string, { mtime: number; entries: ContactsInteractionEntry[] }> = {};
 
-    const isTaskLine = (lineText: string): boolean => /^\s*[-*+]\s+\[[^\]]\]/.test(String(lineText ?? ""));
-
-    const mapStatusFromTaskLine = (lineText: string): any => {
-      const m = String(lineText ?? "").match(/^\s*[-*+]\s+\[([^\]])\]/);
-      if (!m) return "unknown";
-      const c = String(m[1] ?? "");
-      if (c === "x" || c === "X") return "done";
-      if (c === " ") return "todo";
-      if (c === "-" || c === "/" || c === ">") return "in_progress";
-      if (c === "c" || c === "C") return "cancelled";
-      return "unknown";
-    };
-
     for (const p of projects) {
       const folder = normalizePath(String(p?.folderPath ?? p?.folder_path ?? "").trim());
       if (!folder || !folderSet.has(folder)) continue;
@@ -529,76 +525,7 @@ try {
       if (!(af instanceof TFile)) continue;
 
       const content = await app2.vault.cachedRead(af);
-      const contentLines = String(content ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-
-      const allRefs = parseContactRefsFromMarkdown(content, {
-        source_path: tasklistPath,
-        source_type: "project_task",
-        updated_at: nowIso,
-      });
-
-      const byLine = new Map<number, ContactsInteractionEntry[]>();
-      for (const e of allRefs) {
-        const ln = Number((e as any)?.line_no ?? 0);
-        if (!ln) continue;
-        const arr = byLine.get(ln) ?? [];
-        arr.push(e as any);
-        byLine.set(ln, arr);
-      }
-
-      const out: ContactsInteractionEntry[] = [];
-      for (const [ln1, refs0] of byLine.entries()) {
-        const ln0 = ln1 - 1;
-        if (ln0 < 0 || ln0 >= contentLines.length) continue;
-        const lineText = String(contentLines[ln0] ?? "");
-        if (!isTaskLine(lineText)) continue;
-
-        const refs = (refs0 ?? []).slice();
-
-        // Extra-robust:补齐同一项目任务行中多联系人引用（避免只命中一个联系人）。
-        try {
-          const re = /\[\[([^\]]+)\]\]/g;
-          const found = new Set<string>();
-          let m: RegExpExecArray | null;
-          while ((m = re.exec(lineText)) !== null) {
-            const inside = String(m[1] ?? "");
-            const target = (inside.split("|")[0] ?? "").trim();
-            const uid = extractContactUidFromWikiTarget(target);
-            if (uid) found.add(uid);
-          }
-          if (found.size > 0) {
-            const existing = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
-            const heading = getNearestHeadingTitle(contentLines, ln0);
-            const snippet = String(lineText ?? "").trimEnd().slice(0, 240);
-            for (const uid of found) {
-              if (!uid || existing.has(uid)) continue;
-              refs.push({
-                contact_uid: uid,
-                source_path: tasklistPath,
-                source_type: "project_task",
-                snippet,
-                line_no: ln1,
-                heading,
-                updated_at: nowIso,
-                key: `${uid}|${tasklistPath}|project_task|${ln1}`,
-              } as any);
-            }
-          }
-        } catch {
-          // ignore
-        }
-
-        if (!refs || refs.length == 0) continue;
-        const status = mapStatusFromTaskLine(lineText);
-        for (const r of refs) {
-          out.push({
-            ...(r as any),
-            status,
-            updated_at: nowIso,
-          } as any);
-        }
-      }
-
+      const out = buildProjectTaskContactEntriesFromMarkdownContent(content, tasklistPath, nowIso);
       byFile[tasklistPath] = { mtime: Number((af.stat as any)?.mtime ?? 0), entries: out };
     }
 
@@ -628,6 +555,8 @@ try {
   // never block project pipeline
 }
 
+// 与曾用 legacy incrementalRefresh 一致：Pipeline 增量应用后 best-effort 写今日项目进度日记（内部有变化检测）
+await (plugin as any).writeTodayProjectProgressToJournal?.();
 
 if (ctx?.runId) deltaByRunId.set(String(ctx.runId), { addedIds, updatedIds, removedIds });
 
@@ -649,7 +578,7 @@ return ok({
       }
     },
 
-    // --- rebuild scan (P2) ---
+    // --- rebuild scan (P2) — 差分元数据；枚举范围与 §8.1 `rebuildActiveOnly` 一致（跳过 projectArchiveDir）---
     async scanFull(ctx) {
       try {
         const app = plugin?.app;
@@ -809,7 +738,7 @@ async replaceAll(ctx, scan) {
   try {
     await plugin.projectMgr?.ensureReady?.();
 
-    // P4: rebuild index should only update index here; DB sync moved to buildOps/flushQueue.
+    // §8.1 `rebuildActiveOnly`：`refreshAll` 不扫 projectArchiveDir。P4：DB sync 在 buildOps/flushQueue。
     await plugin.projectMgr?.refreshAll?.({ reason: ctx?.reason || "engine_replaceAll", forceSync: false });
 
     // Cancel debounce persistence to avoid implicit enqueue/flush.
@@ -844,6 +773,7 @@ async replaceAll(ctx, scan) {
           analysis_file_path: p?.analysisFilePath,
           milestones: (p?.milestones ?? []).map((m: any) => ({
             name: m?.name,
+            path: String(m?.path ?? m?.name ?? "").trim() || undefined,
             done: m?.done,
             todo: m?.todo,
             inprogress: m?.inprogress,
@@ -854,6 +784,8 @@ async replaceAll(ctx, scan) {
           db_synced_at: (p as any)?.dbSyncedAt,
           db_last_error: (p as any)?.dbLastError,
           db_pending_ops: (p as any)?.dbPendingOps,
+          project_tags: Array.isArray(p?.project_tags) ? [...p.project_tags] : undefined,
+          project_status_display_zh: String(p?.project_status_display_zh ?? "").trim() || undefined,
           updated_at: new Date().toISOString(),
         });
         const items = projects.map(toRSLatteItem).filter((x: any) => String(x.project_id ?? '').trim());
@@ -873,19 +805,6 @@ async replaceAll(ctx, scan) {
         const nowIso = new Date().toISOString();
         const byFile: Record<string, { mtime: number; entries: ContactsInteractionEntry[] }> = {};
 
-        const isTaskLine = (lineText: string): boolean => /^\s*[-*+]\s+\[[^\]]\]/.test(String(lineText ?? ""));
-
-        const mapStatusFromTaskLine = (lineText: string): any => {
-          const m = String(lineText ?? "").match(/^\s*[-*+]\s+\[([^\]])\]/);
-          if (!m) return "unknown";
-          const c = String(m[1] ?? "");
-          if (c === "x" || c === "X") return "done";
-          if (c === " ") return "todo";
-          if (c === "-" || c === "/" || c === ">") return "in_progress";
-          if (c === "c" || c === "C") return "cancelled";
-          return "unknown";
-        };
-
         for (const p of projects) {
           const tasklistPath = normalizePath(String(p?.tasklistFilePath ?? p?.tasklist_file_path ?? "").trim());
           if (!tasklistPath) continue;
@@ -893,75 +812,7 @@ async replaceAll(ctx, scan) {
           if (!(af instanceof TFile)) continue;
 
           const content = await app2.vault.cachedRead(af);
-          const contentLines = String(content ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-          const allRefs = parseContactRefsFromMarkdown(content, {
-            source_path: tasklistPath,
-            source_type: "project_task",
-            updated_at: nowIso,
-          });
-
-          const byLine = new Map<number, ContactsInteractionEntry[]>();
-          for (const e of allRefs) {
-            const ln = Number((e as any)?.line_no ?? 0);
-            if (!ln) continue;
-            const arr = byLine.get(ln) ?? [];
-            arr.push(e as any);
-            byLine.set(ln, arr);
-          }
-
-          const out: ContactsInteractionEntry[] = [];
-          for (const [ln1, refs0] of byLine.entries()) {
-            const ln0 = ln1 - 1;
-            if (ln0 < 0 || ln0 >= contentLines.length) continue;
-            const lineText = String(contentLines[ln0] ?? "");
-            if (!isTaskLine(lineText)) continue;
-
-            const refs = (refs0 ?? []).slice();
-
-            // Extra-robust:补齐同一项目任务行中多联系人引用（避免只命中一个联系人）。
-            try {
-              const re = /\[\[([^\]]+)\]\]/g;
-              const found = new Set<string>();
-              let m: RegExpExecArray | null;
-              while ((m = re.exec(lineText)) !== null) {
-                const inside = String(m[1] ?? "");
-                const target = (inside.split("|")[0] ?? "").trim();
-                const uid = extractContactUidFromWikiTarget(target);
-                if (uid) found.add(uid);
-              }
-              if (found.size > 0) {
-                const existing = new Set(refs.map((x) => String((x as any)?.contact_uid ?? "").trim()).filter(Boolean));
-                const heading = getNearestHeadingTitle(contentLines, ln0);
-                const snippet = String(lineText ?? "").trimEnd().slice(0, 240);
-                for (const uid of found) {
-                  if (!uid || existing.has(uid)) continue;
-                  refs.push({
-                    contact_uid: uid,
-                    source_path: tasklistPath,
-                    source_type: "project_task",
-                    snippet,
-                    line_no: ln1,
-                    heading,
-                    updated_at: nowIso,
-                    key: `${uid}|${tasklistPath}|project_task|${ln1}`,
-                  } as any);
-                }
-              }
-            } catch {
-              // ignore
-            }
-
-            if (!refs || refs.length === 0) continue;
-            const status = mapStatusFromTaskLine(lineText);
-            for (const r of refs) {
-              out.push({
-                ...(r as any),
-                status,
-                updated_at: nowIso,
-              } as any);
-            }
-          }
-
+          const out = buildProjectTaskContactEntriesFromMarkdownContent(content, tasklistPath, nowIso);
           byFile[tasklistPath] = { mtime: Number((af.stat as any)?.mtime ?? 0), entries: out };
         }
 
@@ -997,7 +848,7 @@ return ok({ startedAt, applied: { addedIds, updatedIds, removedIds } });
   }
 },
 
-    // --- archive (P6) ---
+    // --- archive (P6) — §8.1 `rebuildAfterPhysicalArchive`：`archiveDoneAndCancelledNow` 内搬迁 + `archiveIndexNow` ---
     async archiveOutOfRange(ctx) {
       const startedAt = new Date().toISOString();
       try {

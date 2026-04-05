@@ -1,7 +1,10 @@
 import { App, TFile, TFolder, normalizePath, parseYaml } from "obsidian";
 import type { ContactsIndexFile, ContactIndexItem } from "./types";
-import { ContactsIndexStore, ContactsInteractionsStore } from "./indexStore";
+import { ContactsIndexStore, ContactsInteractionsStore, type ContactsInteractionsContext } from "./indexStore";
 import { computeSortname, ensureSortnameInFrontmatter } from "./sortname";
+import { syncAllContactsInteractionReplicasFromStore } from "../services/contacts/contactsInteractionReplica";
+import { computeLastInteractionAtForContactIndex } from "../services/contacts/contactInteractionDisplay";
+import type { TaskPanelSettings } from "../types/taskTypes";
 
 function nowIso() {
   return new Date().toISOString();
@@ -54,14 +57,33 @@ export class ContactsIndexService {
   private centralIndexDirRef: () => string;
   private store: ContactsIndexStore;
   private interactionsStore: ContactsInteractionsStore;
+  /** §6.9：主索引裁剪上限、归档分片大小；由插件注入当前 settings */
+  private interactionsCtxRef?: () => Omit<ContactsInteractionsContext, "contactsDir"> | null;
+  /** 任务面板设置：`last_interaction_at` 落盘时与「最后互动」同一时区理解 */
+  private taskPanelRef?: () => TaskPanelSettings | null | undefined;
 
-  constructor(app: App, contactsDirRef: () => string, archiveDirRef: () => string, centralIndexDirRef: () => string) {
+  constructor(
+    app: App,
+    contactsDirRef: () => string,
+    archiveDirRef: () => string,
+    centralIndexDirRef: () => string,
+    interactionsCtxRef?: () => Omit<ContactsInteractionsContext, "contactsDir"> | null,
+    taskPanelRef?: () => TaskPanelSettings | null | undefined
+  ) {
     this.app = app;
     this.contactsDirRef = contactsDirRef;
     this.archiveDirRef = archiveDirRef;
     this.centralIndexDirRef = centralIndexDirRef;
+    this.interactionsCtxRef = interactionsCtxRef;
+    this.taskPanelRef = taskPanelRef;
     this.store = new ContactsIndexStore(app, centralIndexDirRef);
-    this.interactionsStore = new ContactsInteractionsStore(app, centralIndexDirRef);
+    this.interactionsStore = new ContactsInteractionsStore(app, centralIndexDirRef, () => {
+      const o = this.interactionsCtxRef?.();
+      if (!o) return null;
+      const root = normalizePath((this.contactsDirRef() ?? "").trim() || "90-Contacts");
+      const ctx: ContactsInteractionsContext = { contactsDir: root, ...o };
+      return ctx;
+    });
   }
 
   public getIndexStore(): ContactsIndexStore {
@@ -187,6 +209,22 @@ export class ContactsIndexService {
       }
     }
 
+    // 与侧栏「最后互动」同一时刻；落盘用任务基准时区下的可读偏移串（§6.7.1）
+    try {
+      await this.ensureInteractionsIndexReady();
+      const interIdx = await this.interactionsStore.readIndex();
+      const byUid = interIdx.by_contact_uid ?? {};
+      const tp = this.taskPanelRef?.() ?? undefined;
+      for (const item of items) {
+        const uid = String(item.contact_uid ?? "").trim();
+        if (!uid) continue;
+        const disp = computeLastInteractionAtForContactIndex(byUid[uid] ?? [], tp ?? undefined);
+        if (disp) item.last_interaction_at = disp;
+      }
+    } catch {
+      // ignore：无互动索引时不阻塞联系人主索引重建
+    }
+
     const index: ContactsIndexFile = {
       version: 1,
       updatedAt: nowIso(),
@@ -197,12 +235,58 @@ export class ContactsIndexService {
     return { index, parseErrorFiles };
   }
 
+  /**
+   * 按当前 `contacts-interactions.json` 回写主索引中若干联系人的 `last_interaction_at`（与 `computeDisplayLastAtFromEntries` 一致）。
+   */
+  public async syncLastInteractionAtForContactUids(uids: string[]): Promise<void> {
+    const set = new Set((uids ?? []).map((u) => String(u ?? "").trim()).filter(Boolean));
+    if (set.size === 0) return;
+    try {
+      await this.ensureInteractionsIndexReady();
+      const [mainIdx, interIdx] = await Promise.all([this.store.readIndex(), this.interactionsStore.readIndex()]);
+      let changed = false;
+      const byUid = interIdx.by_contact_uid ?? {};
+      const tp = this.taskPanelRef?.() ?? undefined;
+      for (const item of mainIdx.items ?? []) {
+        const uid = String(item.contact_uid ?? "").trim();
+        if (!set.has(uid)) continue;
+        const disp = computeLastInteractionAtForContactIndex(byUid[uid] ?? [], tp ?? undefined);
+        const next = disp ?? item.last_interaction_at ?? null;
+        const prev = item.last_interaction_at ?? null;
+        if (String(prev ?? "") !== String(next ?? "")) {
+          item.last_interaction_at = next;
+          changed = true;
+        }
+      }
+      if (changed) {
+        mainIdx.updatedAt = nowIso();
+        await this.store.writeIndex(mainIdx);
+      }
+    } catch (e) {
+      console.warn("[RSLatte][contacts] syncLastInteractionAtForContactUids failed", e);
+    }
+  }
+
   public async rebuildAndWrite(): Promise<{ indexPath: string; count: number; parseErrorFiles: string[]; scannedFiles?: string[] }> {
     const files = this.listContactFiles({ includeArchived: false, archivedOnly: false });
     const scannedFiles = files.map(f => f.path);
     const { index, parseErrorFiles } = await this.rebuild({ includeArchived: false, archivedOnly: false });
     await this.store.writeIndex(index);
+    await this.syncInteractionReplicasFromInteractionsIndexBestEffort();
     return { indexPath: this.store.getIndexFilePath(), count: index.items.length, parseErrorFiles, scannedFiles };
+  }
+
+  /**
+   * 根据当前 `contacts-interactions.json` 重写 `{contactsDir}/.contacts/<uid>.json`（与主索引对齐）。
+   * 在联系人列表重建（`rebuildAndWrite`）后调用，补录此前仅存在于主索引、未触发「记互动」写入的副本。
+   */
+  public async syncInteractionReplicasFromInteractionsIndexBestEffort(): Promise<void> {
+    await this.ensureInteractionsIndexReady();
+    const root = normalizePath((this.contactsDirRef() ?? "").trim() || "90-Contacts");
+    await syncAllContactsInteractionReplicasFromStore(this.app, {
+      contactsDir: root,
+      getInteractionsStore: () => this.interactionsStore,
+    });
   }
 
   /** C6: rebuild archive contacts index (scan archiveDir) */

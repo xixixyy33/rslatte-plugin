@@ -6,11 +6,42 @@ import { moment } from "obsidian";
 // ✅ moment 从 Obsidian 导入，但 TypeScript 类型定义可能不完整，使用类型断言
 const momentFn = moment as any;
 import type RSLattePlugin from "../main";
+import { normalizeArchiveThresholdDays } from "../constants/defaults";
 import { fnv1a32 } from "../utils/hash";
 import type { ApiCheckinRecord, ApiFinanceRecord } from "../api";
 
 // DbSyncModuleKey 类型定义（与 main.ts 中的定义保持一致）
-type DbSyncModuleKey = "record" | "checkin" | "finance" | "task" | "memo" | "output" | "project" | "contacts";
+type DbSyncModuleKey = "record" | "checkin" | "finance" | "health" | "task" | "memo" | "output" | "project" | "contacts";
+
+/** 打卡类型侧栏扩展 → `checkin_type.meta_sync` */
+function buildCheckinTypeMetaSyncForDb(x: {
+  checkinDifficulty?: string;
+  heatColor?: string;
+}): Record<string, unknown> | undefined {
+  const difficulty = String(x?.checkinDifficulty ?? "").trim();
+  const heat = String(x?.heatColor ?? "").trim();
+  if (!difficulty && !heat) return undefined;
+  const out: Record<string, unknown> = { schema_version: 1 };
+  if (difficulty) out.checkin_difficulty = difficulty;
+  if (heat) out.heat_color = heat;
+  return out;
+}
+
+function resolveCheckinContinuousDays(plugin: RSLattePlugin, checkinId: string): number | undefined {
+  const items = (plugin.settings?.checkinItems ?? []) as any[];
+  const x = items.find((c: any) => String(c?.id ?? "") === String(checkinId));
+  const d = x?.continuousDays;
+  return typeof d === "number" && Number.isFinite(d) ? Math.max(0, Math.floor(d)) : undefined;
+}
+
+/** 当日连续天数等 → `checkin_records.meta_sync`（与 settings.checkinItems 对齐） */
+function buildCheckinRecordMetaSyncForDb(plugin: RSLattePlugin, it: { checkinId?: string }): Record<string, unknown> | undefined {
+  const cid = String(it?.checkinId ?? "").trim();
+  if (!cid) return undefined;
+  const days = resolveCheckinContinuousDays(plugin, cid);
+  if (days === undefined) return undefined;
+  return { schema_version: 1, continuous_days: days };
+}
 
 export function createRecordSync(plugin: RSLattePlugin) {
   // 私有字段的访问需要通过类型断言
@@ -30,7 +61,7 @@ export function createRecordSync(plugin: RSLattePlugin) {
   const setTodayFinancesFetchedAt = (at: number) => { (plugin as any)._todayFinancesFetchedAt = at; };
   // 未使用的 getter，保留以备将来使用
   // const getTodayFinancesMap = () => (plugin as any)._todayFinancesMap;
-  const setTodayFinancesMap = (map: Map<string, ApiFinanceRecord>) => { (plugin as any)._todayFinancesMap = map; };
+  const setTodayFinancesMap = (map: Map<string, ApiFinanceRecord[]>) => { (plugin as any)._todayFinancesMap = map; };
   const getSerializeErrorForAudit = () => (plugin as any)._serializeErrorForAudit;
 
   return {
@@ -65,19 +96,31 @@ export function createRecordSync(plugin: RSLattePlugin) {
       const db = await (plugin as any).vaultSvc?.checkDbReadySafe?.("autoSyncRecordListsToDb");
       if (!db.ok) return;
 
-      const ck = doCheckin ? (plugin.settings.checkinItems ?? []).map((x) => ({
-        checkin_id: x.id,
-        checkin_name: x.name,
-        status: !!x.active,
-      })) : [];
+      const ck = doCheckin
+        ? (plugin.settings.checkinItems ?? []).map((x) => {
+            const base: any = {
+              checkin_id: x.id,
+              checkin_name: x.name,
+              status: !!x.active,
+            };
+            const ms = buildCheckinTypeMetaSyncForDb(x as any);
+            if (ms) base.meta_sync = ms;
+            return base;
+          })
+        : [];
 
-      const fin = doFinance ? (plugin.settings.financeCategories ?? []).map((x) => ({
-        category_id: x.id,
-        category_name: x.name,
-        category_type: x.type,
-        status: !!x.active,
-        sub_categories: x.subCategories || [], // ✅ 同步子分类列表
-      })) : [];
+      const fin = doFinance
+        ? (plugin.settings.financeCategories ?? []).map((x) => ({
+            category_id: x.id,
+            category_name: x.name,
+            category_type: x.type,
+            status: !!x.active,
+            sub_categories: x.subCategories || [],
+            institution_names: (Array.isArray((x as any).institutionNames) ? (x as any).institutionNames : [])
+              .map((s: string) => String(s ?? "").trim())
+              .filter(Boolean),
+          }))
+        : [];
 
       try {
         // ✅ 自动刷新：静默重试（不弹 Notice），失败则下次 tick 继续尝试
@@ -101,14 +144,17 @@ export function createRecordSync(plugin: RSLattePlugin) {
      * - 自动 tick：只同步阈值范围内（避免全量打爆后端）
      * - 手动触发（刷新/重建后）：同步"当前活跃索引"全量，用于补偿此前失败条目
      */
-    async autoSyncRecordIndexToDb(opts?: { reason?: string; modules?: { checkin?: boolean; finance?: boolean } }): Promise<void> {
-      const mods = opts?.modules ?? { checkin: true, finance: true };
-      const wantCheckin = mods.checkin !== false;
-      const wantFinance = mods.finance !== false;
+    async autoSyncRecordIndexToDb(opts?: { reason?: string; modules?: { checkin?: boolean; finance?: boolean; health?: boolean } }): Promise<void> {
+      const mods = opts?.modules;
+      const fullDefault = mods == null;
+      const wantCheckin = fullDefault ? true : mods!.checkin === true;
+      const wantFinance = fullDefault ? true : mods!.finance === true;
+      const wantHealth = fullDefault ? true : mods!.health === true;
 
       const doCheckin = wantCheckin && plugin.isCheckinDbSyncEnabled();
       const doFinance = wantFinance && plugin.isFinanceDbSyncEnabled();
-      if (!doCheckin && !doFinance) return;
+      const doHealth = wantHealth && plugin.isHealthDbSyncEnabled();
+      if (!doCheckin && !doFinance && !doHealth) return;
 
       // ✅ C0：先做 vaultReadySafe（内部会判断 shouldTouchBackendNow）；不满足条件/失败则直接返回
       const vaultOk = await (plugin as any).vaultSvc?.ensureVaultReadySafe?.("autoSyncRecordIndexToDb");
@@ -131,14 +177,14 @@ export function createRecordSync(plugin: RSLattePlugin) {
       const isAutoTick = /auto|timer|interval/i.test(reason);
 
       const todayKey = plugin.getTodayKey();
-      const days = Math.max(1, Number((plugin.settings as any).rslattePanelArchiveThresholdDays ?? 90));
+      const days = normalizeArchiveThresholdDays((plugin.settings as any).rslattePanelArchiveThresholdDays ?? 90);
       const cutoff = momentFn(todayKey).subtract(days, "days").format("YYYY-MM-DD");
 
       // ✅ rebuild 模式：先确保清单已入库（即使内容未变化，也强制推一次）
       if (forceFullUpsert) {
         try {
           setLastListsSyncKey("");
-          await (plugin as any).syncRecordListsToDb?.(mods);
+          await (plugin as any).syncRecordListsToDb?.(mods ?? { checkin: true, finance: true });
         } catch (e) {
           console.warn("RSLatte autoSyncRecordIndexToDb: force sync lists failed", e);
           // 不阻断后续记录同步：即使清单同步失败，也尽可能把记录推过去，便于发现后端约束问题
@@ -147,11 +193,14 @@ export function createRecordSync(plugin: RSLattePlugin) {
 
       const cSnap = await plugin.recordRSLatte.getCheckinSnapshot(false);
       const fSnap = await plugin.recordRSLatte.getFinanceSnapshot(false);
+      const hSnap = await plugin.recordRSLatte.getHealthSnapshot(false);
 
       const allCheckins = (cSnap.items ?? []) as any[];
       const allFinances = (fSnap.items ?? []) as any[];
+      const allHealth = (hSnap.items ?? []) as any[];
       const scopeCheckins = isAutoTick ? allCheckins.filter((x: any) => String(x.recordDate ?? "") >= cutoff) : allCheckins;
       const scopeFinances = isAutoTick ? allFinances.filter((x: any) => String(x.recordDate ?? "") >= cutoff) : allFinances;
+      const scopeHealth = isAutoTick ? allHealth.filter((x: any) => String(x.recordDate ?? "") >= cutoff) : allHealth;
 
       const norm = (v: any) => String(v ?? "").trim();
       const now = new Date().toISOString();
@@ -160,16 +209,32 @@ export function createRecordSync(plugin: RSLattePlugin) {
         const id = norm(it.checkinId);
         const note = norm(it.note);
         const del = it.isDelete ? "1" : "0";
-        return fnv1a32(`${rd}|${id}|${note}|${del}`);
+        const ms = buildCheckinRecordMetaSyncForDb(plugin, it);
+        const msKey = ms ? JSON.stringify(ms) : "";
+        return fnv1a32(`${rd}|${id}|${note}|${del}|${msKey}`);
       };
       const computeFinanceHash = (it: any): string => {
         const rd = norm(it.recordDate);
         const id = norm(it.categoryId);
+        const eid = norm(it.entryId);
         const ty = norm(it.type);
         const amt = String(Number(it.amount ?? 0));
         const note = norm(it.note);
+        const cyc = norm((it as any).cycleId);
         const del = it.isDelete ? "1" : "0";
-        return fnv1a32(`${rd}|${id}|${ty}|${amt}|${note}|${del}`);
+        return fnv1a32(`${rd}|${id}|${eid}|${ty}|${amt}|${note}|${cyc}|${del}`);
+      };
+      const computeHealthHash = (it: any): string => {
+        const rd = norm(it.recordDate);
+        const eid = norm(it.entryId);
+        const mk = norm(it.metricKey);
+        const period = norm(it.period);
+        const card = norm(it.cardRef);
+        const vs = norm(it.valueStr);
+        const note = norm(it.note);
+        const ssh = norm(it.sleepStartHm);
+        const del = it.isDelete ? "1" : "0";
+        return fnv1a32(`${rd}|${eid}|${mk}|${period}|${card}|${vs}|${note}|${ssh}|${del}`);
       };
       const needsSync = (it: any, computeHash: (x: any) => string): boolean => {
         const src = norm(it.dbSourceHash) || computeHash(it);
@@ -181,9 +246,9 @@ export function createRecordSync(plugin: RSLattePlugin) {
         return last !== src;
       };
 
-      // ✅ 同日同类型/分类仅一条：本地先做去重，避免重复请求。
+      // ✅ 本地先去重，避免重复请求。
       // - checkin: key = recordDate::checkinId
-      // - finance: key = recordDate::categoryId
+      // - finance: key = recordDate::categoryId::entryId（无 entryId 时用 legacy）
       const dedupeByKey = <T extends any>(items: T[], keyFn: (x: T) => string, scoreFn: (x: T) => number): T[] => {
         const map = new Map<string, T>();
         for (const it of items) {
@@ -205,10 +270,22 @@ export function createRecordSync(plugin: RSLattePlugin) {
           : scopeCheckins.filter((x) => needsSync(x, computeCheckinHash)))
         : [];
 
+      const finKey = (x: any) =>
+        norm(x.entryId)
+          ? `${String(x.recordDate)}::${String(x.categoryId)}::${norm(x.entryId)}`
+          : `${String(x.recordDate)}::${String(x.categoryId)}::legacy`;
       const finances = doFinance
         ? (forceFullUpsert
-          ? dedupeByKey(scopeFinances, (x: any) => `${String(x.recordDate)}::${String(x.categoryId)}`, (x: any) => Number(x.tsMs ?? 0))
+          ? dedupeByKey(scopeFinances, finKey, (x: any) => Number(x.tsMs ?? 0))
           : scopeFinances.filter((x) => needsSync(x, computeFinanceHash)))
+        : [];
+
+      const healthKey = (x: any) =>
+        norm(x.entryId) ? `${String(x.recordDate)}::${norm(x.entryId)}` : `${String(x.recordDate)}::m::${norm(x.metricKey)}`;
+      const healthItems = doHealth
+        ? (forceFullUpsert
+          ? dedupeByKey(scopeHealth, healthKey, (x: any) => Number(x.tsMs ?? 0))
+          : scopeHealth.filter((x) => needsSync(x, computeHealthHash)))
         : [];
 
       let errCount = 0;
@@ -246,12 +323,15 @@ export function createRecordSync(plugin: RSLattePlugin) {
         const payloadItems = batch.map((it: any) => {
           const srcHash = norm(it.dbSourceHash) || computeCheckinHash(it);
           it.dbSourceHash = srcHash;
-          return {
+          const row: any = {
             record_date: String(it.recordDate),
             checkin_id: String(it.checkinId),
             note: (it.note ?? "").trim() || undefined,
             is_delete: !!it.isDelete,
           };
+          const ms = buildCheckinRecordMetaSyncForDb(plugin, it);
+          if (ms) row.meta_sync = ms;
+          return row;
         });
 
         try {
@@ -293,12 +373,16 @@ export function createRecordSync(plugin: RSLattePlugin) {
         const payloadItems = batch.map((it: any) => {
           const srcHash = norm(it.dbSourceHash) || computeFinanceHash(it);
           it.dbSourceHash = srcHash;
+          const eid = norm(it.entryId);
+          const cyc = norm((it as any).cycleId);
           return {
             record_date: String(it.recordDate),
             category_id: String(it.categoryId),
             amount: Number(it.amount ?? 0),
             note: (it.note ?? "").trim() || undefined,
             is_delete: !!it.isDelete,
+            ...(eid ? { entry_id: eid } : {}),
+            ...(cyc ? { cycle_id: cyc } : {}),
           };
         });
 
@@ -372,6 +456,101 @@ export function createRecordSync(plugin: RSLattePlugin) {
         }
       }
 
+      // ----- Health batch upsert -----
+      for (const batch of chunks(healthItems, BATCH_SIZE)) {
+        const payloadItems = batch.map((it: any) => {
+          const srcHash = norm(it.dbSourceHash) || computeHealthHash(it);
+          it.dbSourceHash = srcHash;
+          const eid = norm(it.entryId);
+          const row: any = {
+            record_date: String(it.recordDate),
+            metric_key: String(it.metricKey ?? "").trim(),
+            period: String(it.period ?? "day").trim() || "day",
+            value_str: String(it.valueStr ?? "").trim(),
+            is_delete: !!it.isDelete,
+          };
+          if (eid) row.entry_id = eid;
+          const cr = norm(it.cardRef);
+          if (cr) row.card_ref = cr;
+          const nt = norm(it.note);
+          if (nt) row.note = nt;
+          const ssh = norm(it.sleepStartHm);
+          if (ssh) row.sleep_start_hm = ssh;
+          const sfp = norm(it.sourceFilePath);
+          if (sfp) row.source_file_path = sfp;
+          const sl = it.sourceLineMain;
+          if (sl !== undefined && sl !== null && Number.isFinite(Number(sl))) row.source_line_main = Number(sl);
+          const cam = (it as any).createdAtMs;
+          if (cam !== undefined && cam !== null && Number.isFinite(Number(cam))) row.created_at_ms = Number(cam);
+          return row;
+        });
+
+        try {
+          const upsertPayload: any[] = [];
+          const upsertItems: any[] = [];
+          const deletePayload: any[] = [];
+          const deleteItems: any[] = [];
+
+          for (let i = 0; i < payloadItems.length; i++) {
+            const pld: any = payloadItems[i];
+            const it = batch[i];
+            if (pld?.is_delete) {
+              deletePayload.push(pld);
+              deleteItems.push(it);
+            } else {
+              upsertPayload.push(pld);
+              upsertItems.push(it);
+            }
+          }
+
+          if (upsertPayload.length > 0) {
+            const resp: any = await plugin.api.upsertHealthRecordsBatch({ items: upsertPayload });
+            const results: any[] = Array.isArray(resp?.results) ? resp.results : [];
+            if (results.length === 0) {
+              const ok = resp?.ok === true || (typeof resp?.failed === "number" && resp.failed === 0);
+              if (ok) {
+                for (const it of upsertItems) {
+                  const srcHash = String(it.dbSourceHash || "");
+                  markOk(it, srcHash);
+                }
+              } else {
+                for (const it of upsertItems) {
+                  markFail(it, "batch sync failed: empty results");
+                }
+              }
+            } else {
+              for (const r of results) {
+                const idx = Number(r?.index);
+                if (!Number.isFinite(idx) || idx < 0 || idx >= upsertItems.length) continue;
+                const it = upsertItems[idx];
+                const srcHash = String(it.dbSourceHash || "");
+                if (r?.ok) markOk(it, srcHash);
+                else markFail(it, String(r?.error || r?.message || "sync failed"));
+              }
+            }
+          }
+
+          if (deletePayload.length > 0) {
+            for (let i = 0; i < deletePayload.length; i++) {
+              const pld: any = deletePayload[i];
+              const it = deleteItems[i];
+              const srcHash = String(it.dbSourceHash || "");
+              try {
+                await plugin.api.upsertHealthRecord(pld);
+                markOk(it, srcHash);
+              } catch (eOne) {
+                const msg = (eOne as any)?.message ? String((eOne as any).message) : "sync failed";
+                markFail(it, msg);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("RSLatte auto sync health batch failed", e);
+          const msg = (e as any)?.message ? String((e as any).message) : "sync failed";
+          for (const it of batch) markFail(it, msg);
+        }
+      }
+
       if (metaTouched) {
         // persist only once; recordRSLatte will write current active snapshots
         await plugin.recordRSLatte.flushActiveIndexes();
@@ -396,6 +575,7 @@ export function createRecordSync(plugin: RSLattePlugin) {
 
       const ckCounts = countMeta(scopeCheckins, computeCheckinHash);
       const fiCounts = countMeta(scopeFinances, computeFinanceHash);
+      const hiCounts = countMeta(scopeHealth, computeHealthHash);
 
       if (doCheckin) {
         (plugin as any).markDbSyncWithCounts("checkin", {
@@ -413,12 +593,27 @@ export function createRecordSync(plugin: RSLattePlugin) {
           err: fiCounts.failed > 0 ? "部分财务记录入库失败（可刷新重试）" : undefined,
         });
       }
+      if (doHealth) {
+        (plugin as any).markDbSyncWithCounts("health", {
+          pendingCount: hiCounts.pending,
+          failedCount: hiCounts.failed,
+          ok: hiCounts.failed === 0,
+          err: hiCounts.failed > 0 ? "部分健康记录入库失败（可刷新重试）" : undefined,
+        });
+      }
 
       // 兼容旧 record 指标：聚合展示（若某模块未参与本次同步，则沿用该模块既有 meta 计数）
       const exCk: any = getDbSyncMeta()?.checkin ?? {};
       const exFi: any = getDbSyncMeta()?.finance ?? {};
-      const aggPending = (doCheckin ? ckCounts.pending : Number(exCk.pendingCount ?? 0)) + (doFinance ? fiCounts.pending : Number(exFi.pendingCount ?? 0));
-      const aggFailed = (doCheckin ? ckCounts.failed : Number(exCk.failedCount ?? 0)) + (doFinance ? fiCounts.failed : Number(exFi.failedCount ?? 0));
+      const exHi: any = getDbSyncMeta()?.health ?? {};
+      const aggPending =
+        (doCheckin ? ckCounts.pending : Number(exCk.pendingCount ?? 0)) +
+        (doFinance ? fiCounts.pending : Number(exFi.pendingCount ?? 0)) +
+        (doHealth ? hiCounts.pending : Number(exHi.pendingCount ?? 0));
+      const aggFailed =
+        (doCheckin ? ckCounts.failed : Number(exCk.failedCount ?? 0)) +
+        (doFinance ? fiCounts.failed : Number(exFi.failedCount ?? 0)) +
+        (doHealth ? hiCounts.failed : Number(exHi.failedCount ?? 0));
       (plugin as any).markDbSyncWithCounts("record", {
         pendingCount: aggPending,
         failedCount: aggFailed,
@@ -461,19 +656,31 @@ export function createRecordSync(plugin: RSLattePlugin) {
       const db = await (plugin as any).vaultSvc?.checkDbReadySafe?.("syncRecordListsToDb");
       if (!db.ok) return;
 
-      const ck = doCheckin ? (plugin.settings.checkinItems ?? []).map((x) => ({
-        checkin_id: x.id,
-        checkin_name: x.name,
-        status: !!x.active,
-      })) : [];
+      const ck = doCheckin
+        ? (plugin.settings.checkinItems ?? []).map((x) => {
+            const base: any = {
+              checkin_id: x.id,
+              checkin_name: x.name,
+              status: !!x.active,
+            };
+            const ms = buildCheckinTypeMetaSyncForDb(x as any);
+            if (ms) base.meta_sync = ms;
+            return base;
+          })
+        : [];
 
-      const fin = doFinance ? (plugin.settings.financeCategories ?? []).map((x) => ({
-        category_id: x.id,
-        category_name: x.name,
-        category_type: x.type,
-        status: !!x.active,
-        sub_categories: x.subCategories || [], // ✅ 同步子分类列表
-      })) : [];
+      const fin = doFinance
+        ? (plugin.settings.financeCategories ?? []).map((x) => ({
+            category_id: x.id,
+            category_name: x.name,
+            category_type: x.type,
+            status: !!x.active,
+            sub_categories: x.subCategories || [],
+            institution_names: (Array.isArray((x as any).institutionNames) ? (x as any).institutionNames : [])
+              .map((s: string) => String(s ?? "").trim())
+              .filter(Boolean),
+          }))
+        : [];
 
       // 逐个接口调用，便于定位失败来源。失败不阻断插件使用，但会触发状态灯标红。
       // ✅ 严格检查：只有在 doCheckin 为 true 且 ck 数组非空时才调用 checkin 接口
@@ -500,7 +707,7 @@ export function createRecordSync(plugin: RSLattePlugin) {
      * ✅ Public: 立即触发一次"打卡/财务记录索引 -> DB 同步"。
      * - 用于设置页的"扫描重建索引"后，强制做一次全量检查入库。
      */
-    async syncRecordIndexToDbNow(opts?: { reason?: string; modules?: { checkin?: boolean; finance?: boolean } }): Promise<void> {
+    async syncRecordIndexToDbNow(opts?: { reason?: string; modules?: { checkin?: boolean; finance?: boolean; health?: boolean } }): Promise<void> {
       await (plugin as any).autoSyncRecordIndexToDb?.(opts);
     },
 
@@ -572,20 +779,28 @@ export function createRecordSync(plugin: RSLattePlugin) {
       try {
         const fsnap = await plugin.recordRSLatte.getFinanceSnapshot(false);
         const todayItems = (fsnap.items ?? []).filter((x) => String(x.recordDate) === todayKey);
-        const financesMap = new Map<string, ApiFinanceRecord>();
+        const financesMap = new Map<string, ApiFinanceRecord[]>();
         for (const it of todayItems) {
           const id = String(it.categoryId);
-          financesMap.set(id, {
+          const row: ApiFinanceRecord = {
             id: 0,
             record_date: todayKey,
             category_id: id,
+            entry_id: String(it.entryId ?? "").trim() || undefined,
+            cycle_id: String((it as any).cycleId ?? "").trim() || undefined,
             amount: Number(it.amount ?? 0),
             note: it.note,
             is_delete: !!it.isDelete,
             created_at: new Date((it.tsMs ?? Date.now())).toISOString(),
             updated_at: undefined,
-          });
-          st.financeDone[id] = !it.isDelete;
+          };
+          const cur = financesMap.get(id) ?? [];
+          cur.push(row);
+          financesMap.set(id, cur);
+        }
+        for (const [id, rows] of financesMap.entries()) {
+          rows.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+          st.financeDone[id] = rows.some((x) => !x.is_delete);
         }
         setTodayFinancesMap(financesMap);
         setTodayFinancesFetchedAt(Date.now());
@@ -730,10 +945,21 @@ export function createRecordSync(plugin: RSLattePlugin) {
         const resp = await plugin.api.listFinanceRecords(todayKey, todayKey, true);
         const records = (resp as any)?.items ?? [];
 
-        const map = new Map<string, ApiFinanceRecord>();
-        for (const r of (records || [])) {
-          const k = String(r.category_id);
-          if (!map.has(k)) map.set(k, r); // 只取最新一条
+        const byCat = new Map<string, Map<string, ApiFinanceRecord>>();
+        for (const r of records || []) {
+          const cat = String(r.category_id);
+          const eid = String((r as any).entry_id ?? "").trim();
+          const dedupeKey = eid || `idrow_${(r as any).id ?? Math.random()}`;
+          const inner = byCat.get(cat) ?? new Map();
+          if (!inner.has(dedupeKey)) inner.set(dedupeKey, r);
+          byCat.set(cat, inner);
+        }
+        const map = new Map<string, ApiFinanceRecord[]>();
+        for (const [cat, inner] of byCat.entries()) {
+          const arr = Array.from(inner.values()).sort((a, b) =>
+            String(a.created_at ?? "").localeCompare(String(b.created_at ?? ""))
+          );
+          map.set(cat, arr);
         }
 
         setTodayFinancesMap(map);
@@ -742,8 +968,8 @@ export function createRecordSync(plugin: RSLattePlugin) {
 
         const st = plugin.getOrCreateTodayState();
         st.financeDone = {};
-        for (const [id, r] of map.entries()) {
-          st.financeDone[id] = !r.is_delete;
+        for (const [id, rows] of map.entries()) {
+          st.financeDone[id] = (rows ?? []).some((x) => !x.is_delete);
         }
       } catch (e: any) {
         // ✅ 后端不可用：标记为不可用，并降级本地
